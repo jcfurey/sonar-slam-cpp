@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sonar_slam_cpp</name>
+  <version>0.1.0</version>
+  <description>
+    All-C++/CUDA port of the bruce_slam sonar SLAM stack (feature extraction,
+    dead reckoning, gyro integration, Kalman filter, ISAM2 back-end) with full
+    CPU fallback for every GPU kernel. Topic names and parameter schemas are
+    identical to the Python bruce_slam package, so configs are interchangeable.
+  </description>
+  <maintainer email="jcameronfurey@gmail.com">jcfurey</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>tf2_ros</depend>
+  <depend>cv_bridge</depend>
+  <depend>marine_acoustic_msgs</depend>
+
+  <!-- driver message stubs (built from the sonar-SLAM repo in this workspace) -->
+  <depend>sonar_oculus</depend>
+  <depend>rti_dvl</depend>
+  <depend>bar30_depth</depend>
+  <depend>kvh_gyro</depend>
+
+  <depend>libpointmatcher</depend>
+  <depend>gtsam</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

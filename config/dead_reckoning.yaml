@@ -1,0 +1,61 @@
+/**:
+  ros__parameters:
+    # Localization node
+    dvl_max_velocity: 0.5
+
+    # IMU mounting rotation [x y z roll pitch yaw]. The VN100 legacy frame
+    # handling uses roll = deg(-90); for a REP-105 IMU (imu.driver: enu, e.g.
+    # a 3DM-GX5) mounted aligned with the vehicle, use all zeros.
+    imu_pose: [0.0, 0.0, 0.0, -1.5707963267948966, 0.0, 0.0]
+
+    # keyframe spacing for the dead reckoning system
+    keyframe_duration: 1.0
+    keyframe_translation: 4.0
+    keyframe_rotation: 0.5235987755982988   # deg(30)
+
+    # ------------------------------------------------------------------------
+    # Orientation sources — the four localization modes:
+    #   use_imu: true,  use_gyro: false -> IMU attitude + DVL (default)
+    #   use_imu: true,  use_gyro: true  -> IMU roll/pitch + FOG yaw + DVL
+    #   use_imu: false, use_gyro: true  -> FOG yaw only, level attitude + DVL
+    #   use_imu: false, use_gyro: false -> DVL + depth only; heading fed back
+    #                                      from the SLAM scan matcher
+    # ------------------------------------------------------------------------
+    use_gyro: false
+    use_imu: true
+
+    # initial heading (degrees) for the DVL + depth only mode, used until the
+    # first SLAM heading estimate arrives
+    seed_heading: 0.0
+
+    # which VN100 flavor when imu.driver is 'vn100' and imu.topic is blank:
+    # 1 is the heavy and 2 is heavy MKII (sample_data file is version 1)
+    imu_version: 1
+
+    # ------------------------------------------------------------------------
+    # Sensor drivers (pluggable adapters, see bruce_slam/sensors.py).
+    # 'driver' selects the message type/parser; 'topic' overrides the default.
+    # ------------------------------------------------------------------------
+    dvl:
+      driver: rti_dvl          # rti_dvl | twist_stamped | twist_cov
+      topic: /rti/body_velocity/raw
+    depth:
+      driver: bar30            # bar30 | fluid_pressure
+      topic: /bar30/depth/raw
+      # for driver: fluid_pressure (sensor_msgs/FluidPressure -> depth):
+      # water_density: 1025.0
+      # gravity: 9.80665
+    imu:
+      # All IMU drivers use standard sensor_msgs/Imu; 'driver' selects the
+      # FRAME convention:
+      #   vn100 - legacy VectorNav handling (imu_pose roll -90 + fixed offsets)
+      #   enu   - REP-105 ENU AHRS (MicroStrain 3DM-GX5 via
+      #           microstrain_inertial_driver, aliases: 3dm_gx5, microstrain);
+      #           blank topic defaults to /imu/data; set imu_pose to identity
+      driver: vn100
+      topic: ""
+    # Example 3DM-GX5 configuration:
+    # imu_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # imu:
+    #   driver: 3dm_gx5
+    #   topic: /imu/data

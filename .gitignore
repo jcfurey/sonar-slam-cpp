@@ -1,0 +1,8 @@
+build/
+install/
+log/
+*.o
+*.so
+compile_commands.json
+.cache/
+__pycache__/

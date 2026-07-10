@@ -1,0 +1,239 @@
+// SLAM bookkeeping types: port of bruce_slam slam_objects.py (STATUS,
+// Keyframe, InitializationResult, ICPResult, SMParams).
+#pragma once
+
+#include <Eigen/Dense>
+#include <builtin_interfaces/msg/time.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <gtsam/geometry/Pose2.h>
+#include <gtsam/geometry/Pose3.h>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "sonar_slam_cpp/cloud_ops.hpp"
+
+namespace sonar_slam {
+
+// -------------------------------------------------------------------- status
+struct Status
+{
+  enum Code {
+    NOT_ENOUGH_POINTS,
+    LARGE_TRANSFORMATION,
+    NOT_ENOUGH_OVERLAP,
+    NOT_CONVERGED,
+    INITIALIZATION_FAILURE,
+    SUCCESS,
+  };
+
+  Code code = SUCCESS;
+  std::string description;
+
+  Status() = default;
+  Status(Code c) : code(c) {}
+  explicit operator bool() const { return code == SUCCESS; }
+
+  const char* name() const
+  {
+    switch (code) {
+      case NOT_ENOUGH_POINTS: return "Not enough points";
+      case LARGE_TRANSFORMATION: return "Large transformation";
+      case NOT_ENOUGH_OVERLAP: return "Not enough overlap";
+      case NOT_CONVERGED: return "Not converged";
+      case INITIALIZATION_FAILURE: return "Initialization failure";
+      case SUCCESS: return "Success";
+    }
+    return "?";
+  }
+};
+
+// ---------------------------------------------------------------- conversions
+inline gtsam::Pose2 pose322(const gtsam::Pose3& pose)
+{
+  return gtsam::Pose2(pose.x(), pose.y(), pose.rotation().yaw());
+}
+
+inline gtsam::Pose3 pose223(const gtsam::Pose2& pose)
+{
+  return gtsam::Pose3(gtsam::Rot3::Yaw(pose.theta()),
+                      gtsam::Point3(pose.x(), pose.y(), 0.0));
+}
+
+// ------------------------------------------------------------------- keyframe
+struct Keyframe
+{
+  Keyframe(bool status_, const builtin_interfaces::msg::Time& time_,
+           const gtsam::Pose3& dr_pose3_,
+           Matrix points_ = Matrix::Zero(0, 2))
+    : status(status_), time(time_), dr_pose3(dr_pose3_),
+      dr_pose(pose322(dr_pose3_)), pose3(dr_pose3_), pose(pose322(dr_pose3_)),
+      points(std::move(points_))
+  {
+  }
+
+  // update following a SLAM optimization step (slam_objects.py Keyframe.update)
+  void update(const gtsam::Pose2& new_pose)
+  {
+    pose = new_pose;
+    pose3 = gtsam::Pose3(
+      gtsam::Rot3::Ypr(new_pose.theta(), dr_pose3.rotation().pitch(),
+                       dr_pose3.rotation().roll()),
+      gtsam::Point3(new_pose.x(), new_pose.y(), dr_pose3.z()));
+    transf_points = transform_points(points, pose);
+    update_transf_cov();
+  }
+
+  void update(const gtsam::Pose2& new_pose, const Eigen::Matrix3d& new_cov)
+  {
+    cov = new_cov;
+    has_cov = true;
+    update(new_pose);
+  }
+
+  static Matrix transform_points(const Matrix& pts, const gtsam::Pose2& pose)
+  {
+    if (pts.rows() == 0) return Matrix::Zero(0, pts.cols());
+    const float c = static_cast<float>(std::cos(pose.theta()));
+    const float s = static_cast<float>(std::sin(pose.theta()));
+    Eigen::Matrix2f R;
+    R << c, -s, s, c;
+    Matrix out(pts.rows(), 2);
+    out = pts.leftCols(2) * R.transpose();
+    out.col(0).array() += static_cast<float>(pose.x());
+    out.col(1).array() += static_cast<float>(pose.y());
+    return out;
+  }
+
+  bool status = false;
+  builtin_interfaces::msg::Time time;
+
+  gtsam::Pose3 dr_pose3;   // dead reckoning 3d pose
+  gtsam::Pose2 dr_pose;    // dead reckoning 2d pose
+  gtsam::Pose3 pose3;      // estimated 3d pose
+  gtsam::Pose2 pose;       // estimated 2d pose
+
+  bool has_cov = false;
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();        // local frame
+  Eigen::Matrix3d transf_cov = Eigen::Matrix3d::Zero(); // global frame
+
+  Matrix points;         // local frame, Nx2
+  Matrix transf_points;  // global frame
+
+  // non-sequential constraints aka loop closures: (target key, transform)
+  std::vector<std::pair<int, gtsam::Pose2>> constraints;
+
+  geometry_msgs::msg::Twist twist;
+
+private:
+  void update_transf_cov()
+  {
+    if (!has_cov) return;
+    const double c = std::cos(pose.theta()), s = std::sin(pose.theta());
+    Eigen::Matrix2d R;
+    R << c, -s, s, c;
+    transf_cov = cov;
+    transf_cov.topLeftCorner<2, 2>() = R * cov.topLeftCorner<2, 2>() * R.transpose();
+    transf_cov.topRightCorner<2, 1>() = R * cov.topRightCorner<2, 1>();
+    transf_cov.bottomLeftCorner<1, 2>() = cov.bottomLeftCorner<1, 2>() * R.transpose();
+  }
+};
+
+using KeyframePtr = std::shared_ptr<Keyframe>;
+
+// -------------------------------------------------- scan-matching containers
+struct InitializationResult
+{
+  Matrix source_points = Matrix::Zero(0, 2);
+  Matrix target_points = Matrix::Zero(0, 2);
+  int source_key = -1;
+  int target_key = -1;
+  gtsam::Pose2 source_pose;
+  gtsam::Pose2 target_pose;
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  Status status;
+  bool has_estimated_source_pose = false;
+  gtsam::Pose2 estimated_source_pose;
+  // [x, y, theta, cost] samples from global init
+  std::vector<Eigen::Vector4d> source_pose_samples;
+};
+
+struct ICPResult
+{
+  ICPResult(const InitializationResult& init, bool use_samples,
+            double sample_eps = 0.01)
+    : source_points(init.source_points), target_points(init.target_points),
+      source_key(init.source_key), target_key(init.target_key),
+      source_pose(init.source_pose), target_pose(init.target_pose),
+      status(init.status)
+  {
+    if (init.has_estimated_source_pose)
+      initial_transform = target_pose.between(init.estimated_source_pose);
+    else
+      initial_transform = target_pose.between(source_pose);
+
+    if (use_samples && !init.source_pose_samples.empty()) {
+      // sort sampled source poses by cost, convert to transforms in the
+      // target frame, filter near-duplicates (slam_objects.py ICPResult)
+      std::vector<int> idx(init.source_pose_samples.size());
+      for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
+      std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+        return init.source_pose_samples[a][3] < init.source_pose_samples[b][3];
+      });
+      std::vector<gtsam::Pose2> transforms;
+      transforms.reserve(idx.size());
+      for (int i : idx) {
+        const auto& s = init.source_pose_samples[i];
+        transforms.push_back(
+          target_pose.between(gtsam::Pose2(s[0], s[1], s[2])));
+      }
+      initial_transforms.push_back(transforms[0]);
+      for (std::size_t i = 1; i < transforms.size(); ++i) {
+        const gtsam::Pose2 d = initial_transforms.back().between(transforms[i]);
+        const double dist = std::sqrt(d.x() * d.x() + d.y() * d.y() +
+                                      d.theta() * d.theta());
+        if (dist >= sample_eps) initial_transforms.push_back(transforms[i]);
+      }
+    }
+  }
+
+  Matrix source_points;
+  Matrix target_points;
+  int source_key;
+  int target_key;
+  gtsam::Pose2 source_pose;
+  gtsam::Pose2 target_pose;
+  Status status;
+
+  bool has_estimated_transform = false;
+  gtsam::Pose2 estimated_transform;
+  gtsam::Pose2 initial_transform;
+  std::vector<gtsam::Pose2> initial_transforms;
+
+  bool has_cov = false;
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  bool inserted = false;
+  int n_sample_transforms = 0;
+};
+
+// ------------------------------------------------------ scan-matching params
+struct SMParams
+{
+  bool enable = true;
+  bool initialization = true;
+  // (sobol samples per iteration, iterations, local-refine ftol)
+  int init_n = 50;
+  int init_iters = 1;
+  double init_ftol = 0.01;
+
+  int min_points = 50;
+  double max_translation = 2.0;
+  double max_rotation = M_PI / 6.0;
+  int min_st_sep = 1;
+  int source_frames = 5;
+  int target_frames = 3;
+  int cov_samples = 0;
+};
+
+}  // namespace sonar_slam

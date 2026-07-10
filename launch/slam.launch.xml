@@ -1,0 +1,44 @@
+<!-- All-C++ sonar SLAM launch (no Python anywhere, including this file).
+     Mirrors bruce_slam/launch/slam.launch.py online mode: gyro + dead
+     reckoning (or Kalman), feature extraction, SLAM back-end and the static
+     world->map flip. Params files are drop-in compatible with bruce_slam. -->
+<launch>
+  <arg name="enable_slam" default="true"/>
+  <arg name="kalman_dead_reckoning" default="false"/>
+  <arg name="config_dir" default="$(find-pkg-share sonar_slam_cpp)/config"/>
+
+  <group unless="$(var kalman_dead_reckoning)">
+    <node pkg="sonar_slam_cpp" exec="gyro_node" name="gyro_fusion"
+          namespace="bruce/slam" output="screen">
+      <param from="$(var config_dir)/gyro.yaml"/>
+    </node>
+    <node pkg="sonar_slam_cpp" exec="dead_reckoning_node" name="localization"
+          namespace="bruce/slam" output="screen">
+      <param from="$(var config_dir)/dead_reckoning.yaml"/>
+    </node>
+  </group>
+
+  <group if="$(var kalman_dead_reckoning)">
+    <node pkg="sonar_slam_cpp" exec="kalman_node" name="kalman"
+          namespace="bruce/slam" output="screen">
+      <param from="$(var config_dir)/kalman.yaml"/>
+    </node>
+  </group>
+
+  <node pkg="sonar_slam_cpp" exec="feature_extraction_node"
+        name="feature_extraction" namespace="bruce/slam" output="screen">
+    <param from="$(var config_dir)/feature.yaml"/>
+  </node>
+
+  <node pkg="sonar_slam_cpp" exec="slam_node" name="slam"
+        namespace="bruce/slam" output="screen">
+    <param from="$(var config_dir)/slam.yaml"/>
+    <param name="enable_slam" value="$(var enable_slam)"/>
+    <param name="icp_config" value="$(var config_dir)/icp.yaml"/>
+  </node>
+
+  <!-- map -> world so everything is visualized in a z-down frame -->
+  <node pkg="tf2_ros" exec="static_transform_publisher"
+        name="map_to_world_tf_publisher"
+        args="--x 0 --y 0 --z 0 --yaw 0 --pitch 0 --roll 3.14159 --frame-id world --child-frame-id map"/>
+</launch>
