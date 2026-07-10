@@ -118,11 +118,16 @@ private:
   void publish_features(const builtin_interfaces::msg::Time& stamp,
                         const Matrix& points)
   {
-    // axis shift: [x, y] -> [x, 0, y] (feature_extraction.py publish_features)
+    // Publish honest planar base_link coordinates: [x, y, 0]. The python
+    // original packed the lateral coordinate into z ([x, 0, y] — a leftover
+    // of bruce's roll-pi rviz static, which this stack does not use); that
+    // drew the fan rolled 90 deg in an ENU viewer. The SLAM node's
+    // consumption is adjusted in lockstep (slam_node.cpp slam_callback),
+    // so the graph math is unchanged.
     Matrix xyz(points.rows(), 3);
     xyz.col(0) = points.col(0);
-    xyz.col(1).setZero();
-    xyz.col(2) = points.col(1);
+    xyz.col(1) = points.col(1);
+    xyz.col(2).setZero();
 
     sensor_msgs::msg::PointCloud2 msg = make_cloud_xyz(xyz);
     // the stamp of the source sonar image is CRITICAL to downstream sync

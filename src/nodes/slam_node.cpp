@@ -158,11 +158,13 @@ private:
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
 
-    // cloud [x, y, z] -> planar points [x, -z] (slam_ros.py SLAM_callback)
+    // feature cloud now carries honest planar [x, y, 0] in base_link (see
+    // feature_extraction_node.cpp publish_features) — same values the
+    // python pair exchanged via [x, 0, y]/-z, so the graph math is unchanged
     const Matrix xyz = cloud_to_xyz(feature_msg);
     Matrix points(xyz.rows(), 2);
     points.col(0) = xyz.col(0);
-    points.col(1) = -xyz.col(2);
+    points.col(1) = -xyz.col(1);
 
     // NaN cloud means feature extraction skipped this frame
     if (points.rows() > 0 && std::isnan(points(0, 0)))
