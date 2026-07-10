@@ -287,8 +287,11 @@ private:
     }
     odom_pub_->publish(odom_msg);
 
-    // periodic health counters
-    if (slam_.current_key() % 25 == 0) {
+    // periodic health counters — publish_pose runs per callback (~ping
+    // rate), so gate on the keyframe count CHANGING or the same line
+    // repeats hundreds of times while the count sits on a multiple of 25
+    if (slam_.current_key() % 25 == 0 && slam_.current_key() != last_logged_key_) {
+      last_logged_key_ = slam_.current_key();
       RCLCPP_INFO(get_logger(),
                   "SLAM status: keyframes %d, SSM factors %d, NSSM accepted %d",
                   slam_.current_key(), slam_.ssm_accepted, slam_.nssm_accepted);
@@ -382,6 +385,7 @@ private:
   bool enu_world_ = false;
   bool publish_tf_ = true;
   double viz_min_period_ = 2.0;
+  int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
   bool oculus_configured_ = false;
   double feature_odom_sync_max_delay_ = 0.5;
