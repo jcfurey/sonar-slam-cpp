@@ -331,7 +331,13 @@ private:
   {
     // [x, y, z, roll, pitch, yaw, index]
     const float sy = enu_world_ ? -1.0f : 1.0f;
-    Matrix traj(slam_.current_key(), 7);
+    // `t` is the keyframe stamp RELATIVE to this message's stamp (float32
+    // seconds since epoch cannot hold ms precision) — consumers recover the
+    // absolute stamp as msg.stamp + t. Lets the map assembler associate
+    // evidence clouds (same ping stamps) to keyframes.
+    const auto& msg_stamp = slam_.current_keyframe()->time;
+    const double msg_stamp_s = to_sec(msg_stamp);
+    Matrix traj(slam_.current_key(), 8);
     for (int k = 0; k < slam_.current_key(); ++k) {
       const auto& kf = slam_.keyframes[k];
       traj(k, 0) = static_cast<float>(kf->pose3.x());
@@ -341,10 +347,11 @@ private:
       traj(k, 4) = sy * static_cast<float>(kf->pose3.rotation().pitch());
       traj(k, 5) = sy * static_cast<float>(kf->pose3.rotation().yaw());
       traj(k, 6) = static_cast<float>(k);
+      traj(k, 7) = static_cast<float>(to_sec(kf->time) - msg_stamp_s);
     }
     sensor_msgs::msg::PointCloud2 msg =
-      make_cloud({"x", "y", "z", "roll", "pitch", "yaw", "i"}, traj);
-    msg.header.stamp = slam_.current_keyframe()->time;
+      make_cloud({"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, traj);
+    msg.header.stamp = msg_stamp;
     msg.header.frame_id = "map";
     traj_pub_->publish(msg);
   }
