@@ -17,6 +17,7 @@
 #include <mutex>
 
 #include "sonar_slam_cpp/approx_sync.hpp"
+#include "sonar_slam_cpp/gpu.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/node_base.hpp"
 #include "sonar_slam_cpp/ros_conversions.hpp"
@@ -49,6 +50,12 @@ public:
     // emit the map->odom TF in ENU (REP-105) instead of the graph's z-down
     // convention — pair with the enu_odom_relay feeding the odom input
     enu_world_ = get_bool("enu_world", false);
+    // false when an external node (e.g. the map robot_localization EKF
+    // fusing /bruce/slam/slam/pose) owns the map->odom transform
+    publish_tf_ = get_bool("publish_tf", true);
+    // min seconds between rebuilds of the O(history) viz outputs
+    // (constraint markers + aggregated map cloud); <= 0 -> every keyframe
+    viz_min_period_ = get_double("viz_min_period", 2.0);
 
     const auto prior = get_double_array("prior_sigmas");
     const auto odom = get_double_array("odom_sigmas");
@@ -64,6 +71,12 @@ public:
     slam_.ssm_params.max_translation = get_double("ssm/max_translation");
     slam_.ssm_params.max_rotation = get_double("ssm/max_rotation");
     slam_.ssm_params.target_frames = get_int("ssm/target_frames");
+    // covariance-estimating ICP for SSM (core supported it but the config
+    // never reached it — in the python original these fields were unwired,
+    // which left SSM on plain point-to-point ICP with a fixed noise model;
+    // that poisoned the graph on pool geometry, see SONAR_SLAM_PLAN.md)
+    slam_.ssm_params.initialization = get_bool("ssm/initialization", true);
+    slam_.ssm_params.cov_samples = get_int("ssm/cov_samples", 0);
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
@@ -127,7 +140,11 @@ public:
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     slam_.configure();
-    RCLCPP_INFO(get_logger(), "SLAM node is initialized");
+    // observability parity with the feature node: scan-match global init
+    // batches its cost evaluation on the GPU when present (override with
+    // SONAR_SLAM_FORCE_CPU=1); libpointmatcher ICP itself is CPU
+    RCLCPP_INFO(get_logger(), "SLAM node is initialized (GPU: %s)",
+                gpu::available() ? "on" : "off");
   }
 
 private:
@@ -185,9 +202,28 @@ private:
     publish_pose();
     if (slam_.current_frame->status) {
       publish_trajectory();
-      publish_constraint();
-      publish_point_cloud();
+      // The constraint markers and the aggregated map cloud re-walk the
+      // ENTIRE keyframe history (O(n) per keyframe, growing for the whole
+      // mission) — they are pure viz, so rebuild them at most every
+      // viz_min_period seconds instead of on every keyframe.
+      const auto now = this->now();
+      if (viz_min_period_ <= 0.0 ||
+          (now - last_viz_publish_).seconds() >= viz_min_period_) {
+        last_viz_publish_ = now;
+        publish_constraint();
+        publish_point_cloud();
+      }
     }
+  }
+
+  // conjugation by the roll-pi transform: flip a z-down graph-frame pose
+  // back to ENU (REP-105) for external consumers
+  static void flip_pose_enu(geometry_msgs::msg::Pose& p)
+  {
+    p.position.y = -p.position.y;
+    p.position.z = -p.position.z;
+    p.orientation.y = -p.orientation.y;
+    p.orientation.z = -p.orientation.z;
   }
 
   void publish_pose()
@@ -204,30 +240,49 @@ private:
     const int map_idx[3] = {0, 1, 5};
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) cov(map_idx[i], map_idx[j]) = tc(i, j);
+    // transf_cov is zero until the keyframe's marginals are computed —
+    // zero variance reads as infinite confidence to downstream fusion
+    // (robot_localization sanitizes it to ~1e-6 and glues itself to the
+    // pose). Floor the diagonal at a modest uncertainty.
+    for (int i = 0; i < 6; ++i) cov(i, i) = std::max(cov(i, i), 1e-3);
+    if (enu_world_) {
+      flip_pose_enu(pose_msg.pose.pose);
+      // conjugate the covariance by the roll-pi sign signature
+      static const double S[6] = {1, -1, -1, 1, -1, -1};
+      for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) cov(i, j) *= S[i] * S[j];
+    }
     for (int i = 0; i < 36; ++i) pose_msg.pose.covariance[i] = cov(i / 6, i % 6);
     pose_pub_->publish(pose_msg);
 
     // map -> odom: SLAM estimate composed with inverse dead reckoning
-    const gtsam::Pose3 o2m = frame->pose3.compose(frame->dr_pose3.inverse());
-    const geometry_msgs::msg::Pose o2m_msg = g2r(o2m);
-    double tx = o2m_msg.position.x, ty = o2m_msg.position.y, tz = o2m_msg.position.z;
-    double qx = o2m_msg.orientation.x, qy = o2m_msg.orientation.y,
-           qz = o2m_msg.orientation.z, qw = o2m_msg.orientation.w;
-    if (enu_world_) {
-      // conjugation by the roll-pi transform: flip the z-down graph frame
-      // back to ENU (REP-105) for external consumers
-      ty = -ty; tz = -tz;
-      qy = -qy; qz = -qz;
+    if (publish_tf_) {
+      const gtsam::Pose3 o2m = frame->pose3.compose(frame->dr_pose3.inverse());
+      const geometry_msgs::msg::Pose o2m_msg = g2r(o2m);
+      double tx = o2m_msg.position.x, ty = o2m_msg.position.y, tz = o2m_msg.position.z;
+      double qx = o2m_msg.orientation.x, qy = o2m_msg.orientation.y,
+             qz = o2m_msg.orientation.z, qw = o2m_msg.orientation.w;
+      if (enu_world_) {
+        ty = -ty; tz = -tz;
+        qy = -qy; qz = -qz;
+      }
+      tf_->sendTransform(make_transform(Eigen::Vector3d(tx, ty, tz),
+                                        Eigen::Quaterniond(qw, qx, qy, qz),
+                                        frame->time, "map", "odom"));
     }
-    tf_->sendTransform(make_transform(Eigen::Vector3d(tx, ty, tz),
-                                      Eigen::Quaterniond(qw, qx, qy, qz),
-                                      frame->time, "map", "odom"));
 
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header = pose_msg.header;
     odom_msg.pose.pose = pose_msg.pose.pose;
     odom_msg.child_frame_id = "base_link";
     odom_msg.twist.twist = frame->twist;
+    if (enu_world_) {
+      // twist arrives z-down from the relay; flip it back out
+      odom_msg.twist.twist.linear.y = -odom_msg.twist.twist.linear.y;
+      odom_msg.twist.twist.linear.z = -odom_msg.twist.twist.linear.z;
+      odom_msg.twist.twist.angular.y = -odom_msg.twist.twist.angular.y;
+      odom_msg.twist.twist.angular.z = -odom_msg.twist.twist.angular.z;
+    }
     odom_pub_->publish(odom_msg);
 
     // periodic health counters
@@ -240,18 +295,23 @@ private:
 
   void publish_constraint()
   {
+    // viz output follows the external (ENU when enu_world) convention
+    const double sy = enu_world_ ? -1.0 : 1.0;
+    auto P = [&](double x, double y, double z) {
+      return Eigen::Vector3d(x, sy * y, sy * z);
+    };
     std::vector<ConstraintLink> links;
     for (int x = 1; x < slam_.current_key(); ++x) {
       const auto& prev = slam_.keyframes[x - 1];
       const auto& curr = slam_.keyframes[x];
-      const Eigen::Vector3d p1(prev->pose3.x(), prev->pose3.y(), prev->dr_pose3.z());
-      const Eigen::Vector3d p2(curr->pose3.x(), curr->pose3.y(), curr->dr_pose3.z());
+      const Eigen::Vector3d p1 = P(prev->pose3.x(), prev->pose3.y(), prev->dr_pose3.z());
+      const Eigen::Vector3d p2 = P(curr->pose3.x(), curr->pose3.y(), curr->dr_pose3.z());
       links.push_back({{p1, p2}, "green"});
 
       for (const auto& [k, _] : curr->constraints) {
         const auto& target = slam_.keyframes[k];
-        const Eigen::Vector3d p0(target->pose3.x(), target->pose3.y(),
-                                 target->dr_pose3.z());
+        const Eigen::Vector3d p0 =
+          P(target->pose3.x(), target->pose3.y(), target->dr_pose3.z());
         links.push_back({{p0, p2}, "red"});
       }
     }
@@ -265,15 +325,16 @@ private:
   void publish_trajectory()
   {
     // [x, y, z, roll, pitch, yaw, index]
+    const float sy = enu_world_ ? -1.0f : 1.0f;
     Matrix traj(slam_.current_key(), 7);
     for (int k = 0; k < slam_.current_key(); ++k) {
       const auto& kf = slam_.keyframes[k];
       traj(k, 0) = static_cast<float>(kf->pose3.x());
-      traj(k, 1) = static_cast<float>(kf->pose3.y());
-      traj(k, 2) = static_cast<float>(kf->pose3.z());
+      traj(k, 1) = sy * static_cast<float>(kf->pose3.y());
+      traj(k, 2) = sy * static_cast<float>(kf->pose3.z());
       traj(k, 3) = static_cast<float>(kf->pose3.rotation().roll());
-      traj(k, 4) = static_cast<float>(kf->pose3.rotation().pitch());
-      traj(k, 5) = static_cast<float>(kf->pose3.rotation().yaw());
+      traj(k, 4) = sy * static_cast<float>(kf->pose3.rotation().pitch());
+      traj(k, 5) = sy * static_cast<float>(kf->pose3.rotation().yaw());
       traj(k, 6) = static_cast<float>(k);
     }
     sensor_msgs::msg::PointCloud2 msg =
@@ -303,7 +364,7 @@ private:
     // [x, y, 0, key]
     Matrix xyzi(pts.rows(), 4);
     xyzi.col(0) = pts.col(0);
-    xyzi.col(1) = pts.col(1);
+    xyzi.col(1) = enu_world_ ? Matrix(-pts.col(1)) : Matrix(pts.col(1));
     xyzi.col(2).setZero();
     xyzi.col(3) = keys.col(0);
 
@@ -317,6 +378,9 @@ private:
   std::mutex mutex_;
   bool enable_slam_ = true;
   bool enu_world_ = false;
+  bool publish_tf_ = true;
+  double viz_min_period_ = 2.0;
+  rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
   bool oculus_configured_ = false;
   double feature_odom_sync_max_delay_ = 0.5;
 
