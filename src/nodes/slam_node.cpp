@@ -79,6 +79,17 @@ public:
       return v;
     };
 
+    // ICP-covariance method when cov_samples > 0: "sampled" (many ICPs +
+    // FAST-MCD, the default/parity behavior) or "censi" (one ICP + closed-form)
+    const auto cov_method = [this](const char* name) {
+      const std::string s = get_string(name, "sampled");
+      if (s == "sampled") return SMParams::SAMPLED;
+      if (s == "censi") return SMParams::CENSI;
+      throw std::runtime_error(std::string(name) +
+                               " must be 'sampled' or 'censi'");
+    };
+    slam_.censi_sensor_noise = get_double("censi_sensor_noise", 0.1);
+
     slam_.ssm_params.enable = get_bool("ssm/enable");
     slam_.ssm_params.min_points = get_int("ssm/min_points");
     slam_.ssm_params.max_translation = get_double("ssm/max_translation");
@@ -94,6 +105,7 @@ public:
     slam_.ssm_params.init_iters = static_cast<int>(ssm_init[1]);
     slam_.ssm_params.init_ftol = ssm_init[2];
     slam_.ssm_params.cov_samples = get_int("ssm/cov_samples", 0);
+    slam_.ssm_params.cov_method = cov_method("ssm/cov_method");
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
@@ -108,6 +120,7 @@ public:
     slam_.nssm_params.init_iters = static_cast<int>(nssm_init[1]);
     slam_.nssm_params.init_ftol = nssm_init[2];
     slam_.nssm_params.cov_samples = get_int("nssm/cov_samples");
+    slam_.nssm_params.cov_method = cov_method("nssm/cov_method");
 
     slam_.pcm_queue_size = get_int("pcm_queue_size");
     slam_.min_pcm = get_int("min_pcm");

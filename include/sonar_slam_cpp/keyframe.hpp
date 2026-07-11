@@ -220,6 +220,12 @@ struct ICPResult
 // ------------------------------------------------------ scan-matching params
 struct SMParams
 {
+  // how the ICP factor covariance is estimated when cov_samples > 0:
+  //   SAMPLED - run cov_samples ICPs from the best init guesses and take a
+  //             robust (FAST-MCD) covariance of the results (slam.py default)
+  //   CENSI   - one ICP plus the Censi (2007) closed-form covariance
+  enum CovMethod { SAMPLED, CENSI };
+
   bool enable = true;
   bool initialization = true;
   // (sobol samples per iteration, iterations, local-refine ftol)
@@ -234,6 +240,7 @@ struct SMParams
   int source_frames = 5;
   int target_frames = 3;
   int cov_samples = 0;
+  CovMethod cov_method = SAMPLED;
 };
 
 }  // namespace sonar_slam

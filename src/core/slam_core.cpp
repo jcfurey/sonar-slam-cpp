@@ -1,6 +1,7 @@
 #include "sonar_slam_cpp/slam_core.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/global_init.hpp"
+#include "sonar_slam_cpp/icp_covariance.hpp"
 #include "sonar_slam_cpp/mcd.hpp"
 
 #include <gtsam/inference/Symbol.h>
@@ -320,22 +321,16 @@ InitializationResult Slam::initialize_sequential_scan_matching(
   return ret;
 }
 
-void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
+void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
 {
-  InitializationResult ret = initialize_sequential_scan_matching(keyframe);
+  const bool want_cov = params.initialization && params.cov_samples > 0;
 
-  if (!ret.status) {
-    add_odometry(keyframe);
-    return;
-  }
-
-  ICPResult ret2(ret, ssm_params.cov_samples > 0);
-
-  if (ssm_params.initialization && ssm_params.cov_samples > 0) {
+  if (want_cov && params.cov_method == SMParams::SAMPLED) {
+    // run the best init guesses through ICP and take a robust covariance
     std::vector<gtsam::Pose2> guesses(
       ret2.initial_transforms.begin(),
       ret2.initial_transforms.begin() +
-        std::min<std::size_t>(ssm_params.cov_samples,
+        std::min<std::size_t>(params.cov_samples,
                               ret2.initial_transforms.size()));
     const IcpCovResult icp_ret =
       compute_icp_with_cov(ret2.source_points, ret2.target_points, guesses);
@@ -350,17 +345,53 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
       ret2.n_sample_transforms = icp_ret.n_samples;
       ret2.status.description = std::to_string(icp_ret.n_samples) + " samples";
     }
-  } else {
-    auto [message, odom] =
-      compute_icp(ret2.source_points, ret2.target_points, ret2.initial_transform);
-    if (message != "success") {
-      ret2.status = Status(Status::NOT_CONVERGED);
-      ret2.status.description = message;
+    return;
+  }
+
+  // single ICP; the Censi path additionally attaches a closed-form covariance
+  auto [message, odom] =
+    compute_icp(ret2.source_points, ret2.target_points, ret2.initial_transform);
+  if (message != "success") {
+    ret2.status = Status(Status::NOT_CONVERGED);
+    ret2.status.description = message;
+    return;
+  }
+  ret2.estimated_transform = odom;
+  ret2.has_estimated_transform = true;
+
+  if (want_cov && params.cov_method == SMParams::CENSI) {
+    const CensiCovResult c = censi_icp_covariance(
+      ret2.source_points, ret2.target_points, odom, point_noise,
+      censi_sensor_noise * censi_sensor_noise);
+    if (c.success) {
+      // never report a covariance smaller than the fixed ICP model
+      Eigen::Matrix3d cov = c.cov;
+      const Eigen::Matrix3d default_cov =
+        icp_odom_sigmas.array().square().matrix().asDiagonal();
+      if (cov.determinant() < default_cov.determinant()) cov = default_cov;
+      ret2.cov = cov;
+      ret2.has_cov = true;
+      ret2.n_sample_transforms = c.n_correspondences;
+      ret2.status.description = "censi " + std::to_string(c.n_correspondences);
     } else {
-      ret2.estimated_transform = odom;
-      ret2.has_estimated_transform = true;
+      // too few correspondences for a covariance — keep the fixed model
+      ret2.status.description = "censi (fixed model)";
     }
   }
+}
+
+void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
+{
+  InitializationResult ret = initialize_sequential_scan_matching(keyframe);
+
+  if (!ret.status) {
+    add_odometry(keyframe);
+    return;
+  }
+
+  ICPResult ret2(ret, ssm_params.cov_samples > 0 &&
+                        ssm_params.cov_method == SMParams::SAMPLED);
+  run_scan_match_icp(ret2, ssm_params);
 
   // the transformation compared to dead reckoning can't be too large
   if (ret2.status) {
@@ -557,38 +588,9 @@ bool Slam::add_nonsequential_scan_matching()
   InitializationResult ret = initialize_nonsequential_scan_matching();
   if (!ret.status) return false;
 
-  ICPResult ret2(ret, nssm_params.cov_samples > 0);
-
-  if (nssm_params.initialization && nssm_params.cov_samples > 0) {
-    std::vector<gtsam::Pose2> guesses(
-      ret2.initial_transforms.begin(),
-      ret2.initial_transforms.begin() +
-        std::min<std::size_t>(nssm_params.cov_samples,
-                              ret2.initial_transforms.size()));
-    const IcpCovResult icp_ret =
-      compute_icp_with_cov(ret2.source_points, ret2.target_points, guesses);
-    if (icp_ret.message != "success") {
-      ret2.status = Status(Status::NOT_CONVERGED);
-      ret2.status.description = icp_ret.message;
-    } else {
-      ret2.estimated_transform = icp_ret.odom;
-      ret2.has_estimated_transform = true;
-      ret2.cov = icp_ret.cov;
-      ret2.has_cov = true;
-      ret2.n_sample_transforms = icp_ret.n_samples;
-      ret2.status.description = std::to_string(icp_ret.n_samples) + " samples";
-    }
-  } else {
-    auto [message, odom] =
-      compute_icp(ret2.source_points, ret2.target_points, ret2.initial_transform);
-    if (message != "success") {
-      ret2.status = Status(Status::NOT_CONVERGED);
-      ret2.status.description = message;
-    } else {
-      ret2.estimated_transform = odom;
-      ret2.has_estimated_transform = true;
-    }
-  }
+  ICPResult ret2(ret, nssm_params.cov_samples > 0 &&
+                        nssm_params.cov_method == SMParams::SAMPLED);
+  run_scan_match_icp(ret2, nssm_params);
 
   if (ret2.status) {
     const gtsam::Pose2 delta =

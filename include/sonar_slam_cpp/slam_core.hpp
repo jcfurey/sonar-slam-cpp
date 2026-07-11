@@ -35,6 +35,8 @@ public:
 
   double point_resolution = 0.5;  // downsampling for ICP / publishing
   double point_noise = 0.5;       // noise radius in overlap estimation
+  // per-point sonar coordinate noise std (m) for the Censi covariance path
+  double censi_sensor_noise = 0.1;
 
   SMParams ssm_params;
   SMParams nssm_params;
@@ -100,6 +102,11 @@ private:
   InitializationResult initialize_sequential_scan_matching(
     const KeyframePtr& keyframe);
   InitializationResult initialize_nonsequential_scan_matching();
+
+  // run ICP and (when cov_samples > 0) estimate its covariance by the
+  // configured method, filling ret2.estimated_transform / cov / status.
+  // Shared by the SSM and NSSM pipelines.
+  void run_scan_match_icp(ICPResult& ret2, const SMParams& params);
 
   gtsam::SharedNoiseModel create_noise_model(const Eigen::Vector3d& sigmas) const;
   gtsam::SharedNoiseModel create_full_noise_model(const Eigen::Matrix3d& cov) const;

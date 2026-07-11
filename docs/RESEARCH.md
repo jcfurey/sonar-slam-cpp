@@ -133,11 +133,16 @@ and `Slam::compute_icp_with_cov` in `src/core/slam_core.cpp`.
 - **A. Censi, "An accurate closed-form estimate of ICP's covariance,"
   ICRA 2007, pp. 3167–3172.** DOI: 10.1109/ROBOT.2007.363961
   The canonical closed-form ICP covariance estimator (Hessian of the
-  registration error, correlated correspondences). *Useful contrast: this repo
-  (following slam.py) instead estimates covariance empirically — many ICP runs
-  from perturbed initializations, robustified with FAST-MCD
-  (`compute_icp_with_cov` + `mcd.cpp`). Censi's method is the cheaper
-  closed-form alternative if that path ever needs to be faster.*
+  registration error, correlated correspondences). **Implemented as an opt-in
+  alternative** in `src/core/icp_covariance.cpp` (`censi_icp_covariance`) and
+  wired into the scan matchers via `ssm/cov_method: censi` / `nssm/cov_method:
+  censi` — one ICP plus the closed form instead of `cov_samples` ICP runs +
+  FAST-MCD (`compute_icp_with_cov` + `mcd.cpp`). Under an isotropic,
+  independent per-point noise model the estimate reduces to
+  `cov = 2·σ²·(Σ Jᵢᵀ Jᵢ)⁻¹`, validated by Monte Carlo (predicted vs. empirical
+  spread agree to ~1.5%). The default remains `cov_method: sampled`, so shipped
+  configs are byte-for-byte unchanged; the FAST-MCD path stays the parity
+  reference.
 
 - **F. Pomerleau, F. Colas, R. Siegwart, "A Review of Point Cloud Registration
   Algorithms for Mobile Robotics," Foundations and Trends in Robotics, 2015.**
@@ -283,3 +288,40 @@ Context for the dead-reckoning front-end (`dead_reckoning_node.cpp`,
   rank guidance (§2, 3N/4–4N/5 vs. the shipped N/4) and Censi's closed-form
   ICP covariance (§3) as a cheaper alternative to the sampled-ICP + FAST-MCD
   path.
+
+---
+
+## Findings status: what was acted on
+
+The research surfaced mostly **citations** (the bibliography above) plus a few
+**candidate algorithmic extensions**. Because this repo's contract is drop-in
+behavioral parity with `bruce_slam`, extensions are added opt-in (default
+config → unchanged behavior) and only when their correctness can be validated.
+
+**Implemented (opt-in, parity-preserving):**
+
+- **Censi closed-form ICP covariance** (§3) — `src/core/icp_covariance.cpp`,
+  selectable via `ssm/cov_method` / `nssm/cov_method: censi`. Replaces up to
+  `cov_samples` ICP registrations + FAST-MCD with a single ICP + closed form.
+  The covariance formula is Monte-Carlo validated (see the standalone
+  derivation in `include/sonar_slam_cpp/icp_covariance_math.hpp`). Default
+  stays `sampled`, so shipped configs are unaffected.
+
+**Documented, not changed (would break `bruce_slam` parity):**
+
+- **OS-CFAR rank** (§2) — the literature favours k ≈ 3N/4–4N/5, whereas the
+  shipped `feature.yaml` uses `rank: 10` with `Ntc: 40` (N/4), inherited
+  verbatim from `bruce_slam`. Left as-is to preserve tuning parity; the value
+  is already a config knob (`CFAR/rank`) for anyone who wants to follow the
+  guidance. The code's negative-`rank` fallback stays at N/2 to match
+  `CFAR.py`'s `rank=None`.
+
+**Deferred (new algorithms; correctness not verifiable in this environment):**
+
+- **VI-CFAR** (§2) — an adaptive CA/GO/SO detector. Would be a genuinely new
+  detector variant (no `bruce_slam` reference to match), and its decision
+  truth table needs validation against a reference implementation before it
+  can be trusted on real sonar. Tracked as a candidate `CFAR/alg: VI`.
+- **Group-k consistent measurement set maximization** (§5) — a research-grade
+  generalization of the PCM loop-closure gate; the current PCM
+  (`verify_pcm`) is correct and sufficient. Noted as a future upgrade path.

@@ -60,6 +60,12 @@ Python→C++ library replacements (no Python deps remain):
 | gtsam (Python wheel) | libgtsam-dev 4.2 (system) |
 | `bruce_slam.pcl` pybind module | direct libpointmatcher/PCL calls (`cloud_ops.cpp`) |
 
+Beyond the straight port, one opt-in extension is available: the ICP factor
+covariance can be estimated by the Censi (2007) closed form
+(`ssm/cov_method` / `nssm/cov_method: censi`) — one ICP plus an analytic
+covariance instead of `cov_samples` registrations + FAST-MCD. The default
+(`sampled`) reproduces `bruce_slam` exactly; see `docs/RESEARCH.md`.
+
 ## Build
 
 Inside the `nautilus-robot-gpu-1` container (ROS 2 Jazzy, CUDA 12.8):

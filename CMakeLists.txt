@@ -82,6 +82,7 @@ add_library(sonar_slam_core SHARED
   src/core/cloud_ops.cpp
   src/core/global_init.cpp
   src/core/mcd.cpp
+  src/core/icp_covariance.cpp
   src/core/slam_core.cpp
 )
 target_include_directories(sonar_slam_core PUBLIC
