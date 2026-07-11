@@ -303,9 +303,21 @@ config → unchanged behavior) and only when their correctness can be validated.
 - **Censi closed-form ICP covariance** (§3) — `src/core/icp_covariance.cpp`,
   selectable via `ssm/cov_method` / `nssm/cov_method: censi`. Replaces up to
   `cov_samples` ICP registrations + FAST-MCD with a single ICP + closed form.
-  The covariance formula is Monte-Carlo validated (see the standalone
-  derivation in `include/sonar_slam_cpp/icp_covariance_math.hpp`). Default
-  stays `sampled`, so shipped configs are unaffected.
+  The covariance formula is Monte-Carlo validated
+  (`test/censi_covariance_test.cpp`; predicted vs. empirical spread within
+  ~1.5%). Default stays `sampled`, so shipped configs are unaffected.
+
+  **Verified against the real stack** (ROS 2 Jazzy + GTSAM 4.2 +
+  libpointmatcher 1.4): `sonar_slam_core` — including this integration in
+  `slam_core.cpp` — compiles and links, and driving the real `Slam` class end
+  to end (real ISAM2 back-end, real libpointmatcher ICP) with
+  `cov_method: censi` accepts an SSM factor and yields a finite, positive
+  definite marginal covariance, matching the `sampled` path. On a
+  sparse/noisy scene the Censi covariance correctly exceeds the fixed
+  `icp_odom_sigmas` floor and drives the factor weight. All four CUDA kernels
+  additionally compile under `nvcc` 12 / `sm_86`. Not exercised here: live GPU
+  kernel execution (needs a device) and the ROS node layer (needs the vendor
+  driver-message packages).
 
 **Documented, not changed (would break `bruce_slam` parity):**
 
