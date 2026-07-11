@@ -16,12 +16,6 @@
       min_points: 5    # outlier rejection min points
       skip: 1          # how often to skip a point cloud, use 1
 
-    # the vis params
-    visualization:
-      coordinates: 'cartesian'
-      radius: 2
-      color: [0, 165, 255]
-
     # are we using compressed imagary
     compressed_images: false
 

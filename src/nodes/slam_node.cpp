@@ -65,6 +65,19 @@ public:
     slam_.icp_odom_sigmas = Eigen::Vector3d(icp_odom[0], icp_odom[1], icp_odom[2]);
 
     slam_.point_resolution = get_double("point_resolution");
+    slam_.point_noise = get_double("point_noise", 0.5);
+    feature_odom_sync_max_delay_ =
+      get_double("feature_odom_sync_max_delay", 0.5);
+
+    // [sobol samples per iteration, iterations, local-refine ftol]
+    const auto init_params = [this](const char* name,
+                                    const std::vector<double>& def) {
+      const auto v = get_double_array(name, def);
+      if (v.size() != 3)
+        throw std::runtime_error(std::string(name) +
+                                 " must be [n, iters, ftol]");
+      return v;
+    };
 
     slam_.ssm_params.enable = get_bool("ssm/enable");
     slam_.ssm_params.min_points = get_int("ssm/min_points");
@@ -76,6 +89,10 @@ public:
     // which left SSM on plain point-to-point ICP with a fixed noise model;
     // that poisoned the graph on pool geometry, see SONAR_SLAM_PLAN.md)
     slam_.ssm_params.initialization = get_bool("ssm/initialization", true);
+    const auto ssm_init = init_params("ssm/initialization_params", {50.0, 1.0, 0.01});
+    slam_.ssm_params.init_n = static_cast<int>(ssm_init[0]);
+    slam_.ssm_params.init_iters = static_cast<int>(ssm_init[1]);
+    slam_.ssm_params.init_ftol = ssm_init[2];
     slam_.ssm_params.cov_samples = get_int("ssm/cov_samples", 0);
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
@@ -84,6 +101,12 @@ public:
     slam_.nssm_params.max_translation = get_double("nssm/max_translation");
     slam_.nssm_params.max_rotation = get_double("nssm/max_rotation");
     slam_.nssm_params.source_frames = get_int("nssm/source_frames");
+    slam_.nssm_params.initialization = get_bool("nssm/initialization", true);
+    const auto nssm_init =
+      init_params("nssm/initialization_params", {100.0, 5.0, 0.01});
+    slam_.nssm_params.init_n = static_cast<int>(nssm_init[0]);
+    slam_.nssm_params.init_iters = static_cast<int>(nssm_init[1]);
+    slam_.nssm_params.init_ftol = nssm_init[2];
     slam_.nssm_params.cov_samples = get_int("nssm/cov_samples");
 
     slam_.pcm_queue_size = get_int("pcm_queue_size");
@@ -97,18 +120,16 @@ public:
     }
     slam_.icp.load_from_yaml(icp_config);
 
-    // raw sonar subscribed once so the Oculus geometry (max range / aperture,
-    // bounding NSSM loop-closure search) reflects the real sensor
+    // raw sonar keeps the Oculus geometry (max range / aperture, bounding the
+    // NSSM loop-closure search) current — the operator can change the sonar
+    // range mid-mission, so reconfigure whenever the ping geometry changes
     const std::string sonar_driver = get_string("sonar/driver", "oculus_compressed");
     const std::string sonar_topic = get_string("sonar/topic", SONAR_TOPIC);
     sonar_sub_ = subscribe_sonar(
       this, sonar_driver, sonar_topic, rclcpp::SensorDataQoS(),
       [this](const SonarPing& ping) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (oculus_configured_) return;
         slam_.oculus.configure(ping);
-        oculus_configured_ = true;
-        sonar_sub_.reset();  // config is assumed static
       });
 
     // feature cloud (primary) + dead-reckoning odometry, approx-time synced
@@ -185,12 +206,16 @@ private:
 
       if (slam_.keyframes.empty())
         slam_.add_prior(frame);
-      else
+      else if (enable_slam_)
         slam_.add_sequential_scan_matching(frame);
+      else
+        // SLAM back-end disabled: chain plain dead-reckoning odometry factors
+        slam_.add_odometry(frame);
 
       slam_.update_factor_graph(frame);
 
-      if (slam_.nssm_params.enable && slam_.add_nonsequential_scan_matching())
+      if (enable_slam_ && slam_.nssm_params.enable &&
+          slam_.add_nonsequential_scan_matching())
         slam_.update_factor_graph();
     }
 
@@ -394,7 +419,6 @@ private:
   double viz_min_period_ = 2.0;
   int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
-  bool oculus_configured_ = false;
   double feature_odom_sync_max_delay_ = 0.5;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;

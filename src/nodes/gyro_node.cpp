@@ -31,7 +31,9 @@ public:
                        .toRotationMatrix();
 
     const double latitude = get_double("latitude") * M_PI / 180.0;
-    earth_rate_ = -15.04107 * std::sin(latitude) / 3600.0;
+    // earth rotation rate: 15.04107 deg/hr at the pole -> rad/s, matching the
+    // radian delta angles the gyro adapters deliver
+    earth_rate_ = -15.04107 * std::sin(latitude) * M_PI / (180.0 * 3600.0);
     sensor_rate_ = get_double("sensor_rate");
 
     const std::string driver = get_string("gyro/driver", "kvh_gyro");
@@ -76,8 +78,9 @@ private:
   Eigen::Matrix3d offset_matrix_ = Eigen::Matrix3d::Identity();
   double earth_rate_ = 0.0;
   double sensor_rate_ = 250.0;
-  // start angles per gyro.py: roll=90, yaw=0, pitch=0
-  double roll_ = 90.0, yaw_ = 0.0, pitch_ = 0.0;
+  // start attitude per gyro.py (roll = 90 deg), tracked in RADIANS throughout:
+  // the gyro adapters deliver radian delta angles and Rot3::Ypr expects radians
+  double roll_ = M_PI / 2.0, yaw_ = 0.0, pitch_ = 0.0;
 
   rclcpp::SubscriptionBase::SharedPtr gyro_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;

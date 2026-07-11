@@ -207,10 +207,17 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
 {
   if (driver == "oculus_compressed") {
     return node->create_subscription<sonar_oculus::msg::OculusPing>(
-      topic, qos, [cb](const sonar_oculus::msg::OculusPing& msg) {
+      topic, qos, [node, cb](const sonar_oculus::msg::OculusPing& msg) {
         const cv::Mat buf(1, static_cast<int>(msg.ping.data.size()), CV_8UC1,
                           const_cast<unsigned char*>(msg.ping.data.data()));
         cv::Mat img = cv::imdecode(buf, cv::IMREAD_COLOR);
+        // a truncated/corrupt message must not take the node down
+        if (img.empty()) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping sonar ping %d: compressed image failed to decode",
+                      msg.ping_id);
+          return;
+        }
         cv::cvtColor(img, img, cv::COLOR_BGR2GRAY);
         cb(oculus_ping(msg, std::move(img)));
       });

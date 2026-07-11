@@ -7,8 +7,6 @@
 #include <opencv2/core.hpp>
 #include <vector>
 
-#include "sonar_slam_cpp/interp.hpp"
-
 namespace sonar_slam {
 
 struct FireMsg
@@ -39,7 +37,9 @@ struct SonarPing
 class OculusProperty
 {
 public:
-  // returns true when the geometry changed (per sonar.py configure())
+  // updates the geometry from a ping; returns true when it changed. Cheap
+  // when nothing changed, so it can run on every ping — the operator can
+  // change the sonar range/frequency mid-mission (per sonar.py configure())
   bool configure(const SonarPing& ping);
 
   double max_range = 30.0;
@@ -50,12 +50,6 @@ public:
   int num_ranges = 0;
   int num_bearings = 0;
   std::vector<float> bearings;
-
-  // polar <-> Cartesian remap maps (CV_32FC1), built on configure()
-  cv::Mat remap_x, remap_y;
-
-private:
-  Interp1d b2c_;  // bearing -> column (cubic, like sonar.py)
 };
 
 }  // namespace sonar_slam

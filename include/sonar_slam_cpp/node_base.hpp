@@ -91,7 +91,19 @@ protected:
 
   std::vector<double> get_double_array(const std::string& raw_name)
   {
-    const auto p = require_param(raw_name);
+    return as_double_array(require_param(raw_name));
+  }
+  std::vector<double> get_double_array(const std::string& raw_name,
+                                       const std::vector<double>& default_value)
+  {
+    const std::string name = normalize(raw_name);
+    if (!has_parameter(name)) declare_parameter(name, default_value);
+    return as_double_array(get_parameter(name));
+  }
+
+private:
+  static std::vector<double> as_double_array(const rclcpp::Parameter& p)
+  {
     if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY) {
       const auto ints = p.as_integer_array();
       return std::vector<double>(ints.begin(), ints.end());
@@ -99,7 +111,6 @@ protected:
     return p.as_double_array();
   }
 
-private:
   static double as_double(const rclcpp::Parameter& p)
   {
     return p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER

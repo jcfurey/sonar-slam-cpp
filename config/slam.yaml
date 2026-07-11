@@ -21,15 +21,20 @@
     # the node falls back to the installed package share copy of icp.yaml.
     icp_config: ""
 
-    # Raw sonar used ONCE at startup to configure the sonar geometry (max range /
-    # aperture bound the loop-closure search). Keep consistent with feature.yaml
-    # (which defaults to uncompressed images).
+    # Raw sonar keeps the sonar geometry current (max range / aperture bound
+    # the loop-closure search); range changes mid-mission are picked up. Keep
+    # consistent with feature.yaml (which defaults to uncompressed images).
     sonar:
       driver: oculus_uncompressed   # oculus_compressed | oculus_uncompressed | image
       topic: /sonar_oculus_node/ping
 
     # Downsample points for ICP/publishing
     point_resolution: 0.5
+    # noise radius (m) used by the overlap tests and the global-init occupancy grid
+    point_noise: 0.5
+
+    # max stamp difference (s) when pairing feature clouds with odometry
+    feature_odom_sync_max_delay: 0.5
 
     # Sequential scan matching (SSM)
     ssm:
@@ -38,6 +43,9 @@
       max_translation: 3.0    # the max translation allowed
       max_rotation: 0.5235987755982988   # deg(30)
       target_frames: 3        # the number of frames we compare the current frame to
+      initialization: true    # global scan-match init before ICP
+      initialization_params: [50.0, 1.0, 0.01]   # [sobol n per iter, iters, refine ftol]
+      cov_samples: 0          # >0 -> covariance-estimating ICP over the best init samples
 
     # Non-sequential scan matching
     nssm:
@@ -47,15 +55,10 @@
       max_translation: 10.0   # max translation allowed
       max_rotation: 1.0471975511965976   # deg(60)
       source_frames: 5        # the number of frames to aggregate when trying a loop closure
+      initialization: true    # global scan-match init before ICP
+      initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30
 
     # the PCM params for rejecting outlier loop closures
     pcm_queue_size: 5         # the sliding window size for PCM
     min_pcm: 2                # the min number of pairwise consistent loop closures
-
-    # TODO remove this param
-    # Number of samples to compute the probability of
-    # successful non-sequential scan matching p(z)
-    pz_samples: 0
-    # point re-detection rate
-    pz_detection_rate: 0.3
