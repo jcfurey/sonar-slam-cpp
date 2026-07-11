@@ -74,7 +74,8 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
 {
   McdResult result;
   const int n = X.rows(), d = X.cols();
-  const int h = static_cast<int>(std::ceil(support_fraction * n));
+  // sklearn MinCovDet floors: n_support = int(support_fraction * n_samples)
+  const int h = static_cast<int>(support_fraction * n);
   if (n < d + 1 || h < d + 1 || h > n) return result;
 
   std::mt19937 rng(0x5eed);  // deterministic across runs
@@ -109,8 +110,11 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   if (!lu.isInvertible()) return result;
   Eigen::VectorXd d2 = mahalanobis_sq(X, best.mu, lu.inverse());
   std::vector<double> d2_sorted(d2.data(), d2.data() + d2.size());
-  std::nth_element(d2_sorted.begin(), d2_sorted.begin() + n / 2, d2_sorted.end());
-  const double median_d2 = d2_sorted[n / 2];
+  std::sort(d2_sorted.begin(), d2_sorted.end());
+  // np.median semantics: average the two middle elements for even n
+  const double median_d2 =
+    (n % 2 != 0) ? d2_sorted[n / 2]
+                 : 0.5 * (d2_sorted[n / 2 - 1] + d2_sorted[n / 2]);
   const double correction = median_d2 / CHI2_MEDIAN_3;
   if (correction <= 0.0 || !std::isfinite(correction)) return result;
   Eigen::MatrixXd cov_corrected = best.cov * correction;

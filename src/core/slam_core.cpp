@@ -8,11 +8,11 @@
 #include <gtsam/slam/PriorFactor.h>
 
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <map>
 #include <set>
+#include <stdexcept>
 
 namespace sonar_slam {
 
@@ -51,11 +51,19 @@ Slam::Slam()
 
 void Slam::configure()
 {
-  assert(nssm_params.cov_samples == 0 ||
-         nssm_params.cov_samples < nssm_params.init_n * nssm_params.init_iters);
-  assert(ssm_params.cov_samples == 0 ||
-         ssm_params.cov_samples < ssm_params.init_n * ssm_params.init_iters);
-  assert(nssm_params.source_frames < nssm_params.min_st_sep);
+  // config sanity (slam.py used asserts; these must also fire in NDEBUG
+  // builds — the default build type disables assert())
+  if (nssm_params.cov_samples > 0 &&
+      nssm_params.cov_samples >= nssm_params.init_n * nssm_params.init_iters)
+    throw std::invalid_argument(
+      "nssm/cov_samples must be < initialization n * iters");
+  if (ssm_params.cov_samples > 0 &&
+      ssm_params.cov_samples >= ssm_params.init_n * ssm_params.init_iters)
+    throw std::invalid_argument(
+      "ssm/cov_samples must be < initialization n * iters");
+  if (nssm_params.source_frames >= nssm_params.min_st_sep)
+    throw std::invalid_argument(
+      "nssm/source_frames must be < nssm/min_st_sep");
 
   prior_model_ = create_noise_model(prior_sigmas);
   odom_model_ = create_noise_model(odom_sigmas);
@@ -542,7 +550,9 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
 bool Slam::add_nonsequential_scan_matching()
 {
-  if (current_key() < nssm_params.min_st_sep) return false;
+  // current_frame is assigned at the END of the SLAM callback, so it is null
+  // until the second callback
+  if (!current_frame || current_key() < nssm_params.min_st_sep) return false;
 
   InitializationResult ret = initialize_nonsequential_scan_matching();
   if (!ret.status) return false;

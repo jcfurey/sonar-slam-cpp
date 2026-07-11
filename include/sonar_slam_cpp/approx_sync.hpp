@@ -4,11 +4,17 @@
 // nearest message within `slop` seconds from every secondary queue. A match
 // is emitted once every secondary stream has advanced past the primary stamp
 // (or its queue is deep enough that the nearest neighbor is final).
+//
+// Thread safety: add_* calls are serialized on an internal mutex, so the
+// synchronizer is safe under multithreaded executors. The callback fires
+// while that mutex is held — callbacks must not call back into the same
+// synchronizer.
 #pragma once
 
 #include <cmath>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <utility>
 
@@ -67,6 +73,7 @@ public:
 
   void add_primary(double t, const A& a)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     qa_.push_back({t, a});
     detail::trim(qa_, queue_size_);
     try_emit();
@@ -74,6 +81,7 @@ public:
 
   void add_secondary(double t, const B& b)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     qb_.push_back({t, b});
     detail::trim(qb_, queue_size_);
     try_emit();
@@ -99,6 +107,7 @@ private:
   std::size_t queue_size_;
   double slop_;
   Callback cb_;
+  std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;
 };
@@ -117,6 +126,7 @@ public:
 
   void add_primary(double t, const A& a)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     qa_.push_back({t, a});
     detail::trim(qa_, queue_size_);
     try_emit();
@@ -124,6 +134,7 @@ public:
 
   void add_secondary_b(double t, const B& b)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     qb_.push_back({t, b});
     detail::trim(qb_, queue_size_);
     try_emit();
@@ -131,6 +142,7 @@ public:
 
   void add_secondary_c(double t, const C& c)
   {
+    std::lock_guard<std::mutex> lock(mutex_);
     qc_.push_back({t, c});
     detail::trim(qc_, queue_size_);
     try_emit();
@@ -157,6 +169,7 @@ private:
   std::size_t queue_size_;
   double slop_;
   Callback cb_;
+  std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;
   std::deque<detail::Stamped<C>> qc_;
