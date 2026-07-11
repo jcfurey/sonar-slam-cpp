@@ -84,9 +84,12 @@ int main(int argc, char** argv)
       if (gpu) {
         Eigen::Matrix<std::uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
           gmask(rows, cols);
-        sonar_slam::gpu::cfar_cuda(img.data(), rows, cols, alg, train_hs,
-                                   guard_hs, rank, taus(alg, 0), gmask.data());
-        write_mat(dir + "cpp_mask_gpu_" + names[alg] + ".u8", gmask);
+        if (sonar_slam::gpu::cfar_cuda(img.data(), rows, cols, alg, train_hs,
+                                       guard_hs, rank, taus(alg, 0),
+                                       gmask.data()))
+          write_mat(dir + "cpp_mask_gpu_" + names[alg] + ".u8", gmask);
+        else
+          std::printf("CFAR alg %d: GPU path failed, no gpu mask written\n", alg);
       }
 #endif
     }

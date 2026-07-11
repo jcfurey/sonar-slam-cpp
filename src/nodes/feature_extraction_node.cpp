@@ -92,6 +92,8 @@ private:
     rows_ = rows;
     width_ = width;
     cols_ = cols;
+    // new maps -> new version so the GPU remap re-uploads its cached copy
+    ++map_version_;
 
     // bearing -> beam column, linear like feature_extraction.py
     std::vector<double> bx(ping.bearings.begin(), ping.bearings.end());
@@ -138,17 +140,21 @@ private:
 
   cv::Mat remap_u8(const cv::Mat& src) const
   {
+    const cv::Mat cont = src.isContinuous() ? src : src.clone();
 #ifdef SONAR_SLAM_WITH_CUDA
+    // maps are device-resident across calls (re-uploaded only when
+    // map_version_ changes); a failing GPU falls through to cv::remap
     if (gpu::available()) {
       cv::Mat dst(map_x_.rows, map_x_.cols, CV_8UC1);
-      gpu::remap_u8_cuda(src.ptr<std::uint8_t>(), src.rows, src.cols,
-                         map_x_.ptr<float>(), map_y_.ptr<float>(), map_x_.rows,
-                         map_x_.cols, 1, dst.ptr<std::uint8_t>());
-      return dst;
+      if (gpu::remap_u8_cuda(cont.ptr<std::uint8_t>(), cont.rows, cont.cols,
+                             map_x_.ptr<float>(), map_y_.ptr<float>(),
+                             map_x_.rows, map_x_.cols, 1, map_version_,
+                             dst.ptr<std::uint8_t>()))
+        return dst;
     }
 #endif
     cv::Mat dst;
-    cv::remap(src, dst, map_x_, map_y_, cv::INTER_LINEAR);
+    cv::remap(cont, dst, map_x_, map_y_, cv::INTER_LINEAR);
     return dst;
   }
 
@@ -174,12 +180,15 @@ private:
     cv::compare(img, threshold_, above, cv::CMP_GT);  // 0/255
     cv::bitwise_and(peaks, above, peaks);             // 0/1 & 0/255 -> 0/1...
 
-    // visualization image (Cartesian, JET colormap like cv2.applyColorMap(_, 2))
-    cv::Mat vis;
-    cv::remap(img, vis, map_x_, map_y_, cv::INTER_LINEAR);
-    cv::applyColorMap(vis, vis, cv::COLORMAP_JET);
-    feature_img_pub_->publish(
-      *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", vis).toImageMsg());
+    // visualization image (Cartesian, JET colormap like cv2.applyColorMap(_, 2));
+    // remapped through the same GPU path as the detection mask, and skipped
+    // entirely when nobody is subscribed
+    if (feature_img_pub_->get_subscription_count() > 0) {
+      cv::Mat vis = remap_u8(img);
+      cv::applyColorMap(vis, vis, cv::COLORMAP_JET);
+      feature_img_pub_->publish(
+        *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", vis).toImageMsg());
+    }
 
     // to Cartesian
     const cv::Mat cart_peaks = remap_u8(peaks);
@@ -220,6 +229,7 @@ private:
   // remap state
   double res_ = 0.0, height_ = 0.0, width_ = 0.0;
   int rows_ = 0, cols_ = 0;
+  int map_version_ = 0;
   cv::Mat map_x_, map_y_;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;

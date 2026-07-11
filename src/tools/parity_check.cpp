@@ -64,11 +64,15 @@ int main()
 #ifdef SONAR_SLAM_WITH_CUDA
       cv::Mat gpu_mask(rows, cols, CV_8UC1);
       t0 = Clock::now();
-      sonar_slam::gpu::cfar_cuda(img.ptr<float>(), rows, cols,
-                                 static_cast<int>(alg), 20, 5, 10,
-                                 cfar.threshold_factor(alg),
-                                 gpu_mask.ptr<std::uint8_t>());
+      const bool ok = sonar_slam::gpu::cfar_cuda(
+        img.ptr<float>(), rows, cols, static_cast<int>(alg), 20, 5, 10,
+        cfar.threshold_factor(alg), gpu_mask.ptr<std::uint8_t>());
       const double gpu_ms = ms_since(t0);
+      if (!ok) {
+        std::printf("CFAR alg %d: GPU path failed\n", static_cast<int>(alg));
+        ++failures;
+        continue;
+      }
       const int diff = cv::countNonZero(cpu_mask != gpu_mask);
       std::printf("CFAR alg %d: cpu %.2f ms, gpu %.2f ms, mismatched px %d\n",
                   static_cast<int>(alg), cpu_ms, gpu_ms, diff);
@@ -96,15 +100,20 @@ int main()
     cv::Mat cpu_dst;
     cv::remap(mask, cpu_dst, map_x, map_y, cv::INTER_LINEAR);
     cv::Mat gpu_dst(rows, cols, CV_8UC1);
-    sonar_slam::gpu::remap_u8_cuda(mask.ptr<std::uint8_t>(), rows, cols,
-                                   map_x.ptr<float>(), map_y.ptr<float>(), rows,
-                                   cols, 1, gpu_dst.ptr<std::uint8_t>());
-    // cv::remap uses fixed-point bilinear (5-bit fractions); allow +-1 counts
-    cv::Mat diff;
-    cv::absdiff(cpu_dst, gpu_dst, diff);
-    const int bad = cv::countNonZero(diff > 1);
-    std::printf("remap linear: pixels differing by >1: %d\n", bad);
-    if (bad > rows * cols / 1000) ++failures;
+    if (!sonar_slam::gpu::remap_u8_cuda(
+          mask.ptr<std::uint8_t>(), rows, cols, map_x.ptr<float>(),
+          map_y.ptr<float>(), rows, cols, 1, /*map_version=*/-1,
+          gpu_dst.ptr<std::uint8_t>())) {
+      std::printf("remap linear: GPU path failed\n");
+      ++failures;
+    } else {
+      // cv::remap uses fixed-point bilinear (5-bit fractions); allow +-1 counts
+      cv::Mat diff;
+      cv::absdiff(cpu_dst, gpu_dst, diff);
+      const int bad = cv::countNonZero(diff > 1);
+      std::printf("remap linear: pixels differing by >1: %d\n", bad);
+      if (bad > rows * cols / 1000) ++failures;
+    }
   }
 #endif
 

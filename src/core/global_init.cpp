@@ -89,8 +89,9 @@ CostGrid build_grid(const Matrix& target_points, double point_noise)
   g.grid = cv::Mat::zeros(rows, cols, CV_8UC1);
 
   for (int i = 0; i < target_points.rows(); ++i) {
-    int r = static_cast<int>(std::lround((target_points(i, 1) - ymin) / g.resolution));
-    int c = static_cast<int>(std::lround((target_points(i, 0) - xmin) / g.resolution));
+    // rint = round half to even, matching np.round in slam.py
+    int r = static_cast<int>(std::rint((target_points(i, 1) - ymin) / g.resolution));
+    int c = static_cast<int>(std::rint((target_points(i, 0) - xmin) / g.resolution));
     r = std::clamp(r, 0, rows - 1);
     c = std::clamp(c, 0, cols - 1);
     g.grid.at<std::uint8_t>(r, c) = 255;
@@ -136,8 +137,11 @@ void eval_costs_cpu(const Matrix& points, const std::vector<std::array<float, 6>
       const float px = points(i, 0), py = points(i, 1);
       const float x = T[0] * px + T[1] * py + T[4];
       const float y = T[2] * px + T[3] * py + T[5];
-      const int r = static_cast<int>(std::lround((y - ymin) * inv_res));
-      const int c = static_cast<int>(std::lround((x - xmin) * inv_res));
+      // rint = round half to even — the same arithmetic as np.round and the
+      // CUDA __float2int_rn, so CPU-scored and GPU-scored costs agree (the
+      // Nelder-Mead refinement always scores on the CPU)
+      const int r = static_cast<int>(std::rint((y - ymin) * inv_res));
+      const int c = static_cast<int>(std::rint((x - xmin) * inv_res));
       if (r >= 0 && r < rows && c >= 0 && c < cols &&
           g.grid.at<std::uint8_t>(r, c) > 0)
         ++hits;
@@ -155,6 +159,8 @@ void eval_costs(const Matrix& points, const std::vector<std::array<float, 6>>& T
     return;
   }
 #ifdef SONAR_SLAM_WITH_CUDA
+  // batching pays off past a handful of candidates; on any device error the
+  // wrapper returns false and the CPU twin below produces the costs
   if (gpu::available() && Ts.size() >= 8) {
     // row-major point buffer
     std::vector<float> pts(points.rows() * 2);
@@ -162,12 +168,13 @@ void eval_costs(const Matrix& points, const std::vector<std::array<float, 6>>& T
       pts[2 * i] = points(i, 0);
       pts[2 * i + 1] = points(i, 1);
     }
-    gpu::grid_cost_cuda(pts.data(), points.rows(), Ts[0].data(),
-                        static_cast<int>(Ts.size()), g.grid.ptr<std::uint8_t>(),
-                        g.grid.rows, g.grid.cols, static_cast<float>(g.xmin),
-                        static_cast<float>(g.ymin),
-                        static_cast<float>(g.resolution), costs.data());
-    return;
+    if (gpu::grid_cost_cuda(pts.data(), points.rows(), Ts[0].data(),
+                            static_cast<int>(Ts.size()),
+                            g.grid.ptr<std::uint8_t>(), g.grid.rows,
+                            g.grid.cols, static_cast<float>(g.xmin),
+                            static_cast<float>(g.ymin),
+                            static_cast<float>(g.resolution), costs.data()))
+      return;
   }
 #endif
   eval_costs_cpu(points, Ts, g, costs);

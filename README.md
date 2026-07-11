@@ -8,8 +8,8 @@ CPU-only machine with identical behavior.
 ## Drop-in compatibility
 
 Topic names, parameter names and YAML layouts are **identical** to the Python
-`bruce_slam` package — the configs under `config/` are verbatim copies, and any
-tuning done for the Python stack (including
+`bruce_slam` package — the configs under `config/` are drop-in compatible, and
+any tuning done for the Python stack (including
 `src/settings/params/localization/sonar_slam/*.yaml`) applies unchanged. The
 two stacks are interchangeable per-node: you can run the C++ feature extractor
 against the Python SLAM node or vice versa.
@@ -40,7 +40,12 @@ to CPU-only silently otherwise):
 
 Runtime dispatch: `gpu::available()` = built with CUDA ∧ device present ∧
 `SONAR_SLAM_FORCE_CPU` unset. CPU twins are OpenMP-parallel and are the same
-arithmetic (the parity_check tool verifies mask equality per pixel).
+arithmetic (the parity_check tool verifies mask equality per pixel). Any
+runtime CUDA failure (allocation, copy, launch) makes the wrapper return
+false and that call falls back to the CPU twin — a GPU error degrades, it
+never corrupts the output. Device buffers are cached and reused across calls,
+and the remap coordinate maps stay device-resident until the sonar geometry
+changes.
 
 Python→C++ library replacements (no Python deps remain):
 

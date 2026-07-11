@@ -70,6 +70,8 @@ if(HAVE_CUDA)
     CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON)
   target_include_directories(sonar_slam_cuda PRIVATE include)
+  # the .cu files include gpu.hpp, whose declarations are behind this define
+  target_compile_definitions(sonar_slam_cuda PRIVATE SONAR_SLAM_WITH_CUDA)
 endif()
 
 # -------------------------------------------------------------------- core library

@@ -169,11 +169,13 @@ cv::Mat CFAR::detect(const cv::Mat& img, Alg alg) const
   const double tau = threshold_factor(alg);
 
 #ifdef SONAR_SLAM_WITH_CUDA
-  if (gpu::available()) {
-    gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols, static_cast<int>(alg),
-                   train_hs, guard_hs, rank_, tau, mask.ptr<std::uint8_t>());
+  // the wrapper refuses unsupported configs and reports device errors; either
+  // way the CPU twin below produces the result
+  if (gpu::available() &&
+      gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
+                     static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
+                     mask.ptr<std::uint8_t>()))
     return mask;
-  }
 #endif
   detect_cpu(fimg.ptr<float>(), img.rows, img.cols, static_cast<int>(alg),
              train_hs, guard_hs, rank_, tau, mask.ptr<std::uint8_t>());

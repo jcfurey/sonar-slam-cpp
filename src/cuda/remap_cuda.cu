@@ -2,24 +2,19 @@
 // Matches cv::remap semantics with BORDER_CONSTANT(0): dst(r,c) samples
 // src(map_y(r,c), map_x(r,c)); negative map values (the fill for out-of-fan
 // pixels) fall outside and produce 0.
-#include <cuda_runtime.h>
+//
+// The coordinate maps only change when the sonar geometry changes, so they
+// are kept device-resident across calls, keyed by the caller's map_version.
+#include "cuda_common.cuh"
+#include "sonar_slam_cpp/gpu.hpp"
 
 #include <cstdint>
-#include <cstdio>
+#include <mutex>
 
 namespace sonar_slam {
 namespace gpu {
 
 namespace {
-
-#define CUDA_CHECK(call)                                                     \
-  do {                                                                       \
-    cudaError_t err__ = (call);                                              \
-    if (err__ != cudaSuccess) {                                              \
-      fprintf(stderr, "sonar_slam_cpp CUDA error %s at %s:%d\n",             \
-              cudaGetErrorString(err__), __FILE__, __LINE__);                \
-    }                                                                        \
-  } while (0)
 
 __device__ inline float sample_or_zero(const std::uint8_t* src, int rows,
                                        int cols, int r, int c)
@@ -62,35 +57,58 @@ __global__ void remap_kernel(const std::uint8_t* __restrict__ src, int src_rows,
 
 }  // namespace
 
-void remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
+bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
                    const float* map_x, const float* map_y, int dst_rows,
-                   int dst_cols, int interp, std::uint8_t* dst)
+                   int dst_cols, int interp, int map_version, std::uint8_t* dst)
 {
+  static std::mutex mutex;
+  static detail::DeviceBuffer src_buf, dst_buf, mx_buf, my_buf;
+  static int cached_version = -1;
+  static int cached_rows = 0, cached_cols = 0;
+  std::lock_guard<std::mutex> lock(mutex);
+
   const std::size_t n_src = static_cast<std::size_t>(src_rows) * src_cols;
   const std::size_t n_dst = static_cast<std::size_t>(dst_rows) * dst_cols;
 
-  std::uint8_t *d_src = nullptr, *d_dst = nullptr;
-  float *d_mx = nullptr, *d_my = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_src, n_src));
-  CUDA_CHECK(cudaMalloc(&d_dst, n_dst));
-  CUDA_CHECK(cudaMalloc(&d_mx, n_dst * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_my, n_dst * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(d_src, src, n_src, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_mx, map_x, n_dst * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_my, map_y, n_dst * sizeof(float), cudaMemcpyHostToDevice));
+  if (!src_buf.ensure(n_src, "remap_u8_cuda src") ||
+      !dst_buf.ensure(n_dst, "remap_u8_cuda dst") ||
+      !mx_buf.ensure(n_dst * sizeof(float), "remap_u8_cuda map_x") ||
+      !my_buf.ensure(n_dst * sizeof(float), "remap_u8_cuda map_y"))
+    return false;
+
+  const bool maps_cached = map_version >= 0 && map_version == cached_version &&
+                           dst_rows == cached_rows && dst_cols == cached_cols;
+  if (!maps_cached) {
+    cached_version = -1;  // stays invalid if either upload fails
+    if (!detail::check(cudaMemcpy(mx_buf.as<float>(), map_x,
+                                  n_dst * sizeof(float), cudaMemcpyHostToDevice),
+                       "remap_u8_cuda map_x upload") ||
+        !detail::check(cudaMemcpy(my_buf.as<float>(), map_y,
+                                  n_dst * sizeof(float), cudaMemcpyHostToDevice),
+                       "remap_u8_cuda map_y upload"))
+      return false;
+    cached_version = map_version;
+    cached_rows = dst_rows;
+    cached_cols = dst_cols;
+  }
+
+  if (!detail::check(cudaMemcpy(src_buf.as<std::uint8_t>(), src, n_src,
+                                cudaMemcpyHostToDevice),
+                     "remap_u8_cuda src upload"))
+    return false;
 
   const dim3 block(32, 8);
   const dim3 grid((dst_cols + block.x - 1) / block.x,
                   (dst_rows + block.y - 1) / block.y);
-  remap_kernel<<<grid, block>>>(d_src, src_rows, src_cols, d_mx, d_my, dst_rows,
-                                dst_cols, interp, d_dst);
-  CUDA_CHECK(cudaGetLastError());
+  remap_kernel<<<grid, block>>>(src_buf.as<std::uint8_t>(), src_rows, src_cols,
+                                mx_buf.as<float>(), my_buf.as<float>(),
+                                dst_rows, dst_cols, interp,
+                                dst_buf.as<std::uint8_t>());
+  if (!detail::check(cudaGetLastError(), "remap_u8_cuda launch")) return false;
 
-  CUDA_CHECK(cudaMemcpy(dst, d_dst, n_dst, cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(d_src));
-  CUDA_CHECK(cudaFree(d_dst));
-  CUDA_CHECK(cudaFree(d_mx));
-  CUDA_CHECK(cudaFree(d_my));
+  return detail::check(cudaMemcpy(dst, dst_buf.as<std::uint8_t>(), n_dst,
+                                  cudaMemcpyDeviceToHost),
+                       "remap_u8_cuda download");
 }
 
 }  // namespace gpu
