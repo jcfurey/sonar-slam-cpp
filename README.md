@@ -87,9 +87,29 @@ source /opt/ros/jazzy/setup.bash && source install/setup.bash
 colcon build --packages-select sonar_slam_cpp --merge-install
 ```
 
-Depends on the driver message stubs from the sonar-SLAM repo
-(`sonar_oculus`, `rti_dvl`, `bar30_depth`, `kvh_gyro`) plus system
-`ros-jazzy-libpointmatcher`, `libgtsam-dev`, PCL and OpenCV.
+Requires standard ROS 2 messages (`marine_acoustic_msgs`, `sensor_msgs`,
+`geometry_msgs`, `nav_msgs`, `std_msgs`) plus system
+`ros-jazzy-libpointmatcher`, `libgtsam-dev`, PCL and OpenCV. The legacy
+BlueROV driver message stubs (`sonar_oculus`, `rti_dvl`, `bar30_depth`,
+`kvh_gyro`) are **optional** — `find_package(... QUIET)` compiles their
+adapters when present and the build degrades to standard-message drivers
+otherwise, so a standard-payload deployment needs none of them.
+
+## Sensor payloads
+
+Nodes pick their sensor drivers by parameter, so different vehicles are
+supported with a config overlay, not code changes. Ready presets live in
+`config/payloads/`; e.g. the **Deep Trekker Revolution** (Water Linked
+DVL-A50, Blueprint Oculus, ENU AHRS, pressure depth) runs entirely on standard
+messages with no vendor packages:
+
+```bash
+ros2 launch sonar_slam_cpp slam.launch.xml \
+  payload_config:=$(ros2 pkg prefix --share sonar_slam_cpp)/config/payloads/deeptrekker_revolution.yaml \
+  enable_gyro:=false
+```
+
+The full driver matrix and how to add a payload are in `docs/PAYLOADS.md`.
 
 ## Run
 

@@ -1,0 +1,11 @@
+# Default payload overlay — a no-op. It sets only a marker parameter (which no
+# node reads), so the per-node base configs (dead_reckoning.yaml / feature.yaml
+# / kalman.yaml / gyro.yaml) supply every driver setting unchanged (legacy
+# BlueROV payload). Launching with the default payload_config is therefore
+# equivalent to not having the overlay mechanism at all. Point payload_config
+# at another file under this directory to reconfigure the sensor suite
+# (see docs/PAYLOADS.md). The marker is introspectable at runtime:
+#   ros2 param get /bruce/slam/localization sonar_slam_payload
+/**:
+  ros__parameters:
+    sonar_slam_payload: none

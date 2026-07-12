@@ -41,10 +41,39 @@ find_package(builtin_interfaces REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(marine_acoustic_msgs REQUIRED)
-find_package(sonar_oculus REQUIRED)
-find_package(rti_dvl REQUIRED)
-find_package(bar30_depth REQUIRED)
-find_package(kvh_gyro REQUIRED)
+
+# Legacy BlueROV-payload vendor message packages. OPTIONAL: a build that only
+# targets standard-message payloads (e.g. the Deep Trekker Revolution, which
+# runs on marine_acoustic_msgs + sensor_msgs) does not need any of them. Each
+# package found here defines HAVE_<PKG> so src/ros/sensors.cpp compiles the
+# matching driver adapter; an un-found driver reports a runtime error when
+# selected. dvl_msgs is the optional native Water Linked A50 message package.
+find_package(sonar_oculus QUIET)
+find_package(rti_dvl QUIET)
+find_package(bar30_depth QUIET)
+find_package(kvh_gyro QUIET)
+find_package(dvl_msgs QUIET)
+
+set(SONAR_SLAM_VENDOR_MSG_DEPS "")
+set(SONAR_SLAM_VENDOR_MSG_DEFS "")
+foreach(pkg_def
+    sonar_oculus:HAVE_SONAR_OCULUS  rti_dvl:HAVE_RTI_DVL
+    bar30_depth:HAVE_BAR30_DEPTH    kvh_gyro:HAVE_KVH_GYRO
+    dvl_msgs:HAVE_DVL_MSGS)
+  string(REPLACE ":" ";" pd ${pkg_def})
+  list(GET pd 0 pkg)
+  list(GET pd 1 def)
+  if(${pkg}_FOUND)
+    list(APPEND SONAR_SLAM_VENDOR_MSG_DEPS ${pkg})
+    list(APPEND SONAR_SLAM_VENDOR_MSG_DEFS ${def})
+  endif()
+endforeach()
+if(SONAR_SLAM_VENDOR_MSG_DEPS)
+  message(STATUS "sonar_slam_cpp: vendor message packages found: ${SONAR_SLAM_VENDOR_MSG_DEPS}")
+else()
+  message(STATUS "sonar_slam_cpp: no legacy vendor message packages found — "
+                 "standard-message drivers only (Revolution-style build)")
+endif()
 
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
@@ -121,16 +150,23 @@ target_link_libraries(sonar_slam_ros sonar_slam_core)
 ament_target_dependencies(sonar_slam_ros
   rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
   builtin_interfaces tf2_ros cv_bridge marine_acoustic_msgs
-  sonar_oculus rti_dvl bar30_depth kvh_gyro)
+  ${SONAR_SLAM_VENDOR_MSG_DEPS})
+# sensors.cpp guards each vendor adapter behind its HAVE_<PKG> define; only the
+# packages actually found above are compiled in.
+if(SONAR_SLAM_VENDOR_MSG_DEFS)
+  target_compile_definitions(sonar_slam_ros PRIVATE ${SONAR_SLAM_VENDOR_MSG_DEFS})
+endif()
 
 # --------------------------------------------------------------------------- nodes
 function(sonar_slam_node name src)
   add_executable(${name} ${src})
   target_link_libraries(${name} sonar_slam_ros)
+  # nodes select drivers by parameter string and never include a vendor header;
+  # the vendor message runtime comes transitively through sonar_slam_ros
   ament_target_dependencies(${name}
     rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
     builtin_interfaces tf2_ros cv_bridge marine_acoustic_msgs
-    sonar_oculus rti_dvl bar30_depth kvh_gyro ament_index_cpp)
+    ${SONAR_SLAM_VENDOR_MSG_DEPS} ament_index_cpp)
   install(TARGETS ${name} DESTINATION lib/${PROJECT_NAME})
 endfunction()
 

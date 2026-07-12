@@ -20,11 +20,17 @@
     compressed_images: false
 
     # ------------------------------------------------------------------------
-    # Sonar driver (pluggable adapter, see bruce_slam/sensors.py).
-    # Leave 'driver' blank to auto-select the Oculus adapter from compressed_images.
+    # Sonar driver (pluggable adapter, see src/ros/sensors.cpp). Leave 'driver'
+    # blank to auto-select the Oculus adapter from compressed_images. For a
+    # different vehicle, prefer a payload overlay (config/payloads/*.yaml,
+    # docs/PAYLOADS.md).
+    #   "" | oculus_compressed | oculus_uncompressed  -> sonar_oculus (vendor)
+    #   projected_sonar  -> marine_acoustic_msgs/ProjectedSonarImage (standard;
+    #                       modern Blueprint Oculus drivers, e.g. Revolution)
+    #   image            -> plain grayscale polar sensor_msgs/Image
     # ------------------------------------------------------------------------
     sonar:
-      driver: ""     # "" | oculus_compressed | oculus_uncompressed | image
+      driver: ""     # see options above
       topic: ""      # "" -> default Oculus topic for the selected mode
       # for driver: image (a plain grayscale polar sensor_msgs/Image):
       # range_resolution: 0.03      # meters per range bin (required)

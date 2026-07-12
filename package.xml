@@ -26,11 +26,21 @@
   <depend>cv_bridge</depend>
   <depend>marine_acoustic_msgs</depend>
 
-  <!-- driver message stubs (built from the sonar-SLAM repo in this workspace) -->
+  <!-- Optional legacy BlueROV-payload driver message stubs (built from the
+       sonar-SLAM repo). The build finds them QUIET and degrades to standard-
+       message drivers when they are absent, so a standard-only payload (e.g.
+       the Deep Trekker Revolution) needs none of them — see docs/PAYLOADS.md.
+       Kept as <depend> so colcon orders them first when they ARE present;
+       a standard-only workspace resolves them with rosdep --skip-keys. -->
   <depend>sonar_oculus</depend>
   <depend>rti_dvl</depend>
   <depend>bar30_depth</depend>
   <depend>kvh_gyro</depend>
+  <!-- Optional native Water Linked A50 messages (paagutie/ndahn dvl_msgs).
+       Enables the 'dvl_a50' driver; the standard 'dvl_standard'
+       (marine_acoustic_msgs/Dvl) path needs no extra package.
+  <depend>dvl_msgs</depend> -->
+
 
   <depend>libpointmatcher</depend>
   <depend>gtsam</depend>

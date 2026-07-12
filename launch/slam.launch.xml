@@ -5,16 +5,29 @@
 <launch>
   <arg name="enable_slam" default="true"/>
   <arg name="kalman_dead_reckoning" default="false"/>
+  <!-- Omit the FOG gyro integration node. Set false for a payload with no
+       fibre-optic gyro (e.g. the Deep Trekker Revolution). -->
+  <arg name="enable_gyro" default="true"/>
   <arg name="config_dir" default="$(find-pkg-share sonar_slam_cpp)/config"/>
+  <!-- Sensor-payload overlay applied on top of the per-node base configs. It
+       overrides only driver/topic/frame parameters. The default (none.yaml) is
+       a no-op, so the base configs (legacy BlueROV) apply unchanged. For the
+       Deep Trekker Revolution:
+         payload_config:=$(var config_dir)/payloads/deeptrekker_revolution.yaml
+         enable_gyro:=false
+       See docs/PAYLOADS.md for the full matrix. -->
+  <arg name="payload_config" default="$(var config_dir)/payloads/none.yaml"/>
 
   <group unless="$(var kalman_dead_reckoning)">
     <node pkg="sonar_slam_cpp" exec="gyro_node" name="gyro_fusion"
-          namespace="bruce/slam" output="screen">
+          namespace="bruce/slam" output="screen" if="$(var enable_gyro)">
       <param from="$(var config_dir)/gyro.yaml"/>
+      <param from="$(var payload_config)"/>
     </node>
     <node pkg="sonar_slam_cpp" exec="dead_reckoning_node" name="localization"
           namespace="bruce/slam" output="screen">
       <param from="$(var config_dir)/dead_reckoning.yaml"/>
+      <param from="$(var payload_config)"/>
     </node>
   </group>
 
@@ -22,16 +35,18 @@
     <node pkg="sonar_slam_cpp" exec="kalman_node" name="kalman"
           namespace="bruce/slam" output="screen">
       <param from="$(var config_dir)/kalman.yaml"/>
+      <param from="$(var payload_config)"/>
     </node>
   </group>
 
   <node pkg="sonar_slam_cpp" exec="feature_extraction_node"
         name="feature_extraction" namespace="bruce/slam" output="screen">
     <param from="$(var config_dir)/feature.yaml"/>
+    <param from="$(var payload_config)"/>
   </node>
 
-  <node pkg="sonar_slam_cpp" exec="slam_node" name="slam"
-        namespace="bruce/slam" output="screen">
+  <node pkg="sonar_slam_cpp" exec="slam_node" name="slam" namespace="bruce/slam"
+        output="screen">
     <param from="$(var config_dir)/slam.yaml"/>
     <param name="enable_slam" value="$(var enable_slam)"/>
     <param name="icp_config" value="$(var config_dir)/icp.yaml"/>

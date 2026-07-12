@@ -33,25 +33,37 @@
     imu_version: 1
 
     # ------------------------------------------------------------------------
-    # Sensor drivers (pluggable adapters, see bruce_slam/sensors.py).
-    # 'driver' selects the message type/parser; 'topic' overrides the default.
+    # Sensor drivers (pluggable adapters, see src/ros/sensors.cpp). 'driver'
+    # selects the message type/parser; 'topic' overrides the default. For a
+    # different vehicle, prefer a payload overlay (config/payloads/*.yaml,
+    # docs/PAYLOADS.md) rather than editing this file.
     # ------------------------------------------------------------------------
     dvl:
-      driver: rti_dvl          # rti_dvl | twist_stamped | twist_cov
+      # rti_dvl (vendor) | dvl_standard (marine_acoustic_msgs/Dvl) |
+      # dvl_a50 (dvl_msgs, optional) | twist_stamped | twist_cov
+      driver: rti_dvl
       topic: /rti/body_velocity/raw
+      # require_valid: true    # dvl_standard/dvl_a50: drop invalid/water-track
     depth:
-      driver: bar30            # bar30 | fluid_pressure
+      # bar30 (vendor) | fluid_pressure (sensor_msgs/FluidPressure) |
+      # odom (nav_msgs/Odometry z) | float (std_msgs/Float64, m positive-down)
+      driver: bar30
       topic: /bar30/depth/raw
       # for driver: fluid_pressure (sensor_msgs/FluidPressure -> depth):
       # water_density: 1025.0
       # gravity: 9.80665
+      # atmospheric_pressure: 101325.0   # 0.0 if the driver reports gauge kPa
+      # for driver: odom (depth = z_sign * pose.position.z):
+      # z_sign: -1.0                      # -1 ENU/up, +1 z-down
     imu:
       # All IMU drivers use standard sensor_msgs/Imu; 'driver' selects the
       # FRAME convention:
       #   vn100 - legacy VectorNav handling (imu_pose roll -90 + fixed offsets)
       #   enu   - REP-105 ENU AHRS (MicroStrain 3DM-GX5 via
-      #           microstrain_inertial_driver, aliases: 3dm_gx5, microstrain);
+      #           microstrain_inertial_driver, aliases: 3dm_gx5, microstrain;
+      #           also the Deep Trekker Revolution's internal AHRS);
       #           blank topic defaults to /imu/data; set imu_pose to identity
+      #   ned   - AHRS already reporting z-down orientation; pass-through
       driver: vn100
       topic: ""
     # Example 3DM-GX5 configuration:

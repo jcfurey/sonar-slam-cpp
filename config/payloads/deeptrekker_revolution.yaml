@@ -1,0 +1,71 @@
+# Deep Trekker Revolution payload overlay.
+#
+# Selects the standard-message driver adapters for the Revolution's sensor
+# suite and its ENU/aligned frame convention. Loaded on top of the per-node
+# base configs (dead_reckoning.yaml / kalman.yaml / feature.yaml) by
+# slam.launch.xml when launched with:
+#
+#   ros2 launch sonar_slam_cpp slam.launch.xml \
+#       payload_config:=$(ros2 pkg prefix --share sonar_slam_cpp)/config/payloads/deeptrekker_revolution.yaml \
+#       enable_gyro:=false
+#
+# Every driver below is a standard ROS 2 / marine_acoustic_msgs message, so the
+# package builds and runs with NONE of the legacy vendor message packages
+# (sonar_oculus, rti_dvl, bar30_depth, kvh_gyro). See docs/PAYLOADS.md.
+#
+# A single '/**' block is intentional: each node reads only the parameters it
+# cares about (localization/kalman read dvl/depth/imu; feature_extraction reads
+# sonar), and the driver/topic values that ARE shared across nodes are meant to
+# be identical, so sharing them here is correct. Unused params are simply
+# declared and ignored. Adjust the topic names to match your driver launch.
+/**:
+  ros__parameters:
+    # active-payload marker (introspection only; no node reads it)
+    sonar_slam_payload: deeptrekker_revolution
+
+    # DVL — Water Linked DVL-A50. The official waterlinked_dvl ROS 2 driver
+    # publishes marine_acoustic_msgs/Dvl; 'dvl_standard' reads that and drops
+    # readings without a valid bottom-lock (require_valid), since a DVL that
+    # has lost lock still emits a garbage velocity that would corrupt dead
+    # reckoning. (Community paagutie/ndahn driver instead: driver: dvl_a50,
+    # which needs the optional dvl_msgs package at build time.)
+    dvl:
+      driver: dvl_standard
+      topic: /dvl/data
+      require_valid: true
+    dvl_max_velocity: 0.5
+
+    # Depth — internal pressure sensor exposed as sensor_msgs/FluidPressure
+    # (absolute Pascals). depth = (P - atmospheric_pressure) / (rho * g).
+    # A driver publishing gauge pressure should set atmospheric_pressure: 0.0.
+    depth:
+      driver: fluid_pressure
+      topic: /pressure
+      water_density: 1025.0          # seawater; use 1000.0 for fresh water
+      gravity: 9.80665
+      atmospheric_pressure: 101325.0
+
+    # AHRS — the Revolution's internal attitude solution is ENU/REP-145
+    # sensor_msgs/Imu. The 'enu' adapter rotates world ENU->NED and body
+    # FLU->FRD into the pipeline's z-down convention. Mounted aligned with the
+    # vehicle, so the mounting rotation imu_pose is identity.
+    imu:
+      driver: enu
+      topic: /imu/data
+    imu_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # Orientation mode: IMU attitude + DVL. The Revolution has no FOG gyro, so
+    # use_gyro MUST be false (also pass enable_gyro:=false to omit gyro_node).
+    use_imu: true
+    use_gyro: false
+
+    # Sonar — Blueprint Oculus M750d / M1200d. Modern Oculus ROS 2 drivers
+    # publish marine_acoustic_msgs/ProjectedSonarImage; 'projected_sonar' reads
+    # the fan geometry (beam bearings, range bins) straight from the message.
+    # (Legacy sonar_oculus/OculusPing instead: leave driver blank / set
+    # oculus_compressed|oculus_uncompressed, which needs the sonar_oculus
+    # package at build time.)
+    sonar:
+      driver: projected_sonar
+      topic: /oculus/sonar_image
+    compressed_images: false
