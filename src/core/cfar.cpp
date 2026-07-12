@@ -91,9 +91,19 @@ double CFAR::pfa_goca(double x) const
 
 double CFAR::pfa_os(double x) const
 {
+  // P_FA for the detector's ACTUAL statistic train[rank_], i.e. the
+  // (rank_+1)-th smallest of the Ntc training cells (0-indexed nth_element).
+  // By the Renyi spacing representation of exponential order statistics,
+  //   P_FA(T) = prod_{i=0}^{rank_} (N - i) / (T + N - i),
+  // which in log-Gamma form is Gamma(N+1)/Gamma(N-rank) * Gamma(T+N-rank)/
+  // Gamma(T+N+1). CFAR.py (and the original cfar.cpp) used one factor fewer
+  // (Gamma(N-rank+1), Gamma(T+N-rank+1)) — the model for the rank_-th
+  // smallest — so its solved tau over-thresholded and the realized P_FA fell
+  // ~(N-rank)/(T+N-rank) below the requested one. Derivation and Monte Carlo
+  // validation: docs/MATH_NOTES.md; intentional divergence, docs/DIVERGENCES.md.
   const double l1 = std::lgamma(Ntc_ + 1.0);
-  const double l2 = std::lgamma(Ntc_ - rank_ + 1.0);
-  const double l4 = std::lgamma(x + Ntc_ - rank_ + 1.0);
+  const double l2 = std::lgamma(static_cast<double>(Ntc_ - rank_));
+  const double l4 = std::lgamma(x + Ntc_ - rank_);
   const double l6 = std::lgamma(x + Ntc_ + 1.0);
   return std::exp(l1 - l2 + l4 - l6) - Pfa_;
 }
@@ -159,27 +169,91 @@ void CFAR::detect_cpu(const float* img, int rows, int cols, int alg,
   }
 }
 
+namespace {
+
+// Exact prefix-sum CA/SOCA/GOCA for integer-valued (CV_8UC1) images: per
+// column, int32 prefix sums make every training-window sum O(1) instead of
+// O(Ntc + Ngc). PROVABLY bit-identical to detect_cpu on uint8 input: every
+// partial float sum there is an integer <= Ntc*255 < 2^24, hence exact and
+// order-independent (IEEE 754 correct rounding of representable results), and
+// equal to the integer prefix difference computed here; the threshold
+// expressions are then evaluated identically. Full proof: docs/MATH_NOTES.md
+// (Theorems 7-8). OS keeps the nth_element path (order statistic).
+void detect_cpu_prefix_u8(const std::uint8_t* img, int rows, int cols, int alg,
+                          int train_hs, int guard_hs, double tau,
+                          float threshold, std::uint8_t* mask_out)
+{
+  const int border = train_hs + guard_hs;
+  std::fill(mask_out, mask_out + static_cast<std::size_t>(rows) * cols, 0);
+
+#pragma omp parallel for schedule(static)
+  for (int col = 0; col < cols; ++col) {
+    std::vector<std::int32_t> P(static_cast<std::size_t>(rows) + 1);
+    P[0] = 0;
+    for (int i = 0; i < rows; ++i)
+      P[i + 1] = P[i] + img[static_cast<std::size_t>(i) * cols + col];
+
+    for (int row = border; row < rows - border; ++row) {
+      // same value the float path reads: uint8 -> float is exact
+      const float cell =
+        static_cast<float>(img[static_cast<std::size_t>(row) * cols + col]);
+      // leading = sum over [row-border, row-guard_hs-1],
+      // lagging = sum over [row+guard_hs+1, row+border]
+      const std::int32_t leading = P[row - guard_hs] - P[row - border];
+      const std::int32_t lagging = P[row + border + 1] - P[row + guard_hs + 1];
+      bool hit;
+      if (alg == 0) {  // CA
+        const float sum_train = static_cast<float>(leading + lagging);
+        hit = cell > tau * sum_train / (2.0 * train_hs);
+      } else {  // SOCA / GOCA
+        const float sum_train = static_cast<float>(
+          alg == 1 ? std::min(leading, lagging) : std::max(leading, lagging));
+        hit = cell > tau * sum_train / train_hs;
+      }
+      mask_out[static_cast<std::size_t>(row) * cols + col] =
+        (hit && cell > threshold) ? 1 : 0;
+    }
+  }
+}
+
+cv::Mat to_float(const cv::Mat& img)
+{
+  if (img.type() == CV_32FC1) return img.isContinuous() ? img : img.clone();
+  cv::Mat fimg;
+  img.convertTo(fimg, CV_32FC1);
+  return fimg;
+}
+
+}  // namespace
+
 cv::Mat CFAR::detect(const cv::Mat& img, Alg alg, float threshold) const
 {
-  cv::Mat fimg;
-  if (img.type() == CV_32FC1)
-    fimg = img.isContinuous() ? img : img.clone();
-  else
-    img.convertTo(fimg, CV_32FC1);
-
   cv::Mat mask(img.rows, img.cols, CV_8UC1);
   const int train_hs = Ntc_ / 2, guard_hs = Ngc_ / 2;
   const double tau = threshold_factor(alg);
 
 #ifdef SONAR_SLAM_WITH_CUDA
   // the wrapper refuses unsupported configs and reports device errors; either
-  // way the CPU twin below produces the result
-  if (gpu::available() &&
-      gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
-                     static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
-                     threshold, mask.ptr<std::uint8_t>()))
-    return mask;
+  // way the CPU paths below produce the result
+  if (gpu::available()) {
+    const cv::Mat fimg = to_float(img);
+    if (gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
+                       static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
+                       threshold, mask.ptr<std::uint8_t>()))
+      return mask;
+  }
 #endif
+
+  // bit-exact O(1)-per-pixel path for the runtime case (uint8 polar images)
+  if (img.type() == CV_8UC1 && alg != OS) {
+    const cv::Mat u8 = img.isContinuous() ? img : img.clone();
+    detect_cpu_prefix_u8(u8.ptr<std::uint8_t>(), img.rows, img.cols,
+                         static_cast<int>(alg), train_hs, guard_hs, tau,
+                         threshold, mask.ptr<std::uint8_t>());
+    return mask;
+  }
+
+  const cv::Mat fimg = to_float(img);
   detect_cpu(fimg.ptr<float>(), img.rows, img.cols, static_cast<int>(alg),
              train_hs, guard_hs, rank_, tau, threshold, mask.ptr<std::uint8_t>());
   return mask;

@@ -57,6 +57,23 @@ at the time of comparison.
   pose-prior term that consumed it upstream), so the correction is inert today
   but kept correct for any future use.
 
+### 6. OS-CFAR threshold factor — order-statistic off-by-one
+- **Upstream:** `CFAR.py:116-121` solves the threshold factor from
+  `Γ(N+1)/Γ(N−rank+1)·Γ(τ+N−rank+1)/Γ(τ+N+1)` — the false-alarm model for the
+  **rank-th smallest** training cell — while the detector (`cpp/cfar.cpp`,
+  reproduced by this port's CPU and CUDA paths) thresholds on `train[rank]`
+  after `nth_element`, the **(rank+1)-th smallest**. The solved τ therefore
+  over-thresholds: realized P_FA = target × (N−rank)/(τ+N−rank). At the
+  shipped config (Ntc 40, rank 10, Pfa 0.1) that is ≈ 0.0767 instead of 0.1
+  (Monte Carlo: 0.0766).
+- **Here:** `pfa_os()` uses the product with rank+1 factors
+  (`Γ(N−rank)`, `Γ(τ+N−rank)`), matching the detector's actual statistic;
+  realized P_FA hits the target (Monte Carlo: 0.0999). Full derivation and
+  validation: `docs/MATH_NOTES.md` §5, `test/cfar_math_test.cpp`. Note the
+  shipped default `alg: SOCA` is unaffected; only OS runs change. The
+  `parity_vs_python` harness is also unaffected (it consumes τ values from
+  the Python fixture).
+
 ## Carried-over limitations left in place (with rationale)
 
 ### A. Only the newest keyframe's covariance is refreshed

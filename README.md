@@ -47,7 +47,10 @@ never corrupts the output. Device buffers are cached and reused across calls,
 and the remap coordinate maps stay device-resident until the sonar geometry
 changes. The CFAR kernel folds the intensity gate in (no separate host-side
 compare + bitwise-and pass), and the binary detection mask is remapped with
-nearest-neighbour so the GPU and CPU paths are bit-identical.
+nearest-neighbour so the GPU and CPU paths are bit-identical. On the CPU, the
+CA/SOCA/GOCA detectors use an exact integer prefix-sum fast path for uint8
+images — O(1) per pixel and provably bit-identical to the sliding-window
+reference (11× measured; proofs in `docs/MATH_NOTES.md`).
 
 Deferred GPU work (needs on-hardware benchmarking to land safely): fusing the
 whole per-ping feature pipeline (CFAR → mask → remap) into one device
