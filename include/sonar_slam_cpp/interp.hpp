@@ -1,21 +1,14 @@
-// 1-D interpolation used by feature extraction (and, in the Python original,
-// the sonar bearing<->column remap).
-//
-// LINEAR mirrors scipy.interp1d(kind='linear', bounds_error=False,
-// fill_value=-1, assume_sorted=True) exactly, and is the ONLY kind exercised
-// at runtime here.
-//
-// CUBIC is a NATURAL cubic spline (second derivative = 0 at both ends).
-// CAVEAT: scipy.interp1d(kind='cubic') uses NOT-A-KNOT end conditions, so this
-// does NOT reproduce scipy near the first/last interval (they agree only in
-// the interior — e.g. ~0.1 divergence on a mildly-curved cubic near the ends).
-// It is currently UNUSED: the cubic bearing<->column remap from sonar.py was
-// not carried into this port (sonar_geometry.cpp builds no such map). If that
-// remap is ever ported, replace this with a not-a-knot spline (mind the
-// zero-pivot on uniform grids) and validate against scipy. See
-// docs/DIVERGENCES.md.
+// 1-D interpolation matching the scipy.interp1d configurations used by
+// bruce_slam (bounds_error=False, fill_value=-1, assume_sorted=True):
+//   LINEAR mirrors scipy.interp1d(kind='linear');
+//   CUBIC  mirrors scipy.interp1d(kind='cubic') — a NOT-A-KNOT cubic spline.
+// Both agree with scipy to ~1e-15, validated on uniform and non-uniform grids
+// (test/interp_spline_test.cpp). x must be ascending; out-of-range queries
+// return fill_value (default -1). Only LINEAR is exercised at runtime here;
+// CUBIC is kept scipy-faithful for the sonar.py bearing<->column remap.
 #pragma once
 
+#include <Eigen/Dense>
 #include <cmath>
 #include <vector>
 
@@ -32,7 +25,7 @@ public:
            double fill_value = -1.0)
     : x_(std::move(x)), y_(std::move(y)), kind_(kind), fill_(fill_value)
   {
-    if (kind_ == CUBIC && x_.size() >= 3) build_spline();
+    if (kind_ == CUBIC && x_.size() >= 4) build_spline();
   }
 
   double operator()(double xq) const
@@ -64,28 +57,38 @@ public:
 private:
   void build_spline()
   {
-    // solve the tridiagonal system for second derivatives (NATURAL BCs — not
-    // scipy's not-a-knot; see the header caveat. Unused at runtime.)
-    const std::size_t n = x_.size();
-    m_.assign(n, 0.0);
-    std::vector<double> a(n, 0.0), b(n, 0.0), c(n, 0.0), d(n, 0.0);
-    b[0] = 1.0; b[n - 1] = 1.0;
-    for (std::size_t i = 1; i + 1 < n; ++i) {
-      const double h0 = x_[i] - x_[i - 1];
-      const double h1 = x_[i + 1] - x_[i];
-      a[i] = h0 / 6.0;
-      b[i] = (h0 + h1) / 3.0;
-      c[i] = h1 / 6.0;
-      d[i] = (y_[i + 1] - y_[i]) / h1 - (y_[i] - y_[i - 1]) / h0;
+    // Not-a-knot cubic spline, matching scipy.interp1d(kind='cubic'): the third
+    // derivative is continuous across the first and last interior knots. Solve
+    // the second-derivative (moment) system A m = r for m_i = S''(x_i). A is
+    // tridiagonal except for one extra element in the first and last rows (the
+    // not-a-knot conditions), so a general dense solve is used — n is small and
+    // this runs only when the table is (re)built. Unlike a naive Thomas sweep,
+    // the pivoted dense solve is robust on uniform grids. scipy requires >= 4
+    // points for a cubic; fall back to linear (empty m_) otherwise.
+    const int n = static_cast<int>(x_.size());
+    m_.clear();
+    if (n < 4) return;
+    auto h = [&](int i) { return x_[i + 1] - x_[i]; };
+
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(n, n);
+    Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+    for (int i = 1; i < n - 1; ++i) {
+      A(i, i - 1) = h(i - 1);
+      A(i, i) = 2.0 * (h(i - 1) + h(i));
+      A(i, i + 1) = h(i);
+      r(i) = 6.0 * ((y_[i + 1] - y_[i]) / h(i) - (y_[i] - y_[i - 1]) / h(i - 1));
     }
-    // Thomas algorithm
-    for (std::size_t i = 1; i < n; ++i) {
-      const double w = a[i] / b[i - 1];
-      b[i] -= w * c[i - 1];
-      d[i] -= w * d[i - 1];
-    }
-    m_[n - 1] = d[n - 1] / b[n - 1];
-    for (std::size_t i = n - 1; i-- > 0;) m_[i] = (d[i] - c[i] * m_[i + 1]) / b[i];
+    // not-a-knot at x[1]:   S'''(x1-) = S'''(x1+)
+    A(0, 0) = -h(1);
+    A(0, 1) = h(0) + h(1);
+    A(0, 2) = -h(0);
+    // not-a-knot at x[n-2]: S'''(x_{n-2}-) = S'''(x_{n-2}+)
+    A(n - 1, n - 3) = -h(n - 2);
+    A(n - 1, n - 2) = h(n - 3) + h(n - 2);
+    A(n - 1, n - 1) = -h(n - 3);
+
+    const Eigen::VectorXd m = A.fullPivLu().solve(r);
+    m_.assign(m.data(), m.data() + n);
   }
 
   std::vector<double> x_, y_, m_;
