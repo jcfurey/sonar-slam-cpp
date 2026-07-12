@@ -70,6 +70,22 @@ at the time of comparison.
   affects the second-order fan **padding** used for NSSM candidate
   pre-selection. Left as-is pending a cheaper incremental-covariance approach.
 
+## Known non-parity in unused code paths
+
+### `Interp1d` CUBIC is a natural spline, not scipy's not-a-knot
+- **Upstream:** `sonar.py` builds the bearing↔column remap with
+  `scipy.interp1d(kind='cubic')`, which uses **not-a-knot** end conditions.
+- **Here:** `interp.hpp` implements a **natural** cubic spline (S''=0 at the
+  ends). The two agree in the interior but diverge near the first/last interval
+  (~0.1 on a mildly-curved cubic in a quick check).
+- **Status:** harmless today — `Interp1d::CUBIC` is never constructed (this port
+  builds its polar→Cartesian maps directly in the nodes and did not carry over
+  `sonar.py`'s cubic bearing remap). Documented in the header rather than
+  "fixed" because a correct not-a-knot solver must handle the zero-pivot on
+  uniform grids and be validated against scipy, which is out of scope while the
+  path has no consumer. Only `Interp1d::LINEAR` is used at runtime, and it
+  matches scipy exactly.
+
 ## Parity testing
 
 `parity_vs_python.cpp` / `test/parity_driver.py` compare per-function numeric

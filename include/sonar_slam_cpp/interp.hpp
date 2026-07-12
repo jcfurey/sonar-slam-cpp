@@ -1,6 +1,19 @@
-// 1-D interpolation mirroring the scipy.interp1d configurations used by
-// bruce_slam: kind='linear'/'cubic', bounds_error=False, fill_value=-1,
-// assume_sorted=True. The cubic variant is a natural cubic spline.
+// 1-D interpolation used by feature extraction (and, in the Python original,
+// the sonar bearing<->column remap).
+//
+// LINEAR mirrors scipy.interp1d(kind='linear', bounds_error=False,
+// fill_value=-1, assume_sorted=True) exactly, and is the ONLY kind exercised
+// at runtime here.
+//
+// CUBIC is a NATURAL cubic spline (second derivative = 0 at both ends).
+// CAVEAT: scipy.interp1d(kind='cubic') uses NOT-A-KNOT end conditions, so this
+// does NOT reproduce scipy near the first/last interval (they agree only in
+// the interior — e.g. ~0.1 divergence on a mildly-curved cubic near the ends).
+// It is currently UNUSED: the cubic bearing<->column remap from sonar.py was
+// not carried into this port (sonar_geometry.cpp builds no such map). If that
+// remap is ever ported, replace this with a not-a-knot spline (mind the
+// zero-pivot on uniform grids) and validate against scipy. See
+// docs/DIVERGENCES.md.
 #pragma once
 
 #include <cmath>
@@ -51,7 +64,8 @@ public:
 private:
   void build_spline()
   {
-    // solve the tridiagonal system for second derivatives (natural BCs)
+    // solve the tridiagonal system for second derivatives (NATURAL BCs — not
+    // scipy's not-a-knot; see the header caveat. Unused at runtime.)
     const std::size_t n = x_.size();
     m_.assign(n, 0.0);
     std::vector<double> a(n, 0.0), b(n, 0.0), c(n, 0.0), d(n, 0.0);
