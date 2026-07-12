@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -24,6 +25,9 @@
 using sonar_slam::Matrix;
 
 namespace {
+
+// no intensity gate in the parity harness — keep every CFAR hit
+constexpr float kNoGate = -std::numeric_limits<float>::infinity();
 
 template <typename T>
 Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> read_mat(
@@ -78,14 +82,15 @@ int main(int argc, char** argv)
       Eigen::Matrix<std::uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
         mask(rows, cols);
       sonar_slam::CFAR::detect_cpu(img.data(), rows, cols, alg, train_hs,
-                                   guard_hs, rank, taus(alg, 0), mask.data());
+                                   guard_hs, rank, taus(alg, 0), kNoGate,
+                                   mask.data());
       write_mat(dir + "cpp_mask_" + names[alg] + ".u8", mask);
 #ifdef SONAR_SLAM_WITH_CUDA
       if (gpu) {
         Eigen::Matrix<std::uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
           gmask(rows, cols);
         if (sonar_slam::gpu::cfar_cuda(img.data(), rows, cols, alg, train_hs,
-                                       guard_hs, rank, taus(alg, 0),
+                                       guard_hs, rank, taus(alg, 0), kNoGate,
                                        gmask.data()))
           write_mat(dir + "cpp_mask_gpu_" + names[alg] + ".u8", gmask);
         else

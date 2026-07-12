@@ -27,9 +27,12 @@ inline constexpr int kMaxOsTrainCells = 128;
 
 // --- raw kernel entry points (defined in src/cuda/*.cu) ----------------------
 // CFAR over a polar image (row-major, rows = range bins, cols = beams).
-// alg: 0=CA 1=SOCA 2=GOCA 3=OS. Output mask is 0/1 uint8.
+// alg: 0=CA 1=SOCA 2=GOCA 3=OS. A detection also requires cell > threshold
+// (the intensity gate, folded in so the kernel matches the CPU twin). Output
+// mask is 0/1 uint8.
 bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
-               int guard_hs, int rank, double tau, std::uint8_t* mask_out);
+               int guard_hs, int rank, double tau, float threshold,
+               std::uint8_t* mask_out);
 
 // Nearest / bilinear remap of a uint8 image with float32 maps (cv::remap
 // semantics, constant 0 border). interp: 0=nearest, 1=linear.

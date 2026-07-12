@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <opencv2/core.hpp>
 #include <string>
 
@@ -21,7 +22,11 @@ public:
 
   // img: CV_8UC1 or CV_32FC1 polar image (rows = range bins, cols = beams).
   // Returns a CV_8UC1 mask with 1 at detections (matches cfar.cpp output).
-  cv::Mat detect(const cv::Mat& img, Alg alg) const;
+  // A detection also requires cell intensity > threshold; the default keeps
+  // every CFAR hit (no intensity gate), so pass filter/threshold to fold the
+  // gate into the detector instead of a separate compare + bitwise-and.
+  cv::Mat detect(const cv::Mat& img, Alg alg,
+                 float threshold = -std::numeric_limits<float>::infinity()) const;
 
   double threshold_factor(Alg alg) const;
 
@@ -32,7 +37,7 @@ public:
   // exposed for the parity check tool
   static void detect_cpu(const float* img, int rows, int cols, int alg,
                          int train_hs, int guard_hs, int rank, double tau,
-                         std::uint8_t* mask_out);
+                         float threshold, std::uint8_t* mask_out);
 
 private:
   double calc_threshold_factor_ca() const;

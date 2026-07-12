@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -16,6 +17,9 @@
 using Clock = std::chrono::steady_clock;
 
 namespace {
+
+// no intensity gate in the parity harness — keep every CFAR hit
+constexpr float kNoGate = -std::numeric_limits<float>::infinity();
 
 double ms_since(Clock::time_point t0)
 {
@@ -56,7 +60,7 @@ int main()
     auto t0 = Clock::now();
     sonar_slam::CFAR::detect_cpu(img.ptr<float>(), rows, cols,
                                  static_cast<int>(alg), 20, 5, 10,
-                                 cfar.threshold_factor(alg),
+                                 cfar.threshold_factor(alg), kNoGate,
                                  cpu_mask.ptr<std::uint8_t>());
     const double cpu_ms = ms_since(t0);
 
@@ -66,7 +70,7 @@ int main()
       t0 = Clock::now();
       const bool ok = sonar_slam::gpu::cfar_cuda(
         img.ptr<float>(), rows, cols, static_cast<int>(alg), 20, 5, 10,
-        cfar.threshold_factor(alg), gpu_mask.ptr<std::uint8_t>());
+        cfar.threshold_factor(alg), kNoGate, gpu_mask.ptr<std::uint8_t>());
       const double gpu_ms = ms_since(t0);
       if (!ok) {
         std::printf("CFAR alg %d: GPU path failed\n", static_cast<int>(alg));

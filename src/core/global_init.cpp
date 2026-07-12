@@ -243,6 +243,14 @@ GlobalInitResult global_scan_match_init(
   // ------------------------------------------- local Nelder-Mead refinement
   // (replaces shgo's local minimization; the cost is piecewise constant so a
   // derivative-free simplex with an ftol stop criterion is appropriate)
+  //
+  // The Sobol sampling phase above is GPU-batched (eval_costs); the refinement
+  // scores one candidate at a time on the CPU by design. Nelder-Mead is
+  // inherently sequential (each step depends on the previous), so a per-
+  // candidate kernel launch + host<->device round trip would cost more than
+  // the ~1k-point grid scan it replaces. GPU-offloading the refinement would
+  // only pay off with a device-resident grid AND a batched multi-candidate
+  // evaluation — deferred (see README "GPU acceleration").
   auto cost_of = [&](const Eigen::Vector3d& d) {
     std::vector<std::array<float, 6>> one{pack_transform(source_pose, target_pose, d)};
     std::vector<float> c;

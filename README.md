@@ -45,7 +45,16 @@ runtime CUDA failure (allocation, copy, launch) makes the wrapper return
 false and that call falls back to the CPU twin — a GPU error degrades, it
 never corrupts the output. Device buffers are cached and reused across calls,
 and the remap coordinate maps stay device-resident until the sonar geometry
-changes.
+changes. The CFAR kernel folds the intensity gate in (no separate host-side
+compare + bitwise-and pass), and the binary detection mask is remapped with
+nearest-neighbour so the GPU and CPU paths are bit-identical.
+
+Deferred GPU work (needs on-hardware benchmarking to land safely): fusing the
+whole per-ping feature pipeline (CFAR → mask → remap) into one device
+round-trip; page-locked host buffers + CUDA streams to overlap copy and
+compute; and a device-resident grid for the Nelder-Mead scan-match refinement
+(only worthwhile alongside batched multi-candidate evaluation — see
+`global_init.cpp`).
 
 Python→C++ library replacements (no Python deps remain):
 

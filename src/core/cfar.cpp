@@ -115,7 +115,7 @@ double CFAR::threshold_factor(Alg alg) const
 // ---------------------------------------------------------------------------
 void CFAR::detect_cpu(const float* img, int rows, int cols, int alg,
                       int train_hs, int guard_hs, int rank, double tau,
-                      std::uint8_t* mask_out)
+                      float threshold, std::uint8_t* mask_out)
 {
   const int border = train_hs + guard_hs;
   std::fill(mask_out, mask_out + static_cast<std::size_t>(rows) * cols, 0);
@@ -151,12 +151,15 @@ void CFAR::detect_cpu(const float* img, int rows, int cols, int alg,
         std::nth_element(train.begin(), train.begin() + rank, train.end());
         hit = cell > tau * train[rank];
       }
-      mask_out[static_cast<std::size_t>(row) * cols + col] = hit ? 1 : 0;
+      // fold the intensity gate into the detector so the CPU/GPU twins do it
+      // identically and the caller needs no separate compare + bitwise-and
+      mask_out[static_cast<std::size_t>(row) * cols + col] =
+        (hit && cell > threshold) ? 1 : 0;
     }
   }
 }
 
-cv::Mat CFAR::detect(const cv::Mat& img, Alg alg) const
+cv::Mat CFAR::detect(const cv::Mat& img, Alg alg, float threshold) const
 {
   cv::Mat fimg;
   if (img.type() == CV_32FC1)
@@ -174,11 +177,11 @@ cv::Mat CFAR::detect(const cv::Mat& img, Alg alg) const
   if (gpu::available() &&
       gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
                      static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
-                     mask.ptr<std::uint8_t>()))
+                     threshold, mask.ptr<std::uint8_t>()))
     return mask;
 #endif
   detect_cpu(fimg.ptr<float>(), img.rows, img.cols, static_cast<int>(alg),
-             train_hs, guard_hs, rank_, tau, mask.ptr<std::uint8_t>());
+             train_hs, guard_hs, rank_, tau, threshold, mask.ptr<std::uint8_t>());
   return mask;
 }
 

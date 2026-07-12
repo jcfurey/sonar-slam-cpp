@@ -3,6 +3,7 @@
 #include "cuda_common.cuh"
 #include "sonar_slam_cpp/gpu.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -13,7 +14,8 @@ namespace {
 
 __global__ void cfar_kernel(const float* __restrict__ img, int rows, int cols,
                             int alg, int train_hs, int guard_hs, int rank,
-                            double tau, std::uint8_t* __restrict__ mask)
+                            double tau, float threshold,
+                            std::uint8_t* __restrict__ mask)
 {
   const int col = blockIdx.x * blockDim.x + threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -69,25 +71,27 @@ __global__ void cfar_kernel(const float* __restrict__ img, int rows, int cols,
     hit = cell > tau * train[rank];
   }
 
-  mask[idx] = hit ? 1 : 0;
+  // fold the intensity gate in so the kernel matches detect_cpu exactly
+  mask[idx] = (hit && cell > threshold) ? 1 : 0;
 }
 
 }  // namespace
 
 bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
-               int guard_hs, int rank, double tau, std::uint8_t* mask_out)
+               int guard_hs, int rank, double tau, float threshold,
+               std::uint8_t* mask_out)
 {
   // the OS kernel's selection buffer is fixed-size; larger training windows
   // must run on the CPU rather than silently truncate
   if (alg == 3 && 2 * train_hs > kMaxOsTrainCells) {
-    static bool warned = false;
-    if (!warned) {
+    // atomic so the one-shot warning is race-free without taking the buffer
+    // mutex on this early-return path
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
       std::fprintf(stderr,
                    "sonar_slam_cpp: OS-CFAR Ntc %d exceeds the GPU limit %d, "
                    "using the CPU path\n",
                    2 * train_hs, kMaxOsTrainCells);
-      warned = true;
-    }
     return false;
   }
 
@@ -107,7 +111,8 @@ bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
   const dim3 block(32, 8);
   const dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
   cfar_kernel<<<grid, block>>>(img_buf.as<float>(), rows, cols, alg, train_hs,
-                               guard_hs, rank, tau, mask_buf.as<std::uint8_t>());
+                               guard_hs, rank, tau, threshold,
+                               mask_buf.as<std::uint8_t>());
   if (!detail::check(cudaGetLastError(), "cfar_cuda launch")) return false;
 
   return detail::check(cudaMemcpy(mask_out, mask_buf.as<std::uint8_t>(), n_img,
