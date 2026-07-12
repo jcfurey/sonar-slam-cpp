@@ -98,6 +98,11 @@ private:
       const auto match = detail::nearest_within(qb_, head.t, slop_);
       if (match) {
         cb_(head.value, match->value);
+        // keep the matched secondary (drop only strictly-older ones): a dense
+        // secondary (e.g. odometry) may be the nearest neighbour of several
+        // primaries. This deliberately diverges from message_filters ATS,
+        // which consumes a matched message — here we prefer pairing every
+        // primary (each a keyframe candidate) over one-shot secondary use.
         detail::drop_older(qb_, match->t - slop_);
       }
       qa_.pop_front();
