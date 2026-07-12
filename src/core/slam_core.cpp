@@ -274,7 +274,11 @@ InitializationResult Slam::initialize_sequential_scan_matching(
        k < current_key(); ++k)
     target_frames.push_back(k);
   ret.target_points = get_points(target_frames, ret.target_key);
-  ret.cov = odom_sigmas.asDiagonal();
+  // odom_sigmas are standard deviations, so a covariance is their squares.
+  // slam.py wrote diag(odom_sigmas) here (sigma-as-variance); square it for
+  // correctness. Currently vestigial — the C++ global-init cost dropped the
+  // pose-prior term that consumed it — but kept correct in case it is wired up.
+  ret.cov = odom_sigmas.array().square().matrix().asDiagonal();
 
   if (!ssm_params.enable) {
     ret.status = Status(Status::NOT_ENOUGH_POINTS);
@@ -440,10 +444,12 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   ret.status = Status(Status::SUCCESS);
 
   ret.source_key = current_key() - 1;
-  // anchor the search on the just-added keyframe (keyframes[source_key]) whose
-  // frame the source_points live in — NOT current_frame, which the node only
-  // assigns after this runs, so it still points at the previous callback's
-  // frame and would offset the global-init search by up to a keyframe step
+  // Anchor the search on the just-added keyframe (keyframes[source_key]) whose
+  // frame the source_points live in. slam.py used self.current_frame.pose here,
+  // but both stacks assign current_frame only AFTER this runs, so it points at
+  // the previous callback's frame — offsetting the global-init search from its
+  // own geometry by up to a keyframe step. Intentional divergence from
+  // bruce_slam that fixes that latent bug (see docs/DIVERGENCES.md).
   ret.source_pose = keyframes[ret.source_key]->pose;
   ret.estimated_source_pose = ret.source_pose;
   ret.has_estimated_source_pose = false;
@@ -469,7 +475,13 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   auto [target_points_all, target_keys_all] = get_points_with_keys(target_frames);
 
   // keep only points that could be inside the sonar fan of a source frame,
-  // padded by the pose uncertainty
+  // padded by the pose uncertainty.
+  // NOTE: update_factor_graph only refreshes the newest keyframe's covariance
+  // (carried from slam.py; see docs/DIVERGENCES.md), so the older source
+  // frames' covariances here are stale. This only widens/narrows the fan
+  // PADDING for candidate pre-selection, a second-order effect, so it is left
+  // as-is; the high-impact consumer (the global-init search bounds below) now
+  // uses the freshly refreshed anchor-keyframe covariance.
   std::vector<char> sel(target_points_all.rows(), 0);
   Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
   for (int source_frame : source_frames) {
@@ -531,11 +543,16 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
   if (!nssm_params.initialization) return ret;
 
-  // bounds from the source pose uncertainty (uses the last source frame's cov,
-  // like slam.py's loop variable leak)
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
+  // Bounds from the source-pose uncertainty. slam.py reused `cov` leaked from
+  // the fan-selection loop above — the OLDEST source frame's covariance, a
+  // loop-variable-leak bug. Use the anchor keyframe's covariance instead
+  // (ret.cov == keyframes[source_key], the newest source frame), so the search
+  // bounds match ret.source_pose; its marginal was just refreshed by
+  // update_factor_graph, so it is current. (Intentional divergence from
+  // bruce_slam — see docs/DIVERGENCES.md.)
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(ret.cov.topLeftCorner<2, 2>());
   const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());
-  const double rotation_std = std::sqrt(cov(2, 2));
+  const double rotation_std = std::sqrt(ret.cov(2, 2));
   Eigen::Matrix<double, 3, 2> bounds;
   bounds << -5.0 * translation_std, 5.0 * translation_std,
             -5.0 * translation_std, 5.0 * translation_std,
@@ -664,10 +681,13 @@ void Slam::update_factor_graph(const KeyframePtr& keyframe)
     keyframes.at(x)->update(pose);  // .at() fails loudly if the counts diverge
   }
 
-  // only the latest covariance is updated (like slam.py). marginalCovariance
-  // can throw on a weakly-constrained variable (IndeterminantLinearSystem);
-  // keep the optimized pose and skip the covariance update rather than
-  // propagating the failure out of the callback.
+  // Only the latest keyframe's covariance is refreshed — a known limitation
+  // carried from slam.py (its own "TODO propagate cov from previous keyframe"),
+  // so older keyframes keep stale marginals. Recomputing every keyframe's
+  // marginal each step is O(n^2) and would starve the callback; deferred (see
+  // docs/DIVERGENCES.md). marginalCovariance can throw on a weakly-constrained
+  // variable (IndeterminantLinearSystem); keep the optimized pose and skip the
+  // covariance update rather than propagating the failure out of the callback.
   try {
     const Eigen::Matrix3d cov =
       isam_.marginalCovariance(X(static_cast<int>(values.size()) - 1));

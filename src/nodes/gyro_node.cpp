@@ -31,8 +31,10 @@ public:
                        .toRotationMatrix();
 
     const double latitude = get_double("latitude") * M_PI / 180.0;
-    // earth rotation rate: 15.04107 deg/hr at the pole -> rad/s, matching the
-    // radian delta angles the gyro adapters deliver
+    // Earth rotation rate: 15.04107 deg/hr -> rad/s, so it is unit-consistent
+    // with the radian delta angles the integration accumulates. gyro.py used
+    // deg/s here (15.04107/3600) added to a radian integrator — a unit
+    // mismatch. Intentional divergence from bruce_slam (see docs/DIVERGENCES.md).
     earth_rate_ = -15.04107 * std::sin(latitude) * M_PI / (180.0 * 3600.0);
     sensor_rate_ = get_double("sensor_rate");
 
@@ -79,8 +81,10 @@ private:
   Eigen::Matrix3d offset_matrix_ = Eigen::Matrix3d::Identity();
   double earth_rate_ = 0.0;
   double sensor_rate_ = 250.0;
-  // start attitude per gyro.py (roll = 90 deg), tracked in RADIANS throughout:
-  // the gyro adapters deliver radian delta angles and Rot3::Ypr expects radians
+  // Start attitude: 90 deg roll expressed in RADIANS (pi/2). gyro.py wrote the
+  // literal 90. and passed it straight to Rot3.Ypr, which expects radians — a
+  // unit bug (90 rad). Tracked in radians throughout, matching the radian delta
+  // angles. Intentional divergence from bruce_slam (see docs/DIVERGENCES.md).
   double roll_ = M_PI / 2.0, yaw_ = 0.0, pitch_ = 0.0;
 
   rclcpp::SubscriptionBase::SharedPtr gyro_sub_;
