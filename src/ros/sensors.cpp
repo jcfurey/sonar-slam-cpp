@@ -224,10 +224,17 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
   }
   if (driver == "oculus_uncompressed") {
     return node->create_subscription<sonar_oculus::msg::OculusPingUncompressed>(
-      topic, qos, [cb](const sonar_oculus::msg::OculusPingUncompressed& msg) {
-        cv::Mat img = cv_bridge::toCvCopy(msg.ping, "")->image;
-        if (img.type() != CV_8UC1) img.convertTo(img, CV_8UC1);
-        cb(oculus_ping(msg, std::move(img)));
+      topic, qos,
+      [node, cb](const sonar_oculus::msg::OculusPingUncompressed& msg) {
+        try {
+          cv::Mat img = cv_bridge::toCvCopy(msg.ping, "")->image;
+          if (img.type() != CV_8UC1) img.convertTo(img, CV_8UC1);
+          cb(oculus_ping(msg, std::move(img)));
+        } catch (const std::exception& e) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping sonar ping: image conversion failed: %s",
+                      e.what());
+        }
       });
   }
   if (driver == "image") {
@@ -243,8 +250,17 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
     auto count = std::make_shared<int>(0);
     return node->create_subscription<sensor_msgs::msg::Image>(
       topic, qos,
-      [cb, range_resolution, horizontal_fov, count](const sensor_msgs::msg::Image& msg) {
-        cv::Mat img = cv_bridge::toCvCopy(msg, "mono8")->image;
+      [node, cb, range_resolution, horizontal_fov, count](
+        const sensor_msgs::msg::Image& msg) {
+        cv::Mat img;
+        try {
+          img = cv_bridge::toCvCopy(msg, "mono8")->image;
+        } catch (const std::exception& e) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping sonar ping: image conversion failed: %s",
+                      e.what());
+          return;
+        }
         SonarPing ping;
         ping.stamp = msg.header.stamp;
         ping.num_ranges = img.rows;
@@ -264,14 +280,28 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
     auto count = std::make_shared<int>(0);
     return node->create_subscription<marine_acoustic_msgs::msg::ProjectedSonarImage>(
       topic, qos,
-      [cb, count](const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
+      [node, cb, count](const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
         // 8-bit images only (this vehicle's config)
-        if (msg.image.dtype != 0)  // SonarImageData::DTYPE_UINT8
-          throw std::runtime_error(
-            "projected_sonar adapter supports DTYPE_UINT8 only, got dtype " +
-            std::to_string(msg.image.dtype));
+        if (msg.image.dtype != 0) {  // SonarImageData::DTYPE_UINT8
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping projected_sonar ping: unsupported dtype %u",
+                      static_cast<unsigned>(msg.image.dtype));
+          return;
+        }
         const int num_beams = static_cast<int>(msg.image.beam_count);
         const int num_ranges = static_cast<int>(msg.ranges.size());
+        // beam_count / ranges.size() are independent of the actual image
+        // payload, so guard the copy or a malformed message reads past the
+        // end of image.data
+        if (num_beams <= 0 || num_ranges <= 0 ||
+            msg.image.data.size() <
+              static_cast<std::size_t>(num_ranges) * num_beams) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping projected_sonar ping: image data (%zu bytes) "
+                      "smaller than %d ranges x %d beams",
+                      msg.image.data.size(), num_ranges, num_beams);
+          return;
+        }
 
         SonarPing ping;
         ping.stamp = msg.header.stamp;

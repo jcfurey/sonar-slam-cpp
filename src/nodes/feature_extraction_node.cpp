@@ -138,7 +138,10 @@ private:
     feature_pub_->publish(msg);
   }
 
-  cv::Mat remap_u8(const cv::Mat& src) const
+  // interp: 0 = nearest, 1 = bilinear. Use nearest for a binary detection
+  // mask (correct for a 0/1 image and bit-exact between the CPU and GPU remap
+  // paths); use bilinear for the grayscale visualization image.
+  cv::Mat remap_u8(const cv::Mat& src, int interp) const
   {
     const cv::Mat cont = src.isContinuous() ? src : src.clone();
 #ifdef SONAR_SLAM_WITH_CUDA
@@ -148,13 +151,14 @@ private:
       cv::Mat dst(map_x_.rows, map_x_.cols, CV_8UC1);
       if (gpu::remap_u8_cuda(cont.ptr<std::uint8_t>(), cont.rows, cont.cols,
                              map_x_.ptr<float>(), map_y_.ptr<float>(),
-                             map_x_.rows, map_x_.cols, 1, map_version_,
+                             map_x_.rows, map_x_.cols, interp, map_version_,
                              dst.ptr<std::uint8_t>()))
         return dst;
     }
 #endif
     cv::Mat dst;
-    cv::remap(cont, dst, map_x_, map_y_, cv::INTER_LINEAR);
+    cv::remap(cont, dst, map_x_, map_y_,
+              interp == 0 ? cv::INTER_NEAREST : cv::INTER_LINEAR);
     return dst;
   }
 
@@ -171,49 +175,67 @@ private:
       return;
     }
 
-    const cv::Mat& img = ping.image;
-    generate_map_xy(ping);
-
-    // CFAR detection in polar coordinates, gated by the intensity threshold
-    cv::Mat peaks = detector_->detect(img, alg_);
-    cv::Mat above;
-    cv::compare(img, threshold_, above, cv::CMP_GT);  // 0/255
-    cv::bitwise_and(peaks, above, peaks);             // 0/1 & 0/255 -> 0/1...
-
-    // visualization image (Cartesian, JET colormap like cv2.applyColorMap(_, 2));
-    // remapped through the same GPU path as the detection mask, and skipped
-    // entirely when nobody is subscribed
-    if (feature_img_pub_->get_subscription_count() > 0) {
-      cv::Mat vis = remap_u8(img);
-      cv::applyColorMap(vis, vis, cv::COLORMAP_JET);
-      feature_img_pub_->publish(
-        *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", vis).toImageMsg());
+    // a malformed adapter frame (empty / zero-range image) must not throw out
+    // of the callback and terminate the node
+    if (ping.image.empty() || ping.num_ranges <= 0) {
+      RCLCPP_WARN(get_logger(),
+                  "Dropping sonar ping: empty or zero-range image");
+      return;
     }
 
-    // to Cartesian
-    const cv::Mat cart_peaks = remap_u8(peaks);
+    // isolate the OpenCV / detection pipeline so a bad frame drops rather than
+    // crashing the node
+    try {
+      const cv::Mat& img = ping.image;
+      generate_map_xy(ping);
 
-    std::vector<cv::Point> locs;
-    cv::findNonZero(cart_peaks, locs);
+      // CFAR detection with the intensity gate folded into the detector, so
+      // the CPU/GPU twins apply it identically and no separate host-side
+      // compare + bitwise-and pass over the whole image is needed
+      cv::Mat peaks = detector_->detect(img, alg_, static_cast<float>(threshold_));
 
-    // image coordinates -> meters (feature_extraction.py lines 254-258)
-    Matrix points(static_cast<long>(locs.size()), 2);
-    for (std::size_t i = 0; i < locs.size(); ++i) {
-      double x = locs[i].x - cols_ / 2.0;
-      x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
-      const double y = -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
-      points(static_cast<long>(i), 0) = static_cast<float>(y);
-      points(static_cast<long>(i), 1) = static_cast<float>(x);
+      // visualization image (Cartesian, JET colormap like cv2.applyColorMap);
+      // same GPU remap path as the mask, skipped when nobody is subscribed
+      if (feature_img_pub_->get_subscription_count() > 0) {
+        cv::Mat vis = remap_u8(img, /*interp=*/1);  // bilinear for grayscale
+        cv::applyColorMap(vis, vis, cv::COLORMAP_JET);
+        std_msgs::msg::Header header;
+        header.stamp = ping.stamp;
+        header.frame_id = "base_link";
+        feature_img_pub_->publish(
+          *cv_bridge::CvImage(header, "bgr8", vis).toImageMsg());
+      }
+
+      // to Cartesian — nearest-neighbour for the binary mask
+      const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
+
+      std::vector<cv::Point> locs;
+      cv::findNonZero(cart_peaks, locs);
+
+      // image coordinates -> meters (feature_extraction.py lines 254-258)
+      Matrix points(static_cast<long>(locs.size()), 2);
+      for (std::size_t i = 0; i < locs.size(); ++i) {
+        double x = locs[i].x - cols_ / 2.0;
+        x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
+        const double y =
+          -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
+        points(static_cast<long>(i), 0) = static_cast<float>(y);
+        points(static_cast<long>(i), 1) = static_cast<float>(x);
+      }
+
+      if (points.rows() > 0 && resolution_ > 0)
+        points = downsample(points, static_cast<float>(resolution_));
+
+      if (outlier_filter_min_points_ > 1 && points.rows() > 0)
+        points = remove_outlier(points, outlier_filter_radius_,
+                                outlier_filter_min_points_);
+
+      publish_features(ping.stamp, points);
+    } catch (const cv::Exception& e) {
+      RCLCPP_WARN(get_logger(), "Dropping sonar ping: OpenCV error: %s", e.what());
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "Dropping sonar ping: %s", e.what());
     }
-
-    if (points.rows() > 0 && resolution_ > 0)
-      points = downsample(points, static_cast<float>(resolution_));
-
-    if (outlier_filter_min_points_ > 1 && points.rows() > 0)
-      points = remove_outlier(points, outlier_filter_radius_,
-                              outlier_filter_min_points_);
-
-    publish_features(ping.stamp, points);
   }
 
   std::unique_ptr<CFAR> detector_;

@@ -440,7 +440,11 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   ret.status = Status(Status::SUCCESS);
 
   ret.source_key = current_key() - 1;
-  ret.source_pose = current_frame->pose;
+  // anchor the search on the just-added keyframe (keyframes[source_key]) whose
+  // frame the source_points live in — NOT current_frame, which the node only
+  // assigns after this runs, so it still points at the previous callback's
+  // frame and would offset the global-init search by up to a keyframe step
+  ret.source_pose = keyframes[ret.source_key]->pose;
   ret.estimated_source_pose = ret.source_pose;
   ret.has_estimated_source_pose = false;
 
@@ -657,13 +661,20 @@ void Slam::update_factor_graph(const KeyframePtr& keyframe)
   gtsam::Pose2 pose;
   for (std::size_t x = 0; x < values.size(); ++x) {
     pose = values.at<gtsam::Pose2>(X(static_cast<int>(x)));
-    keyframes[x]->update(pose);
+    keyframes.at(x)->update(pose);  // .at() fails loudly if the counts diverge
   }
 
-  // only the latest covariance is updated (like slam.py)
-  const Eigen::Matrix3d cov =
-    isam_.marginalCovariance(X(static_cast<int>(values.size()) - 1));
-  keyframes.back()->update(pose, cov);
+  // only the latest covariance is updated (like slam.py). marginalCovariance
+  // can throw on a weakly-constrained variable (IndeterminantLinearSystem);
+  // keep the optimized pose and skip the covariance update rather than
+  // propagating the failure out of the callback.
+  try {
+    const Eigen::Matrix3d cov =
+      isam_.marginalCovariance(X(static_cast<int>(values.size()) - 1));
+    keyframes.back()->update(pose, cov);
+  } catch (const std::exception&) {
+    keyframes.back()->update(pose);
+  }
 
   // refresh the poses in pending loop closures for PCM
   for (ICPResult& ret : nssm_queue_) {
