@@ -42,7 +42,8 @@ public:
     const int queue_depth = static_cast<int>(sensor_rate_) + 50;
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(GYRO_INTEGRATION_TOPIC,
                                                           queue_depth);
-    gyro_sub_ = subscribe_gyro(this, driver, topic, rclcpp::QoS(queue_depth),
+    gyro_sub_ = subscribe_gyro(this, driver, topic,
+                               rclcpp::SensorDataQoS(rclcpp::KeepLast(queue_depth)),
                                [this](const GyroReading& r) { callback(r); });
 
     RCLCPP_INFO(get_logger(), "Gyro filtering node is initialized");

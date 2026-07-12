@@ -109,6 +109,7 @@ visualization_msgs::msg::Marker ros_constraints(
   marker.scale.x = 0.2;
   marker.color.g = 1.0;
   marker.color.a = 1.0;
+  marker.pose.orientation.w = 1.0;  // valid identity quaternion (not 0,0,0,0)
 
   auto make_color = [](const std::string& name) {
     std_msgs::msg::ColorRGBA c;

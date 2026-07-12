@@ -54,7 +54,12 @@ protected:
 
   int get_int(const std::string& raw_name)
   {
-    return static_cast<int>(require_param(raw_name).as_int());
+    // tolerate a YAML value written with a decimal point (declared DOUBLE),
+    // matching the defaulted overload and this header's leniency contract
+    const auto p = require_param(raw_name);
+    return p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE
+             ? static_cast<int>(p.as_double())
+             : static_cast<int>(p.as_int());
   }
   int get_int(const std::string& raw_name, int default_value)
   {

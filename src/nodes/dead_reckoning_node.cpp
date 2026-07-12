@@ -47,7 +47,7 @@ public:
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     // latest depth reading, held like message_filters.Cache(depth_sub, 1)
-    depth_sub_ = subscribe_depth(this, depth_driver, depth_topic, rclcpp::QoS(10),
+    depth_sub_ = subscribe_depth(this, depth_driver, depth_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(10)),
                                  [this](const DepthReading& r) {
                                    std::lock_guard<std::mutex> lock(mutex_);
                                    last_depth_ = r;
@@ -74,12 +74,12 @@ public:
                          const nav_msgs::msg::Odometry& gyro) {
           callback_with_gyro(imu, dvl, gyro);
         });
-      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::QoS(50),
+      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  sync3_->add_primary(to_sec(r.stamp), r);
                                });
-      imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::QoS(300),
+      imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::SensorDataQoS(rclcpp::KeepLast(300)),
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  sync3_->add_secondary_b(to_sec(r.stamp), r);
@@ -95,12 +95,12 @@ public:
         200, 0.1, [this](const DvlReading& dvl, const ImuReading& imu) {
           callback(imu, dvl);
         });
-      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::QoS(50),
+      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  sync2_imu_->add_primary(to_sec(r.stamp), r);
                                });
-      imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::QoS(300),
+      imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::SensorDataQoS(rclcpp::KeepLast(300)),
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  sync2_imu_->add_secondary(to_sec(r.stamp), r);
@@ -111,7 +111,7 @@ public:
         300, 0.1, [this](const DvlReading& dvl, const nav_msgs::msg::Odometry& gyro) {
           callback_gyro_only(dvl, gyro);
         });
-      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::QoS(50),
+      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  sync2_gyro_->add_primary(to_sec(r.stamp), r);
@@ -127,7 +127,7 @@ public:
     } else {
       // DVL + depth only; heading fed back from the SLAM scan matcher
       slam_yaw_ = get_double("seed_heading", 0.0) * M_PI / 180.0;
-      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::QoS(50),
+      dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  callback_dvl_only(r);
