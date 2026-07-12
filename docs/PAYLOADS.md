@@ -6,12 +6,19 @@ driver message into the pipeline's internal reading type. Supporting a new
 vehicle means picking the right driver names + topics in a config overlay — no
 code changes.
 
-Two payloads are provided as ready overlays under `config/payloads/`:
+Ready overlays are provided under `config/payloads/`:
 
 | Payload | Overlay | Vendor packages needed at build |
 | --- | --- | --- |
 | Legacy BlueROV (bruce_slam original) | `bluerov_legacy.yaml` | `sonar_oculus`, `rti_dvl`, `bar30_depth`, `kvh_gyro` |
+| Modern BlueROV2 (Water Linked A50) | `bluerov2_waterlinked.yaml` | **none** (standard messages only) |
 | **Deep Trekker Revolution** | `deeptrekker_revolution.yaml` | **none** (standard messages only) |
+
+The two standard-message payloads differ only in their default topics and
+frame conventions (the Revolution's internal AHRS vs. the BlueROV2's
+MAVROS/flight-controller IMU) — both run the same standard `dvl_standard` /
+`fluid_pressure` / `enu` / `projected_sonar` adapters, so neither needs a
+vendor package.
 
 ## The build no longer hard-requires the vendor packages
 
