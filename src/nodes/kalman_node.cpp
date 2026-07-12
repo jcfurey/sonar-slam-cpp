@@ -71,19 +71,19 @@ public:
         imu_topic = IMU_TOPIC_ENU;
     }
 
-    imu_sub_ = subscribe_imu(this, imu_driver, imu_topic, rclcpp::QoS(250),
+    imu_sub_ = subscribe_imu(this, imu_driver, imu_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(250)),
                              [this](const ImuReading& r) { imu_callback(r); });
     dvl_sub_ = subscribe_dvl(this, dvl_driver, get_string("dvl/topic", DVL_TOPIC),
-                             rclcpp::QoS(250),
+                             rclcpp::SensorDataQoS(rclcpp::KeepLast(250)),
                              [this](const DvlReading& r) { dvl_callback(r); });
     depth_sub_ = subscribe_depth(
-      this, depth_driver, get_string("depth/topic", DEPTH_TOPIC), rclcpp::QoS(250),
+      this, depth_driver, get_string("depth/topic", DEPTH_TOPIC), rclcpp::SensorDataQoS(rclcpp::KeepLast(250)),
       [this](const DepthReading& r) { pressure_callback(r); });
 
     if (use_gyro_) {
       gyro_sub_ = subscribe_gyro(
         this, get_string("gyro/driver", "kvh_gyro"),
-        get_string("gyro/topic", GYRO_TOPIC), rclcpp::QoS(250),
+        get_string("gyro/topic", GYRO_TOPIC), rclcpp::SensorDataQoS(rclcpp::KeepLast(250)),
         [this](const GyroReading& r) { gyro_callback(r); });
     }
 
@@ -128,7 +128,10 @@ private:
     const Eigen::Matrix<double, 12, 3> K =
       predicted_P * H.transpose() * (H * predicted_P * H.transpose() + R).inverse();
     corrected_x = predicted_x + K * (z - H * predicted_x);
-    corrected_P = predicted_P - K * H * predicted_P;
+    // Joseph form keeps P symmetric and positive-definite under finite
+    // precision over long high-rate (~250 Hz) runs, unlike the naive P - KHP.
+    const Mat12 ImKH = Mat12::Identity() - K * H;
+    corrected_P = ImKH * predicted_P * ImKH.transpose() + K * R * K.transpose();
   }
 
   void gyro_callback(const GyroReading& reading)

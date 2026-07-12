@@ -217,19 +217,28 @@ private:
     if (frame->status) {
       frame->points = points;
 
-      if (slam_.keyframes.empty())
-        slam_.add_prior(frame);
-      else if (enable_slam_)
-        slam_.add_sequential_scan_matching(frame);
-      else
-        // SLAM back-end disabled: chain plain dead-reckoning odometry factors
-        slam_.add_odometry(frame);
+      // The back-end runs GTSAM/ISAM2 (and libpointmatcher ICP), which can
+      // throw on a degenerate/indeterminate system. Under single-threaded
+      // spin an uncaught throw escapes spin() and terminates the node; catch
+      // it so one bad update skips the frame instead of killing the mission.
+      try {
+        if (slam_.keyframes.empty())
+          slam_.add_prior(frame);
+        else if (enable_slam_)
+          slam_.add_sequential_scan_matching(frame);
+        else
+          // SLAM back-end disabled: chain plain dead-reckoning odometry factors
+          slam_.add_odometry(frame);
 
-      slam_.update_factor_graph(frame);
+        slam_.update_factor_graph(frame);
 
-      if (enable_slam_ && slam_.nssm_params.enable &&
-          slam_.add_nonsequential_scan_matching())
-        slam_.update_factor_graph();
+        if (enable_slam_ && slam_.nssm_params.enable &&
+            slam_.add_nonsequential_scan_matching())
+          slam_.update_factor_graph();
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(),
+                     "SLAM back-end update failed, skipping frame: %s", e.what());
+      }
     }
 
     slam_.current_frame = frame;
@@ -275,16 +284,47 @@ private:
     pose_msg.header.frame_id = "map";
     pose_msg.pose.pose = g2r(frame->pose3);
 
-    Eigen::Matrix<double, 6, 6> cov = 1e-4 * Eigen::Matrix<double, 6, 6>::Identity();
+    // 6x6 covariance in (x, y, z, roll, pitch, yaw). The planar back-end only
+    // estimates x, y and yaw; z/roll/pitch are dead-reckoning pass-through, so
+    // they carry a large "unobserved" variance instead of a confident value a
+    // downstream EKF would mistake for a SLAM measurement of those states.
+    constexpr double kUnobserved = 1e6;
+    Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();
+    cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
     const Eigen::Matrix3d& tc = slam_.current_keyframe()->transf_cov;
     const int map_idx[3] = {0, 1, 5};
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) cov(map_idx[i], map_idx[j]) = tc(i, j);
-    // transf_cov is zero until the keyframe's marginals are computed —
-    // zero variance reads as infinite confidence to downstream fusion
-    // (robot_localization sanitizes it to ~1e-6 and glues itself to the
-    // pose). Floor the diagonal at a modest uncertainty.
-    for (int i = 0; i < 6; ++i) cov(i, i) = std::max(cov(i, i), 1e-3);
+
+    // Between-keyframe frames are dead-reckoning extrapolations past the last
+    // keyframe, but transf_cov is only that keyframe's marginal. Inflate the
+    // planar covariance by the DR drift accumulated since the keyframe so
+    // fusion does not over-trust the extrapolated pose (the same odometry is
+    // already delivered to the EKF directly).
+    if (!frame->status) {
+      const gtsam::Pose2 dr =
+        slam_.current_keyframe()->dr_pose.between(frame->dr_pose);
+      const double d = std::hypot(dr.x(), dr.y());
+      const double a = std::abs(dr.theta());
+      const double kt = std::max(slam_.keyframe_translation, 1e-3);
+      const double kr = std::max(slam_.keyframe_rotation, 1e-3);
+      const Eigen::Vector3d& os = slam_.odom_sigmas;
+      cov(0, 0) += (os[0] * d / kt) * (os[0] * d / kt);
+      cov(1, 1) += (os[1] * d / kt) * (os[1] * d / kt);
+      cov(5, 5) += (os[2] * a / kr) * (os[2] * a / kr);
+    }
+
+    // transf_cov is zero until the keyframe's marginals are computed, and a
+    // degenerate ISAM2 marginal can be NaN — either reads as infinite
+    // confidence downstream. Floor the estimated DOF (NaN-safe argument order:
+    // std::max(1e-3, NaN) == 1e-3) and, if anything is still non-finite, fall
+    // back to a safe diagonal.
+    for (int k : {0, 1, 5}) cov(k, k) = std::max(1e-3, cov(k, k));
+    if (!cov.allFinite()) {
+      cov.setZero();
+      cov(0, 0) = cov(1, 1) = cov(5, 5) = 1e-3;
+      cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
+    }
     if (enu_world_) {
       flip_pose_enu(pose_msg.pose.pose);
       // conjugate the covariance by the roll-pi sign signature
@@ -313,9 +353,15 @@ private:
 
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header = pose_msg.header;
-    odom_msg.pose.pose = pose_msg.pose.pose;
+    // copy the FULL PoseWithCovariance, not just the pose — otherwise the
+    // covariance built above never reaches this topic and fusion reads zeros
+    odom_msg.pose = pose_msg.pose;
     odom_msg.child_frame_id = "base_link";
     odom_msg.twist.twist = frame->twist;
+    // twist is not estimated here (the DR/Kalman upstream leave it zero), so
+    // advertise a large twist covariance; the all-zero default would read as
+    // zero-velocity-with-infinite-confidence to a fusing EKF.
+    for (int i = 0; i < 6; ++i) odom_msg.twist.covariance[i * 6 + i] = 1e6;
     if (enu_world_) {
       // twist arrives z-down from the relay; flip it back out
       odom_msg.twist.twist.linear.y = -odom_msg.twist.twist.linear.y;
