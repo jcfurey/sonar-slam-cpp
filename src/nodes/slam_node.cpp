@@ -171,6 +171,26 @@ public:
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       SLAM_CLOUD_TOPIC, latched_qos());
 
+    // The graph cloud doubles as the persistent map for volatile-QoS
+    // consumers (nav2's STVL global costmap): they miss the transient_local
+    // sample on join, and between keyframes (a hovering vehicle) nothing
+    // re-marks their voxels, so STVL's voxel_decay would fade the whole
+    // costmap to empty. Re-emit the cached cloud whenever no keyframe has
+    // published one within cloud_republish_period seconds (<= 0 disables).
+    cloud_republish_period_ = get_double("cloud_republish_period", 5.0);
+    if (cloud_republish_period_ > 0.0) {
+      cloud_republish_timer_ = create_wall_timer(
+        std::chrono::duration<double>(cloud_republish_period_), [this]() {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (last_cloud_msg_.data.empty()) return;
+          if ((now() - last_cloud_pub_).seconds() < cloud_republish_period_)
+            return;
+          last_cloud_msg_.header.stamp = now();
+          cloud_pub_->publish(last_cloud_msg_);
+          last_cloud_pub_ = now();
+        });
+    }
+
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     slam_.configure();
@@ -478,6 +498,9 @@ private:
     msg.header.stamp = slam_.current_keyframe()->time;
     msg.header.frame_id = "map";
     cloud_pub_->publish(msg);
+    // cache for the periodic republish timer (see constructor)
+    last_cloud_msg_ = std::move(msg);
+    last_cloud_pub_ = now();
   }
 
   Slam slam_;
@@ -489,6 +512,10 @@ private:
   int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
   double feature_odom_sync_max_delay_ = 0.5;
+  double cloud_republish_period_ = 5.0;
+  sensor_msgs::msg::PointCloud2 last_cloud_msg_;
+  rclcpp::Time last_cloud_pub_{0, 0, RCL_ROS_TIME};
+  rclcpp::TimerBase::SharedPtr cloud_republish_timer_;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr feature_sub_;

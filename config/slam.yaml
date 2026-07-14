@@ -39,6 +39,12 @@
     # max stamp difference (s) when pairing feature clouds with odometry
     feature_odom_sync_max_delay: 0.5
 
+    # re-emit the cached aggregated map cloud when no keyframe published one
+    # within this many seconds (<= 0 disables). Volatile-QoS consumers (e.g. a
+    # nav2 STVL costmap) miss the transient_local sample on join, and a
+    # stationary vehicle produces no keyframes to re-mark their voxels.
+    cloud_republish_period: 5.0
+
     # Sequential scan matching (SSM)
     ssm:
       enable: true            # is this module enabled?
