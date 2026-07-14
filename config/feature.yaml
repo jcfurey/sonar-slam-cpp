@@ -35,3 +35,4 @@
       # for driver: image (a plain grayscale polar sensor_msgs/Image):
       # range_resolution: 0.03      # meters per range bin (required)
       # horizontal_fov: 2.2689      # radians across all beams (default 130 deg)
+      # range_min: 0.0              # range of image row 0, if not ~zero

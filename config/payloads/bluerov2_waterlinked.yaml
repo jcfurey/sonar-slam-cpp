@@ -45,6 +45,10 @@
       driver: enu
       topic: /mavros/imu/data
     imu_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # kalman-mode roll offset: the enu adapter already normalizes the frame,
+    # so the VN100-era 180-degree default in kalman.yaml must be overridden
+    # (kalman_node applies imu_offset unconditionally)
+    imu_offset: 0.0
 
     # Orientation mode: IMU attitude + DVL. No FOG on a stock BlueROV2, so
     # use_gyro must be false (also pass enable_gyro:=false to omit gyro_node).

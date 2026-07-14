@@ -37,9 +37,13 @@
   <depend>bar30_depth</depend>
   <depend>kvh_gyro</depend>
   <!-- Optional native Water Linked A50 messages (paagutie/ndahn dvl_msgs);
-       enables the 'dvl_a50' driver. The standard 'dvl_standard' path
-       (marine_acoustic_msgs/Dvl) needs no extra package. To enable, add:
-       depend on dvl_msgs here and it is picked up by find_package QUIET. -->
+       enables the 'dvl_a50' driver. Declared like the other optional vendor
+       packages so colcon builds it FIRST when it is in the workspace —
+       without the ordering edge, find_package(dvl_msgs QUIET) races the
+       build order and HAVE_DVL_MSGS flips nondeterministically. Absent from
+       the workspace it resolves like any external dependency (the standard
+       'dvl_standard' path needs no extra package either way). -->
+  <depend>dvl_msgs</depend>
 
 
   <depend>libpointmatcher</depend>

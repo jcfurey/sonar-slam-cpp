@@ -230,11 +230,21 @@ private:
           // SLAM back-end disabled: chain plain dead-reckoning odometry factors
           slam_.add_odometry(frame);
 
-        slam_.update_factor_graph(frame);
-
-        if (enable_slam_ && slam_.nssm_params.enable &&
-            slam_.add_nonsequential_scan_matching())
-          slam_.update_factor_graph();
+        if (!slam_.update_factor_graph(frame)) {
+          // the frame's factors were dropped and the estimator rebuilt from
+          // the last good state; skip loop-closure work this callback
+          RCLCPP_ERROR(get_logger(),
+                       "SLAM back-end update failed (%s); keyframe dropped, "
+                       "estimator rebuilt from last good state",
+                       slam_.last_error().c_str());
+        } else if (enable_slam_ && slam_.nssm_params.enable &&
+                   slam_.add_nonsequential_scan_matching()) {
+          if (!slam_.update_factor_graph())
+            RCLCPP_ERROR(get_logger(),
+                         "SLAM loop-closure update failed (%s); loop factors "
+                         "rolled back, estimator rebuilt",
+                         slam_.last_error().c_str());
+        }
       } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(),
                      "SLAM back-end update failed, skipping frame: %s", e.what());

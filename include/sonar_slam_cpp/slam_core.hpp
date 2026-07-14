@@ -65,7 +65,13 @@ public:
   void add_sequential_scan_matching(const KeyframePtr& keyframe);
   // returns true when a loop closure was accepted into the graph
   bool add_nonsequential_scan_matching();
-  void update_factor_graph(const KeyframePtr& keyframe = nullptr);
+  // Incorporate the buffered factors/values into ISAM2. Returns false when the
+  // solve failed: the offending frame's factors (and any loop closures marked
+  // this round) are rolled back, the estimator is rebuilt from the previously
+  // committed factors, and last_error() describes the failure. The caller
+  // should log it and skip any further graph work this callback.
+  bool update_factor_graph(const KeyframePtr& keyframe = nullptr);
+  const std::string& last_error() const { return last_error_; }
 
   // ------------------------------------------------------------- utilities
   // accumulate points of `frames` in the frame of `ref_key` (or global when
@@ -111,9 +117,23 @@ private:
   gtsam::SharedNoiseModel create_noise_model(const Eigen::Vector3d& sigmas) const;
   gtsam::SharedNoiseModel create_full_noise_model(const Eigen::Matrix3d& cov) const;
 
+  // failure recovery for update_factor_graph: undo loop-closure bookkeeping
+  // written before a failed solve, and reconstruct ISAM2 from the committed
+  // factor mirror (a thrown ISAM2::update leaves the estimator in an
+  // undefined, partially-mutated state — GTSAM gives no exception guarantee)
+  void rollback_pending_loops();
+  void rebuild_isam();
+
   gtsam::ISAM2 isam_;
   gtsam::NonlinearFactorGraph graph_;
   gtsam::Values values_;
+  // mirror of every factor that has been through a SUCCESSFUL isam_.update —
+  // the rebuild source when an update throws
+  gtsam::NonlinearFactorGraph committed_graph_;
+  // indices into nssm_queue_ of loops marked inserted since the last
+  // successful update (rolled back if that update fails)
+  std::vector<int> pending_loops_;
+  std::string last_error_;
 
   gtsam::SharedNoiseModel prior_model_, odom_model_, icp_odom_model_;
 

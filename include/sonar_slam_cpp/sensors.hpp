@@ -9,11 +9,22 @@
 #include <builtin_interfaces/msg/time.hpp>
 #include <functional>
 #include <rclcpp/rclcpp.hpp>
+#include <stdexcept>
 #include <string>
 
 #include "sonar_slam_cpp/sonar_geometry.hpp"
 
 namespace sonar_slam {
+
+// Thrown when a requested driver exists but its vendor message package was
+// absent at build time. Distinct from std::invalid_argument (unknown driver
+// name / bad configuration) so a caller can treat "not compiled in" as a soft
+// condition WITHOUT also masking config typos — a typo must stay a loud
+// startup failure.
+struct DriverNotCompiledError : std::runtime_error
+{
+  using std::runtime_error::runtime_error;
+};
 
 // ------------------------------------------------------- normalized readings
 struct DvlReading

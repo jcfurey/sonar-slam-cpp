@@ -35,10 +35,10 @@ ROS 2 message packages the port already depends on
 (`marine_acoustic_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`,
 `std_msgs`), with no BlueROV vendor stubs in the workspace at all.
 
-`rosdep` note: the vendor stubs are still listed in `package.xml` (as
-`<depend>`) so `colcon` orders them first *when they are in the workspace*. In
-a standard-only workspace they are absent; run
-`rosdep install --from-paths src --skip-keys "sonar_oculus rti_dvl bar30_depth kvh_gyro"`.
+`rosdep` note: the vendor stubs (and `dvl_msgs`) are still listed in
+`package.xml` (as `<depend>`) so `colcon` orders them first *when they are in
+the workspace*. In a standard-only workspace they are absent; run
+`rosdep install --from-paths src --skip-keys "sonar_oculus rti_dvl bar30_depth kvh_gyro dvl_msgs"`.
 
 ## Running the Revolution
 
@@ -81,7 +81,13 @@ Selected per sensor via the `<sensor>/driver` parameter (`dvl/driver`,
 | `twist_cov` | `geometry_msgs/TwistWithCovarianceStamped` | standard | none |
 
 `dvl.require_valid` (default `true`) turns the validity gating on/off for the
-`dvl_standard`/`dvl_a50` adapters.
+`dvl_standard`/`dvl_a50` adapters. Caveat for `dvl_standard`: the message spec
+defines `beam_velocities_valid` as "the optional per-beam data is populated",
+but the official `waterlinked_dvl` driver publishes its bottom-lock validity in
+it — the default gating assumes that convention. A spec-conforming publisher
+that only reports the derived velocity leaves the flag `false` on every
+message; the adapter logs a throttled warning naming the remedy — set
+`dvl.require_valid: false` for such a driver.
 
 ### Depth — `depth/driver`
 | Name | Message | Package | Conversion |

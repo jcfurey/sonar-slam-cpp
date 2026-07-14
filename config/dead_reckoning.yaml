@@ -3,6 +3,13 @@
     # Localization node
     dvl_max_velocity: 0.5
 
+    # Max time gap (s) between synchronized DVL readings to integrate across.
+    # Larger gaps (a secondary-stream outage dropped the intervening readings,
+    # a bag jump) hold position and refresh only attitude/depth instead of
+    # integrating stale velocity into a jump. Must exceed the DVL's
+    # synchronized cadence.
+    dvl_max_gap: 10.0
+
     # IMU mounting rotation [x y z roll pitch yaw]. The VN100 legacy frame
     # handling uses roll = deg(-90); for a REP-105 IMU (imu.driver: enu, e.g.
     # a 3DM-GX5) mounted aligned with the vehicle, use all zeros.

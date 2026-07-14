@@ -84,24 +84,20 @@ private:
     // rows (kept at cell size `res`) so a nonzero-min-range multibeam is placed
     // at its true range. For an Oculus (range_min == 0) extra_rows is 0 and this
     // reduces byte-for-byte to the original grid.
-    const int extra_rows =
-      res > 0.0 ? static_cast<int>(std::ceil(range_min / res)) : 0;
+    const int extra_rows = static_cast<int>(std::ceil(range_min / res));
     const int rows = ping.num_ranges + extra_rows;
     const double height = rows * res;
     const double width =
       std::sin((ping.bearings.back() - ping.bearings.front()) / 2.0) * height * 2.0;
     const int cols = static_cast<int>(std::ceil(width / res));
 
-    if (res == res_ && height == height_ && rows == rows_ && width == width_ &&
-        cols == cols_)
+    // The cache key must cover EVERY input of the maps: res and range_min
+    // (different offsets can produce identical derived dims), the grid dims,
+    // and the full bearing vector (a beam-count or pattern change can leave
+    // width/cols untouched while invalidating the bearing->column interp).
+    if (res == res_ && range_min == range_min_ && rows == rows_ &&
+        cols == cols_ && ping.bearings == bearings_)
       return;
-    res_ = res;
-    height_ = height;
-    rows_ = rows;
-    width_ = width;
-    cols_ = cols;
-    // new maps -> new version so the GPU remap re-uploads its cached copy
-    ++map_version_;
 
     // bearing -> beam column, linear like feature_extraction.py
     std::vector<double> bx(ping.bearings.begin(), ping.bearings.end());
@@ -109,11 +105,14 @@ private:
     for (std::size_t i = 0; i < by.size(); ++i) by[i] = static_cast<double>(i);
     const Interp1d f_bearings(bx, by, Interp1d::LINEAR, -1.0);
 
-    map_x_.create(rows, cols, CV_32FC1);
-    map_y_.create(rows, cols, CV_32FC1);
+    // build into locals and commit the cache fields only after the maps exist:
+    // a throwing allocation (oversized geometry) must not poison the cache, or
+    // every subsequent identical ping would reuse empty/stale maps
+    cv::Mat map_x(rows, cols, CV_32FC1);
+    cv::Mat map_y(rows, cols, CV_32FC1);
     for (int r = 0; r < rows; ++r) {
-      float* px = map_x_.ptr<float>(r);
-      float* py = map_y_.ptr<float>(r);
+      float* px = map_x.ptr<float>(r);
+      float* py = map_y.ptr<float>(r);
       for (int c = 0; c < cols; ++c) {
         const double x = res * (rows - r);
         const double y = res * (-cols / 2.0 + c + 0.5);
@@ -125,6 +124,18 @@ private:
         px[c] = static_cast<float>(f_bearings(b));
       }
     }
+
+    map_x_ = std::move(map_x);
+    map_y_ = std::move(map_y);
+    res_ = res;
+    range_min_ = range_min;
+    height_ = height;
+    rows_ = rows;
+    width_ = width;
+    cols_ = cols;
+    bearings_ = ping.bearings;
+    // new maps -> new version so the GPU remap re-uploads its cached copy
+    ++map_version_;
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
@@ -190,6 +201,22 @@ private:
     if (ping.image.empty() || ping.num_ranges <= 0) {
       RCLCPP_WARN(get_logger(),
                   "Dropping sonar ping: empty or zero-range image");
+      return;
+    }
+    // Geometry choke point for EVERY sonar adapter: the map builder divides by
+    // range_resolution and dereferences bearings.front()/back() (UB on an
+    // empty vector — not an exception, so the try/catch below cannot contain
+    // it), and a bearing count that disagrees with the beam columns would
+    // silently distort every feature.
+    if (!(ping.range_resolution > 0.0) ||
+        !std::isfinite(ping.range_resolution) ||
+        !std::isfinite(ping.range_min) || ping.range_min < 0.0 ||
+        static_cast<int>(ping.bearings.size()) != ping.image.cols) {
+      RCLCPP_WARN(get_logger(),
+                  "Dropping sonar ping: inconsistent geometry (res %.6g m, "
+                  "range_min %.6g m, %zu bearings for %d beam columns)",
+                  ping.range_resolution, ping.range_min, ping.bearings.size(),
+                  ping.image.cols);
       return;
     }
 
@@ -259,8 +286,9 @@ private:
   int frame_count_ = 0;
 
   // remap state
-  double res_ = 0.0, height_ = 0.0, width_ = 0.0;
+  double res_ = 0.0, range_min_ = -1.0, height_ = 0.0, width_ = 0.0;
   int rows_ = 0, cols_ = 0;
+  std::vector<float> bearings_;
   int map_version_ = 0;
   cv::Mat map_x_, map_y_;
 

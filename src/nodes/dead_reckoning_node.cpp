@@ -9,6 +9,7 @@
 #include <gtsam/geometry/Pose2.h>
 #include <gtsam/geometry/Pose3.h>
 
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -30,10 +31,12 @@ public:
     const auto imu_pose = get_double_array("imu_pose");  // [x y z roll pitch yaw]
     imu_rot_ = gtsam::Rot3::Ypr(imu_pose[5], imu_pose[4], imu_pose[3]);
     dvl_max_velocity_ = get_double("dvl_max_velocity");
-    // max DVL time gap to integrate across; a larger gap (e.g. the synchronizer
-    // dropped primaries during a secondary-stream stall) re-anchors instead of
-    // integrating stale velocity into a position jump
-    dvl_max_gap_ = get_double("dvl_max_gap", 1.0);
+    // Max DVL time gap to integrate across; a larger gap (e.g. the synchronizer
+    // dropped primaries during a secondary-stream stall) holds position instead
+    // of integrating stale velocity into a jump. Must exceed the DVL's
+    // synchronized cadence — the default accommodates any realistic DVL ping
+    // rate while still catching multi-ten-second outages.
+    dvl_max_gap_ = get_double("dvl_max_gap", 10.0);
     keyframe_duration_ = get_double("keyframe_duration");
     keyframe_translation_ = get_double("keyframe_translation");
     keyframe_rotation_ = get_double("keyframe_rotation");
@@ -82,16 +85,19 @@ public:
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 dvl_seen_ = true;
                                  sync3_->add_primary(to_sec(r.stamp), r);
                                });
       imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::SensorDataQoS(rclcpp::KeepLast(300)),
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 imu_seen_ = true;
                                  sync3_->add_secondary_b(to_sec(r.stamp), r);
                                });
       gyro_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         GYRO_INTEGRATION_TOPIC, 300, [this](const nav_msgs::msg::Odometry& msg) {
           std::lock_guard<std::mutex> lock(mutex_);
+          gyro_seen_ = true;
           sync3_->add_secondary_c(to_sec(msg.header.stamp), msg);
         });
     } else if (use_imu_) {
@@ -104,11 +110,13 @@ public:
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 dvl_seen_ = true;
                                  sync2_imu_->add_primary(to_sec(r.stamp), r);
                                });
       imu_sub_ = subscribe_imu(this, imu_driver, imu_topic_, rclcpp::SensorDataQoS(rclcpp::KeepLast(300)),
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 imu_seen_ = true;
                                  sync2_imu_->add_secondary(to_sec(r.stamp), r);
                                });
     } else if (use_gyro_) {
@@ -121,11 +129,13 @@ public:
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 dvl_seen_ = true;
                                  sync2_gyro_->add_primary(to_sec(r.stamp), r);
                                });
       gyro_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         GYRO_INTEGRATION_TOPIC, 300, [this](const nav_msgs::msg::Odometry& msg) {
           std::lock_guard<std::mutex> lock(mutex_);
+          gyro_seen_ = true;
           sync2_gyro_->add_secondary(to_sec(msg.header.stamp), msg);
         });
       RCLCPP_WARN(get_logger(),
@@ -137,6 +147,7 @@ public:
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
+                                 dvl_seen_ = true;
                                  callback_dvl_only(r);
                                });
       slam_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -148,6 +159,42 @@ public:
                   "Localization running in DVL+depth only mode (no IMU/FOG); "
                   "heading is taken from the SLAM scan matcher.");
     }
+
+    // Startup watchdog: if a required stream never arrives, name it. The
+    // synchronizer cannot emit without every stream, so a missing one (gyro
+    // node omitted via enable_gyro:=false while use_gyro is true, a dead
+    // driver, a wrong topic) otherwise means localization silently publishes
+    // nothing for the whole mission.
+    watchdog_ = create_wall_timer(std::chrono::seconds(10), [this]() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      bool all_seen = true;
+      if (!dvl_seen_) {
+        all_seen = false;
+        RCLCPP_ERROR(get_logger(),
+                     "No DVL readings received yet — check dvl/driver and "
+                     "dvl/topic; localization cannot start without the DVL");
+      }
+      if (use_imu_ && !imu_seen_) {
+        all_seen = false;
+        RCLCPP_ERROR(get_logger(),
+                     "No IMU readings received yet — check imu/driver and "
+                     "imu/topic (%s)", imu_topic_.c_str());
+      }
+      if (use_gyro_ && !gyro_seen_) {
+        all_seen = false;
+        RCLCPP_ERROR(get_logger(),
+                     "No gyro integration received on %s — is gyro_node "
+                     "running? (enable_gyro:=false with use_gyro: true starves "
+                     "localization)", GYRO_INTEGRATION_TOPIC);
+      }
+      if (!last_depth_) {
+        all_seen = false;
+        RCLCPP_ERROR(get_logger(),
+                     "No depth readings received yet — check depth/driver and "
+                     "depth/topic");
+      }
+      if (all_seen) watchdog_->cancel();
+    });
 
     RCLCPP_INFO(get_logger(), "Localization node is initialized");
   }
@@ -241,12 +288,16 @@ private:
       // A large (or negative/out-of-order) gap between DVL primaries — e.g. a
       // secondary stream stalled and the synchronizer dropped the intervening
       // primaries — must not integrate stale velocity into a single large
-      // position jump. Re-anchor (advance time/velocity, hold pose) instead.
+      // position jump. Hold the position, but keep tracking attitude and
+      // depth (they don't depend on dt), so even a persistently-triggering
+      // gate degrades gracefully instead of freezing the whole pose.
       if (dt < 0.0 || dt > dvl_max_gap_) {
-        RCLCPP_WARN(get_logger(),
-                    "DVL dt %.2fs outside (0, %.2f]s; re-anchoring dead "
-                    "reckoning (no integration this step)",
-                    dt, dvl_max_gap_);
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "DVL dt %.2fs outside (0, %.2f]s (dvl_max_gap); holding position, "
+          "refreshing attitude/depth",
+          dt, dvl_max_gap_);
+        pose_ = gtsam::Pose3(rot, gtsam::Point3(pose_->x(), pose_->y(), depth));
         prev_time_ = dvl_time;
         prev_vel_ = vel;
         publish_pose(false);
@@ -338,7 +389,9 @@ private:
   double dvl_error_timer_ = 0.0;
   double slam_yaw_ = 0.0;
   std::optional<DepthReading> last_depth_;
+  bool dvl_seen_ = false, imu_seen_ = false, gyro_seen_ = false;
   std::vector<std::pair<double, gtsam::Pose3>> keyframes_;
+  rclcpp::TimerBase::SharedPtr watchdog_;
 
   rclcpp::SubscriptionBase::SharedPtr dvl_sub_, depth_sub_, imu_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gyro_sub_, slam_sub_;

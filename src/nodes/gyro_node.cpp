@@ -45,15 +45,16 @@ public:
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(GYRO_INTEGRATION_TOPIC,
                                                           queue_depth);
     // A payload without a FOG gyro (e.g. the Deep Trekker Revolution) either
-    // omits this node via enable_gyro:=false or builds without kvh_gyro. If the
-    // requested driver is unavailable, stay alive and idle instead of aborting
-    // the process — nothing consumes gyro output when use_gyro is false.
+    // omits this node via enable_gyro:=false or builds without kvh_gyro. Only
+    // the not-compiled-in case may idle: any OTHER constructor failure (a
+    // typo'd driver name, a bad topic) must stay a loud startup abort, or a
+    // misconfigured FOG vehicle would silently lose all localization.
     try {
       gyro_sub_ = subscribe_gyro(this, driver, topic,
                                  rclcpp::SensorDataQoS(rclcpp::KeepLast(queue_depth)),
                                  [this](const GyroReading& r) { callback(r); });
       RCLCPP_INFO(get_logger(), "Gyro filtering node is initialized");
-    } catch (const std::exception& e) {
+    } catch (const DriverNotCompiledError& e) {
       RCLCPP_WARN(get_logger(),
                   "Gyro node idle (no integration published): %s. Expected on a "
                   "payload with no FOG gyro; pass enable_gyro:=false to omit it.",

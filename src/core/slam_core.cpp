@@ -677,6 +677,9 @@ bool Slam::add_nonsequential_scan_matching()
       keyframes[loop.source_key]->constraints.emplace_back(
         loop.target_key, loop.estimated_transform);
       loop.inserted = true;
+      // tentative until the next update_factor_graph succeeds; rolled back
+      // (inserted flag, constraints entry, counter) if the solve throws
+      pending_loops_.push_back(m);
       ++nssm_accepted;
       accepted = true;
     }
@@ -687,32 +690,34 @@ bool Slam::add_nonsequential_scan_matching()
 // ---------------------------------------------------------------------------
 // graph update
 // ---------------------------------------------------------------------------
-void Slam::update_factor_graph(const KeyframePtr& keyframe)
+bool Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
   if (keyframe) keyframes.push_back(keyframe);
 
-  // Transactional update. isam_.update can throw (e.g. IndeterminantLinearSystem
-  // on a rank-deficient scan-match factor). GTSAM augments theta_ with the new
-  // variables BEFORE the elimination that throws, so on failure the buffered
-  // X(n) may already be in the estimate. If we neither clear the buffers nor
-  // re-sync `keyframes`, the next callback re-inserts X(n) -> ValuesKeyAlreadyExists,
-  // which throws again before the buffers are ever cleared, wedging the back-end
-  // for the rest of the mission. On failure: drop this frame's buffered
-  // factor+value and truncate `keyframes` to the estimate's actual variable
-  // count (getLinearizationPoint() reads theta_ without solving, so it is safe
-  // even when the linear system is indeterminate), keeping the two in lockstep,
-  // then skip this frame's pose/covariance refresh.
+  // isam_.update can throw (e.g. IndeterminantLinearSystem on a rank-deficient
+  // scan-match factor), and GTSAM gives NO exception guarantee: by the time
+  // elimination throws, the new factor is already in nonlinearFactors_, X(n)
+  // is in theta_, and the Bayes tree may be partially recalculated. Clearing
+  // the local buffers cannot un-poison the estimator, so recovery is: drop the
+  // offending frame (pop the keyframe, roll back loop bookkeeping) and REBUILD
+  // ISAM2 from the mirror of everything that previously solved.
   try {
     isam_.update(graph_, values_);
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    last_error_ = e.what();
     graph_.resize(0);
     values_.clear();
-    const std::size_t n = isam_.getLinearizationPoint().size();
-    if (keyframes.size() > n) keyframes.resize(n);
-    return;
+    if (keyframe) keyframes.pop_back();
+    rollback_pending_loops();
+    rebuild_isam();
+    return false;
   }
+  // the buffered factors are now permanently in the estimator; mirror them
+  // for failure recovery, and let this round's loop-closure marks stand
+  committed_graph_.push_back(graph_);
   graph_.resize(0);
   values_.clear();
+  pending_loops_.clear();
 
   const gtsam::Values values = isam_.calculateEstimate();
   gtsam::Pose2 pose;
@@ -742,6 +747,47 @@ void Slam::update_factor_graph(const KeyframePtr& keyframe)
     ret.target_pose = keyframes[ret.target_key]->pose;
     if (ret.inserted)
       ret.estimated_transform = ret.target_pose.between(ret.source_pose);
+  }
+  return true;
+}
+
+void Slam::rollback_pending_loops()
+{
+  // Loops are marked inserted (and appended to their keyframe's constraints)
+  // in add_nonsequential_scan_matching, BEFORE the update that actually
+  // incorporates their factors. If that update failed, the factors were
+  // discarded — un-mark them so PCM can re-insert on a later round instead of
+  // carrying phantom constraints forever.
+  for (int m : pending_loops_) {
+    if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
+    ICPResult& loop = nssm_queue_[m];
+    if (!loop.inserted) continue;
+    loop.inserted = false;
+    if (loop.source_key >= 0 &&
+        loop.source_key < static_cast<int>(keyframes.size())) {
+      auto& constraints = keyframes[loop.source_key]->constraints;
+      if (!constraints.empty()) constraints.pop_back();
+    }
+    --nssm_accepted;
+  }
+  pending_loops_.clear();
+}
+
+void Slam::rebuild_isam()
+{
+  // Reconstruct the estimator from the committed factor mirror, linearizing at
+  // the last optimized keyframe poses. These factors solved together before,
+  // so this update is expected to succeed; if it somehow does not, keep the
+  // fresh estimator and report — the next frame retries against it.
+  isam_ = gtsam::ISAM2();
+  gtsam::Values estimates;
+  for (std::size_t i = 0; i < keyframes.size(); ++i)
+    estimates.insert(X(static_cast<int>(i)), keyframes[i]->pose);
+  try {
+    gtsam::NonlinearFactorGraph graph = committed_graph_;
+    isam_.update(graph, estimates);
+  } catch (const std::exception& e) {
+    last_error_ += std::string("; estimator rebuild also failed: ") + e.what();
   }
 }
 
