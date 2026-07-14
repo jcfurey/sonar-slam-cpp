@@ -28,6 +28,7 @@ struct SonarPing
   cv::Mat image;                  // CV_8UC1
   std::vector<float> bearings;    // radians, ascending
   double range_resolution = 0.0;  // m per range bin
+  double range_min = 0.0;         // range of image row 0 (0 for Oculus/image)
   int num_ranges = 0;
   int ping_id = 0;
   FireMsg fire;

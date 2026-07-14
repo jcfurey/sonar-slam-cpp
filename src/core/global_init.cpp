@@ -262,7 +262,14 @@ GlobalInitResult global_scan_match_init(
   std::array<Eigen::Vector3d, 4> simplex;
   std::array<double, 4> fvals;
   simplex[0] = deltas[best];
-  fvals[0] = costs[best];
+  // Re-score the seed vertex with the SAME CPU objective the refinement uses.
+  // costs[best] may be a GPU-batched value (eval_costs dispatches to CUDA), and
+  // the GPU/CPU costs are not bit-identical for borderline cells, so seeding
+  // fvals[0] from costs[best] while every other vertex is scored by cost_of
+  // (CPU) makes the simplex inconsistent — a phantom-low seed freezes the search
+  // on the raw Sobol sample. One extra CPU evaluation keeps all vertices on one
+  // objective.
+  fvals[0] = cost_of(simplex[0]);
   for (int k = 0; k < 3; ++k) {
     simplex[k + 1] = deltas[best];
     simplex[k + 1][k] += 0.05 * (bounds(k, 1) - bounds(k, 0));

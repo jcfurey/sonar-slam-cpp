@@ -30,6 +30,10 @@ public:
     const auto imu_pose = get_double_array("imu_pose");  // [x y z roll pitch yaw]
     imu_rot_ = gtsam::Rot3::Ypr(imu_pose[5], imu_pose[4], imu_pose[3]);
     dvl_max_velocity_ = get_double("dvl_max_velocity");
+    // max DVL time gap to integrate across; a larger gap (e.g. the synchronizer
+    // dropped primaries during a secondary-stream stall) re-anchors instead of
+    // integrating stale velocity into a position jump
+    dvl_max_gap_ = get_double("dvl_max_gap", 1.0);
     keyframe_duration_ = get_double("keyframe_duration");
     keyframe_translation_ = get_double("keyframe_translation");
     keyframe_rotation_ = get_double("keyframe_rotation");
@@ -74,6 +78,7 @@ public:
                          const nav_msgs::msg::Odometry& gyro) {
           callback_with_gyro(imu, dvl, gyro);
         });
+      sync3_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -95,6 +100,7 @@ public:
         200, 0.1, [this](const DvlReading& dvl, const ImuReading& imu) {
           callback(imu, dvl);
         });
+      sync2_imu_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -111,6 +117,7 @@ public:
         300, 0.1, [this](const DvlReading& dvl, const nav_msgs::msg::Odometry& gyro) {
           callback_gyro_only(dvl, gyro);
         });
+      sync2_gyro_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -146,6 +153,17 @@ public:
   }
 
 private:
+  // surface silently-dropped DVL primaries (synchronizer overflow while a
+  // secondary stream is stalled) so the outage is observable
+  void warn_dropped(std::size_t n)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "Localization dropped %zu DVL reading(s): an IMU/gyro stream is stalling; "
+      "dead reckoning will re-anchor on recovery.",
+      n);
+  }
+
   // adapter-normalized quaternion + mounting rotation (imu_rotation in Python)
   gtsam::Rot3 imu_rotation(const ImuReading& imu) const
   {
@@ -220,6 +238,20 @@ private:
 
     if (pose_) {
       const double dt = to_sec(dvl_time) - to_sec(*prev_time_);
+      // A large (or negative/out-of-order) gap between DVL primaries — e.g. a
+      // secondary stream stalled and the synchronizer dropped the intervening
+      // primaries — must not integrate stale velocity into a single large
+      // position jump. Re-anchor (advance time/velocity, hold pose) instead.
+      if (dt < 0.0 || dt > dvl_max_gap_) {
+        RCLCPP_WARN(get_logger(),
+                    "DVL dt %.2fs outside (0, %.2f]s; re-anchoring dead "
+                    "reckoning (no integration this step)",
+                    dt, dvl_max_gap_);
+        prev_time_ = dvl_time;
+        prev_vel_ = vel;
+        publish_pose(false);
+        return;
+      }
       const Eigen::Vector3d dv = (vel + prev_vel_) * 0.5;
       const Eigen::Vector3d trans = dv * dt;
 
@@ -291,6 +323,7 @@ private:
   gtsam::Rot3 imu_rot_;
   bool imu_legacy_ = true;
   double dvl_max_velocity_ = 0.3;
+  double dvl_max_gap_ = 1.0;
   double keyframe_duration_ = 1.0;
   double keyframe_translation_ = 4.0;
   double keyframe_rotation_ = 0.5;

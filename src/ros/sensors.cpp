@@ -144,6 +144,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_dvl(
         r.stamp = msg.header.stamp;
         r.velocity << msg.velocity.x, msg.velocity.y, msg.velocity.z;
         r.altitude = msg.altitude;
+        if (!r.velocity.allFinite()) return;
         cb(r);
       });
 #else
@@ -198,6 +199,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_dvl(
         DvlReading r;
         r.stamp = msg.header.stamp;
         r.velocity << msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z;
+        if (!r.velocity.allFinite()) return;
         cb(r);
       });
   }
@@ -208,6 +210,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_dvl(
         r.stamp = msg.header.stamp;
         r.velocity << msg.twist.twist.linear.x, msg.twist.twist.linear.y,
           msg.twist.twist.linear.z;
+        if (!r.velocity.allFinite()) return;
         cb(r);
       });
   }
@@ -458,6 +461,17 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
                       msg.image.data.size(), num_ranges, num_beams);
           return;
         }
+        // beam_directions is independent of beam_count in the message; the map
+        // builder assumes one bearing per image column, so a missing/mismatched
+        // array would leave ping.bearings empty (UB in generate_map_xy's
+        // front()/back()) or mis-index every beam. Drop it here instead.
+        if (msg.beam_directions.size() != static_cast<std::size_t>(num_beams)) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping projected_sonar ping: %zu beam_directions for "
+                      "%d beams",
+                      msg.beam_directions.size(), num_beams);
+          return;
+        }
 
         SonarPing ping;
         ping.stamp = msg.header.stamp;
@@ -476,6 +490,10 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
           num_ranges > 1
             ? static_cast<double>(msg.ranges[1] - msg.ranges[0])
             : static_cast<double>(msg.ranges.empty() ? 0.0 : msg.ranges[0] * 2.0);
+        // range of image row 0: for a multibeam whose first sample is at a
+        // nonzero minimum range, the polar->Cartesian map must offset by this
+        // (an Oculus reports ~one cell, so this is ~0 there).
+        ping.range_min = msg.ranges.front();
         const double sos = msg.ping_info.sound_speed;
         ping.fire.speed_of_sound = sos > 0.0 ? sos : 1500.0;
         ping.fire.range = msg.ranges.empty() ? 0.0 : msg.ranges.back();

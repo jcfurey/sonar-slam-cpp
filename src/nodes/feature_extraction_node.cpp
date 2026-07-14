@@ -78,8 +78,16 @@ private:
   void generate_map_xy(const SonarPing& ping)
   {
     const double res = ping.range_resolution;
-    const double height = ping.num_ranges * res;
-    const int rows = ping.num_ranges;
+    const double range_min = ping.range_min;
+    // Polar row 0 is at range_min, so the Cartesian fan spans
+    // [0, range_min + num_ranges*res]. Add ceil(range_min/res) near-field output
+    // rows (kept at cell size `res`) so a nonzero-min-range multibeam is placed
+    // at its true range. For an Oculus (range_min == 0) extra_rows is 0 and this
+    // reduces byte-for-byte to the original grid.
+    const int extra_rows =
+      res > 0.0 ? static_cast<int>(std::ceil(range_min / res)) : 0;
+    const int rows = ping.num_ranges + extra_rows;
+    const double height = rows * res;
     const double width =
       std::sin((ping.bearings.back() - ping.bearings.front()) / 2.0) * height * 2.0;
     const int cols = static_cast<int>(std::ceil(width / res));
@@ -111,7 +119,9 @@ private:
         const double y = res * (-cols / 2.0 + c + 0.5);
         const double b = std::atan2(y, x);
         const double range = std::sqrt(x * x + y * y);
-        py[c] = static_cast<float>(range / res);
+        // polar row = (range - range_min)/res; near-field cells (range <
+        // range_min) map to a negative row and are sampled as border.
+        py[c] = static_cast<float>((range - range_min) / res);
         px[c] = static_cast<float>(f_bearings(b));
       }
     }

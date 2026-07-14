@@ -368,8 +368,19 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
       ret2.source_points, ret2.target_points, odom, point_noise,
       censi_sensor_noise * censi_sensor_noise);
     if (c.success) {
-      // never report a covariance smaller than the fixed ICP model
+      // Censi produces the covariance in the global-translation chart (residual
+      // r = R(theta) p + t - q, so dr/dt = I in the WORLD frame). Un-rotate the
+      // translation block into the Pose2 body/tangent frame that GTSAM's
+      // Gaussian::Covariance factor expects — the identical conversion the
+      // sampled path applies (compute_icp_with_cov, a port of slam.py:377-380),
+      // so both covariance methods feed factors in a consistent frame. The
+      // determinant (used by the floor below) is rotation-invariant, but the
+      // off-diagonal / axis orientation is not.
       Eigen::Matrix3d cov = c.cov;
+      const Eigen::Matrix2d R = odom.rotation().matrix();
+      cov.topRows<2>() = R.transpose() * cov.topRows<2>();
+      cov.leftCols<2>() = cov.leftCols<2>() * R;
+      // never report a covariance smaller than the fixed ICP model
       const Eigen::Matrix3d default_cov =
         icp_odom_sigmas.array().square().matrix().asDiagonal();
       if (cov.determinant() < default_cov.determinant()) cov = default_cov;
@@ -521,9 +532,17 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   for (int k : target_keys) counts[k]++;
   int best_frame = -1, best_count = 0;
   bool any = false;
+  // the keyframes that survive the fan/covariance gate (>10 nearby points):
+  // this is the LOCAL overlapping submap, not the whole map. Used below to
+  // build the final target cloud, matching slam.py's reassignment of
+  // target_frames = target_frames[counts > 10] (std::map keeps ascending order,
+  // matching np.unique). Without this the loop-closure ICP/overlap/covariance
+  // would register against the entire explored trajectory.
+  std::vector<int> candidate_frames;
   for (const auto& [frame, count] : counts) {
     if (count > 10) {
       any = true;
+      candidate_frames.push_back(frame);
       if (count > best_count) { best_count = count; best_frame = frame; }
     }
   }
@@ -595,7 +614,9 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
   ret.target_key = refined_frame;
   ret.target_pose = keyframes[ret.target_key]->pose;
-  ret.target_points = get_points(target_frames, ret.target_key);
+  // aggregate only the fan-selected candidate submap (not the whole map) into
+  // the refined target frame — see candidate_frames above.
+  ret.target_points = get_points(candidate_frames, ret.target_key);
 
   return ret;
 }
@@ -670,7 +691,26 @@ void Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
   if (keyframe) keyframes.push_back(keyframe);
 
-  isam_.update(graph_, values_);
+  // Transactional update. isam_.update can throw (e.g. IndeterminantLinearSystem
+  // on a rank-deficient scan-match factor). GTSAM augments theta_ with the new
+  // variables BEFORE the elimination that throws, so on failure the buffered
+  // X(n) may already be in the estimate. If we neither clear the buffers nor
+  // re-sync `keyframes`, the next callback re-inserts X(n) -> ValuesKeyAlreadyExists,
+  // which throws again before the buffers are ever cleared, wedging the back-end
+  // for the rest of the mission. On failure: drop this frame's buffered
+  // factor+value and truncate `keyframes` to the estimate's actual variable
+  // count (getLinearizationPoint() reads theta_ without solving, so it is safe
+  // even when the linear system is indeterminate), keeping the two in lockstep,
+  // then skip this frame's pose/covariance refresh.
+  try {
+    isam_.update(graph_, values_);
+  } catch (const std::exception&) {
+    graph_.resize(0);
+    values_.clear();
+    const std::size_t n = isam_.getLinearizationPoint().size();
+    if (keyframes.size() > n) keyframes.resize(n);
+    return;
+  }
   graph_.resize(0);
   values_.clear();
 

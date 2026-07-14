@@ -71,11 +71,24 @@ public:
   {
   }
 
+  // Fires (while the internal mutex is held) with the count of primary messages
+  // silently dropped because a secondary stream stalled and the primary queue
+  // overflowed. Lets the caller surface the outage instead of losing it quietly.
+  void set_overflow_callback(std::function<void(std::size_t)> cb)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_overflow_ = std::move(cb);
+  }
+
   void add_primary(double t, const A& a)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     qa_.push_back({t, a});
-    detail::trim(qa_, queue_size_);
+    if (qa_.size() > queue_size_) {
+      const std::size_t dropped = qa_.size() - queue_size_;
+      detail::trim(qa_, queue_size_);
+      if (on_overflow_) on_overflow_(dropped);
+    }
     try_emit();
   }
 
@@ -112,6 +125,7 @@ private:
   std::size_t queue_size_;
   double slop_;
   Callback cb_;
+  std::function<void(std::size_t)> on_overflow_;
   std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;
@@ -129,11 +143,23 @@ public:
   {
   }
 
+  // Fires (while the internal mutex is held) with the count of primary messages
+  // dropped because a secondary stalled and the primary queue overflowed.
+  void set_overflow_callback(std::function<void(std::size_t)> cb)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_overflow_ = std::move(cb);
+  }
+
   void add_primary(double t, const A& a)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     qa_.push_back({t, a});
-    detail::trim(qa_, queue_size_);
+    if (qa_.size() > queue_size_) {
+      const std::size_t dropped = qa_.size() - queue_size_;
+      detail::trim(qa_, queue_size_);
+      if (on_overflow_) on_overflow_(dropped);
+    }
     try_emit();
   }
 
@@ -174,6 +200,7 @@ private:
   std::size_t queue_size_;
   double slop_;
   Callback cb_;
+  std::function<void(std::size_t)> on_overflow_;
   std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;
