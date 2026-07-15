@@ -124,6 +124,11 @@ public:
 
     slam_.pcm_queue_size = get_int("pcm_queue_size");
     slam_.min_pcm = get_int("min_pcm");
+    // NSSM degeneracy gate (see slam_core.hpp)
+    slam_.nssm_max_sigma = get_double("nssm/max_sigma", 0.5);
+    slam_.nssm_max_anisotropy = get_double("nssm/max_anisotropy", 8.0);
+    slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.15);
+    slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
 
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");
@@ -212,13 +217,30 @@ private:
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
 
-    // feature cloud now carries honest planar [x, y, 0] in base_link (see
-    // feature_extraction_node.cpp publish_features) — same values the
-    // python pair exchanged via [x, 0, y]/-z, so the graph math is unchanged
+    // feature cloud carries true base_link 3D (head tilt folded in by
+    // feature_extraction_node.cpp publish_features). Rotate by the DR
+    // roll/pitch (Ry(p)*Rx(r), yaw excluded) so stored points are
+    // horizon-referenced: registration then matches world-horizontal
+    // projections even when the vehicle pitches, and col2 carries elevation
+    // relative to the vehicle for the 3D map cloud (FULL_3D_ROADMAP.md
+    // Phase 3). A level vehicle (roll=pitch=0) reduces col0/col1 to the old
+    // planar values byte-for-byte.
+    // dr_pose3 arrives through enu_odom_relay's roll-pi conjugation, so its
+    // euler attitude is (roll, -pitch, -yaw) of the ENU vehicle attitude and
+    // its z is +depth (down-positive). Undo the pitch flip to rotate the
+    // ENU-frame base_link cloud; the resulting elevation column is ENU
+    // up-positive relative to the vehicle.
     const Matrix xyz = cloud_to_xyz(feature_msg);
-    Matrix points(xyz.rows(), 2);
-    points.col(0) = xyz.col(0);
-    points.col(1) = -xyz.col(1);
+    const Eigen::Matrix3f R_h = gtsam::Rot3::Ypr(0.0,
+                                                 -dr_pose3.rotation().pitch(),
+                                                 dr_pose3.rotation().roll())
+                                  .matrix()
+                                  .cast<float>();
+    const Matrix xyz_h = xyz * R_h.transpose();
+    Matrix points(xyz.rows(), 3);
+    points.col(0) = xyz_h.col(0);
+    points.col(1) = -xyz_h.col(1);
+    points.col(2) = xyz_h.col(2);
 
     // NaN cloud means feature extraction skipped this frame
     if (points.rows() > 0 && std::isnan(points(0, 0)))
@@ -407,8 +429,17 @@ private:
     if (slam_.current_key() % 25 == 0 && slam_.current_key() != last_logged_key_) {
       last_logged_key_ = slam_.current_key();
       RCLCPP_INFO(get_logger(),
-                  "SLAM status: keyframes %d, SSM factors %d, NSSM accepted %d",
-                  slam_.current_key(), slam_.ssm_accepted, slam_.nssm_accepted);
+                  "SLAM status: keyframes %d (last kf %ld pts), SSM factors %d, "
+                  "NSSM accepted %d, last SSM: %s | NSSM attempts %d, queued %d, "
+                  "best clique %d, queue depth %d, PCM min md %.1f (thresh 11.3, "
+                  "%d edges), last NSSM: %s",
+                  slam_.current_key(),
+                  static_cast<long>(slam_.current_keyframe()->points.rows()),
+                  slam_.ssm_accepted, slam_.nssm_accepted,
+                  slam_.last_ssm_status.c_str(), slam_.nssm_attempts,
+                  slam_.nssm_queued, slam_.nssm_best_clique,
+                  slam_.nssm_queue_depth(), slam_.last_pcm_min_md,
+                  slam_.last_pcm_edges, slam_.last_nssm_status.c_str());
     }
   }
 
@@ -473,25 +504,35 @@ private:
   void publish_point_cloud()
   {
     long total = 0;
-    for (const auto& kf : slam_.keyframes) total += kf->transf_points.rows();
-    Matrix all_points(total, 2), all_keys(total, 1);
+    for (const auto& kf : slam_.keyframes) total += kf->points.rows();
+    Matrix all_points(total, 3), all_keys(total, 1);
     long at = 0;
     for (int key = 0; key < slam_.current_key(); ++key) {
-      const Matrix& transf = slam_.keyframes[key]->transf_points;
-      all_points.middleRows(at, transf.rows()) = transf;
-      all_keys.middleRows(at, transf.rows()).setConstant(static_cast<float>(key));
-      at += transf.rows();
+      const auto& kf = slam_.keyframes[key];
+      const long n = kf->points.rows();
+      // x/y through the optimized SE2 pose; z in ENU world = the point's
+      // up-positive elevation (col2) minus vehicle depth (pose3.z carries the
+      // relay's down-positive z across updates). The graph corrects x/y/yaw;
+      // z and attitude ride from dead-reckoning.
+      all_points.middleRows(at, n).leftCols(2) =
+        Keyframe::transform_points(kf->points, kf->pose);
+      all_points.middleRows(at, n).col(2) =
+        kf->points.col(2).array() - static_cast<float>(kf->pose3.z());
+      all_keys.middleRows(at, n).setConstant(static_cast<float>(key));
+      at += n;
     }
 
+    // 3D octree downsample (OctreeGridDataPointsFilter is dimension-agnostic)
     auto [pts, keys] =
       downsample(all_points, all_keys, static_cast<float>(slam_.point_resolution));
     if (pts.rows() == 0) return;
 
-    // [x, y, 0, key]
+    // [x, y, z, key] — col2 was built ENU (up-positive); the non-ENU (slam
+    // z-down) output flips it along with y, completing the roll-pi transform
     Matrix xyzi(pts.rows(), 4);
     xyzi.col(0) = pts.col(0);
     xyzi.col(1) = enu_world_ ? Matrix(-pts.col(1)) : Matrix(pts.col(1));
-    xyzi.col(2).setZero();
+    xyzi.col(2) = enu_world_ ? Matrix(pts.col(2)) : Matrix(-pts.col(2));
     xyzi.col(3) = keys.col(0);
 
     sensor_msgs::msg::PointCloud2 msg = make_cloud({"x", "y", "z", "i"}, xyzi);

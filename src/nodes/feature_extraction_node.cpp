@@ -7,7 +7,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/float32.hpp>
 
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -23,6 +25,49 @@
 #include "sonar_slam_cpp/sensors.hpp"
 
 namespace sonar_slam {
+
+namespace {
+
+// Map-stream cloud: 6 float fields packed in the PointXYZI 32-byte stride
+// (x@0 y@4 z@8 intensity@16 range@20 incidence@24). MUST stay byte-identical
+// to sonar_proc's map_points layout — the Accumulator's field-validating
+// concatenate is the enforcement point (SURVEY_RADIOMETRICS_PLAN.md).
+// Features carry no incidence estimate -> -1 (unknown).
+sensor_msgs::msg::PointCloud2 make_map_cloud(const Matrix& xyz,
+                                             const Eigen::VectorXf& intens,
+                                             const Eigen::VectorXf& ranges)
+{
+  sensor_msgs::msg::PointCloud2 msg;
+  msg.height = 1;
+  msg.width = static_cast<uint32_t>(xyz.rows());
+  msg.is_bigendian = false;
+  msg.is_dense = true;
+  static const char* names[6] = {"x", "y", "z", "intensity", "range", "incidence"};
+  static const uint32_t offsets[6] = {0, 4, 8, 16, 20, 24};
+  for (int i = 0; i < 6; ++i) {
+    sensor_msgs::msg::PointField f;
+    f.name = names[i];
+    f.offset = offsets[i];
+    f.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    f.count = 1;
+    msg.fields.push_back(f);
+  }
+  msg.point_step = 32;
+  msg.row_step = msg.point_step * msg.width;
+  msg.data.assign(msg.row_step, 0);
+  for (long r = 0; r < xyz.rows(); ++r) {
+    float* p = reinterpret_cast<float*>(msg.data.data() + r * msg.point_step);
+    p[0] = xyz(r, 0);
+    p[1] = xyz(r, 1);
+    p[2] = xyz(r, 2);
+    p[4] = r < intens.size() ? intens(r) : 1.0f;
+    p[5] = r < ranges.size() ? ranges(r) : 0.0f;
+    p[6] = -1.0f;
+  }
+  return msg;
+}
+
+}  // namespace
 
 class FeatureExtractionNode : public SlamNodeBase
 {
@@ -68,6 +113,41 @@ public:
       SONAR_FEATURE_TOPIC, 10);
     feature_img_pub_ = create_publisher<sensor_msgs::msg::Image>(
       SONAR_FEATURE_IMG_TOPIC, 10);
+
+    // Optional union map stream: republish the (non-sentinel) feature clouds
+    // as padded XYZI onto a shared topic with sonar_proc's candidate stream,
+    // so the map accumulator/vdb see the CFAR detector's structure too —
+    // CFAR holds a constant false-alarm rate against the local background
+    // and finds low-contrast structure the candidate edge detector misses.
+    const std::string map_topic = get_string("map_points_topic", "");
+    if (!map_topic.empty())
+      map_points_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>(map_topic, 10);
+    // residual TVG for the map stream (identity at 0) — keep these equal to
+    // sonar_proc's values so the union's two intensity sources stay on one
+    // radiometric scale (SURVEY_RADIOMETRICS_PLAN.md)
+    tvg_spread_db_ = get_double("tvg_spread_db", 0.0);
+    tvg_absorption_db_per_m_ = get_double("tvg_absorption_db_per_m", 0.0);
+
+    // Sonar head pitch. The Oculus rides the Deep Trekker's pivoting head
+    // (cameraHead.tilt), which sweeps up to +/-54 deg; treating it as a level
+    // scanner mis-places every feature. system_interface republishes the head
+    // angle on /base/sensor_tilt_angle (DEGREES). We fold it into the
+    // published fan as a pitch about the lateral axis so the cloud sits at the
+    // true sonar attitude in base_link. slam_node consumes only (x, y), so it
+    // automatically receives the horizontal (de-tilted) projection; z carries
+    // the pitch for viz / 3D consumers. If the topic never arrives the angle
+    // stays 0 and behaviour is byte-for-byte the old level assumption.
+    apply_head_tilt_ = get_bool("apply_head_tilt", true);
+    if (apply_head_tilt_) {
+      const std::string tilt_topic =
+        get_string("head_tilt_topic", "/base/sensor_tilt_angle");
+      tilt_sub_ = create_subscription<std_msgs::msg::Float32>(
+        tilt_topic, rclcpp::SensorDataQoS(),
+        [this](const std_msgs::msg::Float32& m) {
+          head_tilt_rad_.store(m.data * static_cast<float>(M_PI) / 180.0f);
+        });
+    }
 
     RCLCPP_INFO(get_logger(), "Feature extraction node initialized (GPU: %s)",
                 gpu::available() ? "on" : "off, CPU fallback");
@@ -147,16 +227,61 @@ private:
     // drew the fan rolled 90 deg in an ENU viewer. The SLAM node's
     // consumption is adjusted in lockstep (slam_node.cpp slam_callback),
     // so the graph math is unchanged.
+    // Rotate the sonar-plane fan (col0 = forward along the bore, col1 =
+    // lateral) by the head pitch about the lateral axis: forward tips into
+    // -z as the head looks down (tilt < 0). Lateral is the pitch axis and is
+    // unchanged. head_tilt_rad_ == 0 reduces this to the old [x, y, 0].
+    const float phi = apply_head_tilt_ ? head_tilt_rad_.load() : 0.0f;
+    const float cphi = std::cos(phi);
+    const float sphi = std::sin(phi);
     Matrix xyz(points.rows(), 3);
-    xyz.col(0) = points.col(0);
+    xyz.col(0) = points.col(0) * cphi;
     xyz.col(1) = points.col(1);
-    xyz.col(2).setZero();
+    xyz.col(2) = points.col(0) * sphi;
 
     sensor_msgs::msg::PointCloud2 msg = make_cloud_xyz(xyz);
     // the stamp of the source sonar image is CRITICAL to downstream sync
     msg.header.stamp = stamp;
     msg.header.frame_id = "base_link";
     feature_pub_->publish(msg);
+
+    // union map stream (see constructor): skip the NaN skip-frame sentinel
+    // (a sync signal for the slam node, poison for map consumers) and empty
+    // frames (they only flood the chain/assembler with no-data warnings)
+    if (map_points_pub_ && xyz.rows() > 0 && !std::isnan(xyz(0, 0))) {
+      // real echo intensity (0..1): invert the extraction pixel->meters
+      // mapping back into this ping's remapped grayscale. points col0 =
+      // forward (rows axis), col1 = lateral (cols axis), pre-tilt — their
+      // planar norm is the slant range.
+      Eigen::VectorXf intens = Eigen::VectorXf::Ones(points.rows());
+      Eigen::VectorXf ranges = Eigen::VectorXf::Zero(points.rows());
+      for (long r = 0; r < points.rows(); ++r)
+        ranges(r) = std::hypot(points(r, 0), points(r, 1));
+      if (!cart_gray_.empty() && rows_ > 0 && height_ > 0 && width_ > 0) {
+        for (long r = 0; r < points.rows(); ++r) {
+          const int row = static_cast<int>(
+            std::lround((1.0 - points(r, 0) / height_) * rows_));
+          const int col = static_cast<int>(
+            std::lround(cols_ / 2.0 - points(r, 1) * cols_ / width_));
+          if (row >= 0 && row < cart_gray_.rows && col >= 0 &&
+              col < cart_gray_.cols)
+            intens(r) = cart_gray_.at<std::uint8_t>(row, col) / 255.0f;
+          // residual TVG (dB; identity when both coefficients are 0) — must
+          // match sonar_proc's mapIntensity so the union stays on one scale
+          if (ranges(r) > 1e-3f &&
+              (tvg_spread_db_ != 0.0 || tvg_absorption_db_per_m_ != 0.0)) {
+            const double db =
+              tvg_spread_db_ * std::log10(static_cast<double>(ranges(r))) +
+              tvg_absorption_db_per_m_ * 2.0 * (static_cast<double>(ranges(r)) - 1.0);
+            intens(r) = static_cast<float>(std::clamp(
+              static_cast<double>(intens(r)) * std::pow(10.0, db / 20.0), 0.0, 1.0));
+          }
+        }
+      }
+      sensor_msgs::msg::PointCloud2 map_msg = make_map_cloud(xyz, intens, ranges);
+      map_msg.header = msg.header;
+      map_points_pub_->publish(map_msg);
+    }
   }
 
   // interp: 0 = nearest, 1 = bilinear. Use nearest for a binary detection
@@ -246,6 +371,11 @@ private:
       // to Cartesian — nearest-neighbour for the binary mask
       const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
 
+      // grayscale echo image for the map stream's per-point intensity
+      // (looked up at publish time, after downsample/outlier filtering)
+      if (map_points_pub_)
+        cart_gray_ = remap_u8(img, /*interp=*/1);
+
       std::vector<cv::Point> locs;
       cv::findNonZero(cart_peaks, locs);
 
@@ -291,10 +421,20 @@ private:
   std::vector<float> bearings_;
   int map_version_ = 0;
   cv::Mat map_x_, map_y_;
+  // per-ping remapped grayscale for map-stream intensity lookup
+  cv::Mat cart_gray_;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr feature_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feature_img_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_pub_;
+  double tvg_spread_db_ = 0.0;
+  double tvg_absorption_db_per_m_ = 0.0;
+
+  // sonar head pitch (rad), latest value from /base/sensor_tilt_angle; 0 = level
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr tilt_sub_;
+  std::atomic<float> head_tilt_rad_{0.0f};
+  bool apply_head_tilt_ = true;
 };
 
 }  // namespace sonar_slam

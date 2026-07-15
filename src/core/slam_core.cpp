@@ -21,6 +21,44 @@ namespace {
 
 inline gtsam::Key X(int i) { return gtsam::Symbol('x', i); }
 
+// SE3 graph chart (FULL_3D_ROADMAP.md Phase 4): states are HORIZON poses
+// (yaw-only rotation, live z). Sonar ICP observes (x, y, yaw); depth is an
+// absolute measurement; roll/pitch are 0 BY CONSTRUCTION in this chart (the
+// clouds are attitude-rotated at ingestion). Sigma constants for the
+// dimensions each factor does not observe:
+constexpr double kSigmaWide = 10.0;      // effectively unconstrained
+constexpr double kSigmaTightRP = 1e-3;   // pins chart roll/pitch at 0
+constexpr double kSigmaDepthAbs = 0.02;  // absolute depth (bridge), m
+constexpr double kSigmaDepthDelta = 0.05;  // DR depth delta over a keyframe, m
+
+// lift planar sigmas (x, y, theta) into the Pose3 tangent (rx,ry,rz,tx,ty,tz)
+gtsam::SharedNoiseModel lift_sigmas(const Eigen::Vector3d& s, double s_rp,
+                                    double s_z)
+{
+  gtsam::Vector6 v;
+  v << s_rp, s_rp, s[2], s[0], s[1], s_z;
+  return gtsam::noiseModel::Diagonal::Sigmas(v);
+}
+
+// embed a planar (x, y, theta) covariance into the Pose3 tangent, leaving the
+// unobserved dimensions (roll, pitch, z) at kSigmaWide^2
+Eigen::Matrix<double, 6, 6> embed_planar_cov(const Eigen::Matrix3d& c)
+{
+  Eigen::Matrix<double, 6, 6> C = Eigen::Matrix<double, 6, 6>::Zero();
+  C(0, 0) = C(1, 1) = C(5, 5) = kSigmaWide * kSigmaWide;
+  constexpr int map[3] = {3, 4, 2};  // x->tx, y->ty, theta->rz
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) C(map[i], map[j]) = c(i, j);
+  return C;
+}
+
+// lift a planar ICP transform into the horizon chart (z unobserved -> 0)
+gtsam::Pose3 lift_planar(const gtsam::Pose2& p)
+{
+  return gtsam::Pose3(gtsam::Rot3::Yaw(p.theta()),
+                      gtsam::Point3(p.x(), p.y(), 0.0));
+}
+
 }  // namespace
 
 Slam::Slam()
@@ -66,9 +104,18 @@ void Slam::configure()
     throw std::invalid_argument(
       "nssm/source_frames must be < nssm/min_st_sep");
 
-  prior_model_ = create_noise_model(prior_sigmas);
-  odom_model_ = create_noise_model(odom_sigmas);
-  icp_odom_model_ = create_noise_model(icp_odom_sigmas);
+  // 6D lifts of the configured planar sigmas (see the chart note above):
+  // prior/odometry constrain chart roll/pitch (0) and depth (absolute for the
+  // prior, DR delta for odometry); ICP factors are wide in everything the
+  // sonar cannot observe. The per-keyframe unary carries absolute depth +
+  // zero-attitude and is wide in the planar dimensions the graph owns.
+  prior_model_ = lift_sigmas(prior_sigmas, kSigmaTightRP, kSigmaDepthAbs);
+  odom_model_ = lift_sigmas(odom_sigmas, kSigmaTightRP, kSigmaDepthDelta);
+  icp_odom_model_ = lift_sigmas(icp_odom_sigmas, kSigmaWide, kSigmaWide);
+  gtsam::Vector6 u;
+  u << kSigmaTightRP, kSigmaTightRP, kSigmaWide, kSigmaWide, kSigmaWide,
+    kSigmaDepthAbs;
+  unary_model_ = gtsam::noiseModel::Diagonal::Sigmas(u);
 }
 
 gtsam::SharedNoiseModel Slam::create_noise_model(const Eigen::Vector3d& sigmas) const
@@ -242,16 +289,28 @@ bool Slam::is_keyframe(const Keyframe& frame) const
 
 void Slam::add_prior(const KeyframePtr& keyframe)
 {
-  graph_.add(gtsam::PriorFactor<gtsam::Pose2>(X(0), keyframe->pose, prior_model_));
-  values_.insert(X(0), keyframe->pose);
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), keyframe->horizon_pose3(),
+                                              prior_model_));
+  values_.insert(X(0), keyframe->horizon_pose3());
 }
 
 void Slam::add_odometry(const KeyframePtr& keyframe)
 {
-  const gtsam::Pose2 dr_odom = keyframes.back()->pose.between(keyframe->pose);
-  graph_.add(gtsam::BetweenFactor<gtsam::Pose2>(
+  // horizon-chart DR delta: planar odometry + the measured depth change
+  const gtsam::Pose3 dr_odom =
+    keyframes.back()->horizon_pose3().between(keyframe->horizon_pose3());
+  graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
     X(current_key() - 1), X(current_key()), dr_odom, odom_model_));
-  values_.insert(X(current_key()), keyframe->pose);
+  values_.insert(X(current_key()), keyframe->horizon_pose3());
+  add_state_unary(current_key(), keyframe);
+}
+
+void Slam::add_state_unary(int key, const KeyframePtr& keyframe)
+{
+  // absolute depth + zero-attitude anchor for the dimensions no scan-match
+  // factor observes (wide in x/y/yaw, which the graph owns)
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+    X(key), keyframe->horizon_dr_pose3(), unary_model_));
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +327,8 @@ InitializationResult Slam::initialize_sequential_scan_matching(
   ret.source_pose = keyframe->pose;
   ret.target_pose = current_keyframe()->pose;
 
-  ret.source_points = keyframe->points;
+  // registration is planar: keep the x/y projection, drop the elevation col
+  ret.source_points = keyframe->points.leftCols(2);
   std::vector<int> target_frames;
   for (int k = std::max(0, current_key() - ssm_params.target_frames);
        k < current_key(); ++k)
@@ -400,6 +460,8 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
   InitializationResult ret = initialize_sequential_scan_matching(keyframe);
 
   if (!ret.status) {
+    last_ssm_status =
+      std::string(ret.status.name()) + " (" + ret.status.description + ")";
     add_odometry(keyframe);
     return;
   }
@@ -434,14 +496,26 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
 
   if (ret2.status) {
     const gtsam::SharedNoiseModel model =
-      ret2.has_cov ? create_full_noise_model(ret2.cov) : icp_odom_model_;
-    graph_.add(gtsam::BetweenFactor<gtsam::Pose2>(
-      X(ret2.target_key), X(ret2.source_key), ret2.estimated_transform, model));
+      ret2.has_cov
+        ? gtsam::noiseModel::Gaussian::Covariance(embed_planar_cov(ret2.cov))
+        : icp_odom_model_;
+    graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+      X(ret2.target_key), X(ret2.source_key),
+      lift_planar(ret2.estimated_transform), model));
+    // initial value: planar compose; z from DR (the factor is z-wide, the
+    // unary below anchors it)
+    const gtsam::Pose2 init2 = ret2.target_pose.compose(ret2.estimated_transform);
     values_.insert(X(ret2.source_key),
-                   ret2.target_pose.compose(ret2.estimated_transform));
+                   gtsam::Pose3(gtsam::Rot3::Yaw(init2.theta()),
+                                gtsam::Point3(init2.x(), init2.y(),
+                                              keyframe->dr_pose3.z())));
+    add_state_unary(ret2.source_key, keyframe);
     ret2.inserted = true;
     ++ssm_accepted;
+    last_ssm_status = "accepted (" + ret2.status.description + ")";
   } else {
+    last_ssm_status =
+      std::string(ret2.status.name()) + " (" + ret2.status.description + ")";
     add_odometry(keyframe);
   }
 }
@@ -627,8 +701,13 @@ bool Slam::add_nonsequential_scan_matching()
   // until the second callback
   if (!current_frame || current_key() < nssm_params.min_st_sep) return false;
 
+  ++nssm_attempts;
   InitializationResult ret = initialize_nonsequential_scan_matching();
-  if (!ret.status) return false;
+  if (!ret.status) {
+    last_nssm_status =
+      std::string(ret.status.name()) + " (" + ret.status.description + ")";
+    return false;
+  }
 
   ICPResult ret2(ret, nssm_params.cov_samples > 0 &&
                         nssm_params.cov_method == SMParams::SAMPLED);
@@ -656,8 +735,51 @@ bool Slam::add_nonsequential_scan_matching()
     ret2.status.description = std::to_string(overlap);
   }
 
+  // Compass-consistency gate (ABSOLUTE, added 2026-07-15 night after two
+  // accepted closures rotated the map 90°+): discrete rotational aliasing —
+  // a near-square pool aliases at ~90° — produces CONFIDENT wrong locks
+  // (tight isotropic covariance, tiny ICP refinement) and symmetric pairs
+  // that agree with each other, so every relative gate below passes. The
+  // compass cannot be aliased: both keyframes' DR yaws are compass-anchored
+  // and drift-free, so the closure's measured relative yaw must match the
+  // DR relative yaw within compass noise.
+  if (ret2.status) {
+    const double dr_rel_yaw = keyframes[ret2.target_key]
+                                ->dr_pose.between(keyframes[ret2.source_key]->dr_pose)
+                                .theta();
+    const double yaw_err = std::abs(std::remainder(
+      ret2.estimated_transform.theta() - dr_rel_yaw, 2.0 * M_PI));
+    if (yaw_err > nssm_max_yaw_vs_compass) {
+      ret2.status = Status(Status::LARGE_TRANSFORMATION);
+      ret2.status.description =
+        "compass-inconsistent (closure yaw vs DR yaw differs by " +
+        std::to_string(yaw_err) + " rad)";
+    }
+  }
+
+  // Degeneracy gate (FULL_3D_ROADMAP.md "Path to survey-grade" item 1):
+  // pool/wall aliasing produced self-consistent-but-wrong closures that PCM
+  // could not reject (2026-07 CHL_Pool: 9 accepted closures demanding 21 deg
+  // RMS yaw correction — why NSSM was turned off). Sliding along featureless
+  // structure shows up as an elongated translation covariance in the
+  // sampled/Censi estimate, so reject closures whose covariance is too large
+  // or too anisotropic. The yaw half of the gate is nssm/max_rotation,
+  // tightened in slam.yaml to the compass-anchored bound.
+  if (ret2.status && ret2.has_cov) {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
+      ret2.cov.topLeftCorner<2, 2>());
+    const double sig_max = std::sqrt(std::max(0.0, es.eigenvalues()[1]));
+    const double sig_min = std::sqrt(std::max(1e-12, es.eigenvalues()[0]));
+    if (sig_max > nssm_max_sigma || sig_max / sig_min > nssm_max_anisotropy) {
+      ret2.status = Status(Status::NOT_CONVERGED);
+      ret2.status.description = "degenerate: sigma " + std::to_string(sig_max) +
+                                " aniso " + std::to_string(sig_max / sig_min);
+    }
+  }
+
   bool accepted = false;
   if (ret2.status) {
+    ++nssm_queued;
     // slide the PCM queue window
     while (!nssm_queue_.empty() &&
            ret2.source_key - nssm_queue_.front().source_key > pcm_queue_size)
@@ -665,15 +787,30 @@ bool Slam::add_nonsequential_scan_matching()
 
     nssm_queue_.push_back(ret2);
     const std::vector<int> pcm = verify_pcm(nssm_queue_, min_pcm);
+    nssm_best_clique = std::max(nssm_best_clique, static_cast<int>(pcm.size()));
+    last_nssm_status = pcm.empty()
+      ? "queued (queue " + std::to_string(nssm_queue_.size()) +
+          ", no consistent clique >= " + std::to_string(min_pcm) + ")"
+      : "PCM clique " + std::to_string(pcm.size());
 
     for (int m : pcm) {
       ICPResult& loop = nssm_queue_[m];
       if (loop.inserted) continue;
 
-      const gtsam::SharedNoiseModel model =
-        loop.has_cov ? create_full_noise_model(loop.cov) : icp_odom_model_;
-      graph_.add(gtsam::BetweenFactor<gtsam::Pose2>(
-        X(loop.target_key), X(loop.source_key), loop.estimated_transform, model));
+      // Robust kernel on loop factors (rtabmap/Vertigo-style damage
+      // limitation): DCS (Agarwal et al., dynamic covariance scaling)
+      // down-weights any closure whose residual grows during optimization —
+      // a bad closure that fools every gate loses the argument with the
+      // odometry chain instead of winning it.
+      const gtsam::SharedNoiseModel base =
+        loop.has_cov
+          ? gtsam::noiseModel::Gaussian::Covariance(embed_planar_cov(loop.cov))
+          : icp_odom_model_;
+      const gtsam::SharedNoiseModel model = gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::DCS::Create(1.0), base);
+      graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        X(loop.target_key), X(loop.source_key),
+        lift_planar(loop.estimated_transform), model));
       keyframes[loop.source_key]->constraints.emplace_back(
         loop.target_key, loop.estimated_transform);
       loop.inserted = true;
@@ -682,7 +819,11 @@ bool Slam::add_nonsequential_scan_matching()
       pending_loops_.push_back(m);
       ++nssm_accepted;
       accepted = true;
+      last_nssm_status = "accepted (clique " + std::to_string(pcm.size()) + ")";
     }
+  } else {
+    last_nssm_status =
+      std::string(ret2.status.name()) + " (" + ret2.status.description + ")";
   }
   return accepted;
 }
@@ -712,19 +853,56 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     rebuild_isam();
     return false;
   }
-  // the buffered factors are now permanently in the estimator; mirror them
-  // for failure recovery, and let this round's loop-closure marks stand
+  const gtsam::Values values = isam_.calculateEstimate();
+  gtsam::Pose3 pose;
+  for (std::size_t x = 0; x < values.size(); ++x) {
+    pose = values.at<gtsam::Pose3>(X(static_cast<int>(x)));
+    keyframes.at(x)->update(pose);  // .at() fails loudly if the counts diverge
+  }
+
+  // rtabmap-style optimize-then-verify (RGBD/OptimizeMaxError analog, using
+  // the reference rtabmap doesn't have — an absolute compass): when this
+  // round inserted loop closures, check the WHOLE graph's optimized yaws
+  // against the compass-anchored DR yaws. A closure that fooled every
+  // per-closure gate (confident rotational alias) still has to bend the
+  // trajectory away from the compass to win — the historical "21 deg RMS
+  // yaw correction" diagnostic, automated. On failure the loops are rolled
+  // back and the estimator rebuilt without them.
+  if (!pending_loops_.empty()) {
+    double ss = 0.0;
+    for (const auto& kf : keyframes) {
+      const double e =
+        std::remainder(kf->pose.theta() - kf->dr_pose.theta(), 2.0 * M_PI);
+      ss += e * e;
+    }
+    const double rms = std::sqrt(ss / static_cast<double>(keyframes.size()));
+    if (rms > post_loop_max_yaw_rms) {
+      last_error_ = "post-loop compass check failed: optimized-vs-DR yaw RMS " +
+                    std::to_string(rms) + " rad > " +
+                    std::to_string(post_loop_max_yaw_rms);
+      last_nssm_status = "REVERTED (" + last_error_ + ")";
+      graph_.resize(0);
+      values_.clear();
+      rollback_pending_loops();
+      rebuild_isam();
+      // keyframes were already updated with the bent estimates — re-extract
+      // from the rebuilt estimator (linearized at the bent poses, so the
+      // first re-solve may retain some residual; subsequent keyframe updates
+      // converge it back)
+      const gtsam::Values reverted = isam_.calculateEstimate();
+      for (std::size_t x = 0; x < reverted.size() && x < keyframes.size(); ++x)
+        keyframes.at(x)->update(
+          reverted.at<gtsam::Pose3>(X(static_cast<int>(x))));
+      return false;
+    }
+  }
+
+  // verified (or no loops this round): the factors become permanent; mirror
+  // them for failure recovery, and let this round's loop-closure marks stand
   committed_graph_.push_back(graph_);
   graph_.resize(0);
   values_.clear();
   pending_loops_.clear();
-
-  const gtsam::Values values = isam_.calculateEstimate();
-  gtsam::Pose2 pose;
-  for (std::size_t x = 0; x < values.size(); ++x) {
-    pose = values.at<gtsam::Pose2>(X(static_cast<int>(x)));
-    keyframes.at(x)->update(pose);  // .at() fails loudly if the counts diverge
-  }
 
   // Only the latest keyframe's covariance is refreshed — a known limitation
   // carried from slam.py (its own "TODO propagate cov from previous keyframe"),
@@ -734,11 +912,38 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // variable (IndeterminantLinearSystem); keep the optimized pose and skip the
   // covariance update rather than propagating the failure out of the callback.
   try {
-    const Eigen::Matrix3d cov =
+    const Eigen::MatrixXd cov6 =
       isam_.marginalCovariance(X(static_cast<int>(values.size()) - 1));
+    // extract the planar (x, y, theta) block from the Pose3 tangent marginal
+    // for the downstream 3x3 transf_cov machinery
+    constexpr int map[3] = {3, 4, 2};
+    Eigen::Matrix3d cov;
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) cov(i, j) = cov6(map[i], map[j]);
     keyframes.back()->update(pose, cov);
   } catch (const std::exception&) {
     keyframes.back()->update(pose);
+  }
+
+  // PCM marginal refresh (fixes the DIVERGENCES.md known limitation: only
+  // the newest keyframe's marginal was ever refreshed, so PCM tested
+  // consistency against stale covariances and honest cliques never formed):
+  // refresh the marginals of every keyframe involved in a queued closure —
+  // a handful of O(1) calls per update, not the O(n^2) full-history sweep.
+  for (const ICPResult& q : nssm_queue_) {
+    for (const int k : {q.source_key, q.target_key}) {
+      if (k < 0 || k >= static_cast<int>(keyframes.size())) continue;
+      try {
+        const Eigen::MatrixXd c6 = isam_.marginalCovariance(X(k));
+        constexpr int map[3] = {3, 4, 2};
+        Eigen::Matrix3d c;
+        for (int i = 0; i < 3; ++i)
+          for (int j = 0; j < 3; ++j) c(i, j) = c6(map[i], map[j]);
+        keyframes[k]->update(keyframes[k]->horizon_pose3(), c);
+      } catch (const std::exception&) {
+        // weakly constrained variable: keep the stale marginal
+      }
+    }
   }
 
   // refresh the poses in pending loop closures for PCM
@@ -782,7 +987,7 @@ void Slam::rebuild_isam()
   isam_ = gtsam::ISAM2();
   gtsam::Values estimates;
   for (std::size_t i = 0; i < keyframes.size(); ++i)
-    estimates.insert(X(static_cast<int>(i)), keyframes[i]->pose);
+    estimates.insert(X(static_cast<int>(i)), keyframes[i]->horizon_pose3());
   try {
     gtsam::NonlinearFactorGraph graph = committed_graph_;
     isam_.update(graph, estimates);
@@ -834,8 +1039,10 @@ void find_cliques(const std::map<int, std::set<int>>& adj,
 }  // namespace
 
 std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
-                                  int min_pcm_value) const
+                                  int min_pcm_value)
 {
+  last_pcm_min_md = -1.0;
+  last_pcm_edges = 0;
   if (static_cast<int>(queue.size()) < min_pcm_value) return {};
 
   // build the consistency graph
@@ -856,9 +1063,26 @@ std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
       Eigen::Matrix3d cov = ret_jk.cov;
       if (!ret_jk.has_cov)
         cov = icp_odom_sigmas.array().square().matrix().asDiagonal();
+      // The consistency error routes through the GRAPH's relative pose
+      // between the two closures' source keyframes (plk) — its uncertainty
+      // (the drift PCM exists to tolerate) must appear in the chi2
+      // denominator or honest pairs on a drifted segment always fail.
+      // Approximate the relative covariance as the sum of the (freshly
+      // refreshed) world marginals, unrotated into pj's frame — the same
+      // world->local pattern as compute_icp_with_cov. Ignoring the (helpful)
+      // cross-correlation makes this an over-estimate: permissive, so PCM
+      // still relies on the per-closure gates for outright junk.
+      Eigen::Matrix3d rel = keyframes[ret_il.source_key]->cov +
+                            keyframes[ret_jk.source_key]->cov;
+      const Eigen::Matrix2d R = pj.rotation().matrix();
+      rel.topRows<2>() = R.transpose() * rel.topRows<2>();
+      rel.leftCols<2>() = rel.leftCols<2>() * R;
+      cov += rel;
       const double md = error.dot(cov.inverse() * error);
+      if (last_pcm_min_md < 0.0 || md < last_pcm_min_md) last_pcm_min_md = md;
       // chi2.ppf(0.99, 3) = 11.34
       if (md < 11.34) {
+        ++last_pcm_edges;
         adj[static_cast<int>(a)].insert(static_cast<int>(b));
         adj[static_cast<int>(b)].insert(static_cast<int>(a));
       }

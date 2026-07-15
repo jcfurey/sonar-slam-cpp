@@ -66,7 +66,7 @@ struct Keyframe
 {
   Keyframe(bool status_, const builtin_interfaces::msg::Time& time_,
            const gtsam::Pose3& dr_pose3_,
-           Matrix points_ = Matrix::Zero(0, 2))
+           Matrix points_ = Matrix::Zero(0, 3))
     : status(status_), time(time_), dr_pose3(dr_pose3_),
       dr_pose(pose322(dr_pose3_)), pose3(dr_pose3_), pose(pose322(dr_pose3_)),
       points(std::move(points_))
@@ -90,6 +90,42 @@ struct Keyframe
     cov = new_cov;
     has_cov = true;
     update(new_pose);
+  }
+
+  // SE3 graph update (FULL_3D_ROADMAP.md Phase 4): the graph estimates
+  // HORIZON poses — yaw-only rotation with z a live state — because point
+  // clouds are attitude-rotated at ingestion (roll/pitch in a pose would
+  // double-apply them). z comes from the estimate; roll/pitch ride from DR.
+  void update(const gtsam::Pose3& est_h)
+  {
+    pose = gtsam::Pose2(est_h.x(), est_h.y(), est_h.rotation().yaw());
+    pose3 = gtsam::Pose3(
+      gtsam::Rot3::Ypr(pose.theta(), dr_pose3.rotation().pitch(),
+                       dr_pose3.rotation().roll()),
+      gtsam::Point3(est_h.x(), est_h.y(), est_h.z()));
+    transf_points = transform_points(points, pose);
+    update_transf_cov();
+  }
+
+  void update(const gtsam::Pose3& est_h, const Eigen::Matrix3d& new_cov)
+  {
+    cov = new_cov;
+    has_cov = true;
+    update(est_h);
+  }
+
+  // the keyframe's current estimate as a horizon pose (graph state chart)
+  gtsam::Pose3 horizon_pose3() const
+  {
+    return gtsam::Pose3(gtsam::Rot3::Yaw(pose.theta()),
+                        gtsam::Point3(pose.x(), pose.y(), pose3.z()));
+  }
+
+  // the DR measurement as a horizon pose (planar dr_pose + measured depth)
+  gtsam::Pose3 horizon_dr_pose3() const
+  {
+    return gtsam::Pose3(gtsam::Rot3::Yaw(dr_pose.theta()),
+                        gtsam::Point3(dr_pose.x(), dr_pose.y(), dr_pose3.z()));
   }
 
   static Matrix transform_points(const Matrix& pts, const gtsam::Pose2& pose)
@@ -118,8 +154,8 @@ struct Keyframe
   Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();        // local frame
   Eigen::Matrix3d transf_cov = Eigen::Matrix3d::Zero(); // global frame
 
-  Matrix points;         // local frame, Nx2
-  Matrix transf_points;  // global frame
+  Matrix points;         // local horizon-referenced frame, Nx3 (x, y, elev)
+  Matrix transf_points;  // global frame, Nx2 (registration cache; x/y only)
 
   // non-sequential constraints aka loop closures: (target key, transform)
   std::vector<std::pair<int, gtsam::Pose2>> constraints;

@@ -44,6 +44,25 @@ public:
   int pcm_queue_size = 5;
   int min_pcm = 3;
 
+  // NSSM degeneracy gate (wall-aliasing closures are self-consistent, so PCM
+  // alone cannot reject them): reject a closure whose sampled/Censi
+  // translation covariance is too large or too elongated (sliding along a
+  // featureless wall). Pair with a tight nssm/max_rotation — yaw corrections
+  // beyond compass noise are bogus by construction in this anchored frame.
+  double nssm_max_sigma = 0.5;       // max sqrt(largest translation eigenvalue), m
+  double nssm_max_anisotropy = 8.0;  // max sigma_max / sigma_min
+  // ABSOLUTE yaw gate against the compass (kills discrete rotational
+  // aliasing — e.g. a near-square pool aliases at 90°, which ICP matches
+  // confidently and symmetric pairs pass PCM): the closure's relative yaw
+  // must agree with the compass-anchored DR relative yaw within this bound.
+  // Neither max_rotation (ICP-vs-Sobol refinement only) nor the covariance
+  // gate (catches sliding, not confident-but-wrong locks) covers this mode.
+  double nssm_max_yaw_vs_compass = 0.15;  // rad (~8.6°, > compass noise)
+  // optimize-then-verify (rtabmap RGBD/OptimizeMaxError analog): after a
+  // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
+  // under this bound or the loops are rolled back (see update_factor_graph)
+  double post_loop_max_yaw_rms = 0.15;  // rad
+
   OculusProperty oculus;
 
   // ----------------------------------------------------------------- state
@@ -54,6 +73,22 @@ public:
 
   int ssm_accepted = 0;
   int nssm_accepted = 0;
+  // most recent SSM outcome ("accepted" or "<Status name>: <description>") —
+  // surfaced in the periodic status log so a 0-factor run explains itself
+  std::string last_ssm_status = "none yet";
+  // same for NSSM, plus pipeline counters: attempts that got past the
+  // st_sep/current_frame gate, candidates that survived every per-closure
+  // gate into the PCM queue, and the largest consistent clique seen
+  std::string last_nssm_status = "none yet";
+  int nssm_attempts = 0;
+  int nssm_queued = 0;
+  int nssm_best_clique = 0;
+  int nssm_queue_depth() const { return static_cast<int>(nssm_queue_.size()); }
+  // PCM introspection: the smallest pairwise Mahalanobis distance seen in
+  // the last verify (how close the queue is to forming an edge; threshold
+  // 11.34 = chi2.ppf(0.99, 3)) and how many consistency edges formed
+  double last_pcm_min_md = -1.0;
+  int last_pcm_edges = 0;
 
   const KeyframePtr& current_keyframe() const { return keyframes.back(); }
   int current_key() const { return static_cast<int>(keyframes.size()); }
@@ -62,6 +97,8 @@ public:
   bool is_keyframe(const Keyframe& frame) const;
   void add_prior(const KeyframePtr& keyframe);
   void add_odometry(const KeyframePtr& keyframe);
+  // absolute depth + zero-attitude prior on X(key) (Phase 4 horizon chart)
+  void add_state_unary(int key, const KeyframePtr& keyframe);
   void add_sequential_scan_matching(const KeyframePtr& keyframe);
   // returns true when a loop closure was accepted into the graph
   bool add_nonsequential_scan_matching();
@@ -100,9 +137,10 @@ public:
                   const gtsam::Pose2* source_pose = nullptr,
                   std::vector<int>* indices_out = nullptr) const;
 
-  // PCM over the loop-closure queue; returns indices into the queue
+  // PCM over the loop-closure queue; returns indices into the queue.
+  // Non-const: records last_pcm_min_md / last_pcm_edges introspection.
   std::vector<int> verify_pcm(const std::deque<ICPResult>& queue,
-                              int min_pcm_value) const;
+                              int min_pcm_value);
 
 private:
   InitializationResult initialize_sequential_scan_matching(
@@ -135,7 +173,10 @@ private:
   std::vector<int> pending_loops_;
   std::string last_error_;
 
+  // 6D models over the Pose3 tangent (rx, ry, rz, tx, ty, tz); see configure()
   gtsam::SharedNoiseModel prior_model_, odom_model_, icp_odom_model_;
+  // per-keyframe absolute depth + zero-attitude prior (wide x/y/yaw)
+  gtsam::SharedNoiseModel unary_model_;
 
   std::deque<ICPResult> nssm_queue_;
 };
