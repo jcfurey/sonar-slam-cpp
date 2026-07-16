@@ -138,6 +138,20 @@ public:
     // automatically receives the horizontal (de-tilted) projection; z carries
     // the pitch for viz / 3D consumers. If the topic never arrives the angle
     // stays 0 and behaviour is byte-for-byte the old level assumption.
+    // Head-pitch FRAME GATE (2026-07-16, from CHL_Pool ping forensics):
+    // bruce-slam's planar registration assumes a near-level fan. During the
+    // ±54° head sweep the frame is DOMINATED by the floor bowl — a huge
+    // bright curved band whose planar (x,y) projection registers against
+    // real walls from other frames and pulls the graph (the observed "bad
+    // SLAM corrections"), and whose features stamp curved bands into the
+    // mapping tiles. Skip feature frames when |head pitch| exceeds this
+    // bound (rad; 0 disables the gate). The NaN sentinel keeps the SLAM
+    // synchronizer advancing; dead-reckoning odometry factors carry the
+    // graph between level frames, and the sweep frames still feed the map
+    // through sonar_proc's candidates/dense streams (which place them with
+    // the floor/wall projections).
+    max_head_pitch_ = get_double("max_head_pitch", 0.0);
+
     apply_head_tilt_ = get_bool("apply_head_tilt", true);
     if (apply_head_tilt_) {
       const std::string tilt_topic =
@@ -321,6 +335,16 @@ private:
       return;
     }
 
+    // head-pitch frame gate (see constructor): swept frames are floor- or
+    // surface-dominated — poison for the planar registration and the tiles
+    if (max_head_pitch_ > 0.0 &&
+        std::fabs(head_tilt_rad_.load()) > static_cast<float>(max_head_pitch_)) {
+      Matrix nan(1, 2);
+      nan.setConstant(std::numeric_limits<float>::quiet_NaN());
+      publish_features(ping.stamp, nan);
+      return;
+    }
+
     // a malformed adapter frame (empty / zero-range image) must not throw out
     // of the callback and terminate the node
     if (ping.image.empty() || ping.num_ranges <= 0) {
@@ -435,6 +459,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr tilt_sub_;
   std::atomic<float> head_tilt_rad_{0.0f};
   bool apply_head_tilt_ = true;
+  // skip feature frames when |head pitch| exceeds this (rad); 0 = no gate
+  double max_head_pitch_ = 0.0;
 };
 
 }  // namespace sonar_slam
