@@ -89,6 +89,26 @@ at the time of comparison.
   to be correct. (`mapping_node`, the port of `mapping.py`; see
   `SONAR_MAPPING_ARCHITECTURE.md` §5.)
 
+### 8. Sampled-covariance registrations run in parallel (`parallel_cov_samples`)
+- **Upstream:** `slam.py` runs the `cov_samples` (30) ICP registrations of the
+  "sampled" covariance method sequentially on one core with a 2 s wall-clock
+  cap — with SSM + NSSM both on `sampled`, that is up to 60 registrations
+  (≈4 s worst case) per keyframe on a single core, the node's dominant CPU
+  cost.
+- **Here:** `parallel_cov_samples` (default true) runs the registrations
+  across a per-OpenMP-thread pool of identically-configured libpointmatcher
+  engines (`ICP::compute_batch`). Each guess's registration is IDENTICAL to
+  the sequential result — the configured chain (`icp.yaml`) has no sampling
+  filters, so registration is deterministic given (source, target, guess) —
+  and samples are collected in guess order. The only behavioral divergence is
+  the 2 s cap: sequentially it could truncate the sample set mid-way; in
+  parallel it rarely fires, so FAST-MCD typically sees all 30 samples (a
+  strictly better-populated covariance estimate). Set false to restore the
+  historical one-core loop. GPU note: the registrations stay CPU
+  (libpointmatcher) by decision — see repo-root `GPU_ACCELERATION.md` §4;
+  the overlap/correspondence 1-NN (`cloud_ops match()`) is GPU-dispatched
+  (exact brute force, same -1/inf contract as the KDTree).
+
 ## Carried-over limitations left in place (with rationale)
 
 ### A. Only the newest keyframe's covariance is refreshed

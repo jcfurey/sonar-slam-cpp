@@ -18,8 +18,38 @@ if(SONAR_SLAM_ENABLE_CUDA)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-      set(CMAKE_CUDA_ARCHITECTURES 86)   # RTX 3090; override with -DCMAKE_CUDA_ARCHITECTURES
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+      # RTX 3090 = sm_86. `-real` emits the cubin for this GPU; `-virtual` also
+      # embeds PTX so a newer GPU can JIT. Override with -DCMAKE_CUDA_ARCHITECTURES.
+      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual)
+    endif()
+    # A stale CACHED value (the observed case: 52, from an old configure) is
+    # worse than it looks: under nvcc 12.x it still BUILDS (pre-75 archs are
+    # merely deprecated), so the kernels ship as compute_52 PTX that the
+    # sm_86 device must JIT — silently slow, no build error to notice — and
+    # under nvcc 13+ (which dropped sm_5x) the target fails outright while
+    # colcon continue-on-error keeps the stale install. Treat anything below
+    # sm_75 (Turing) as a stale cache on any modern toolkit and self-heal to
+    # sm_86 so the kernels actually rebuild for the device.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+      set(_cuda_arch_floor 75)
+    else()
+      set(_cuda_arch_floor 0)
+    endif()
+    set(_cuda_arch_ok TRUE)
+    foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+      string(REGEX MATCH "^[0-9]+" _an "${_a}")
+      if(_an AND _an LESS _cuda_arch_floor)
+        set(_cuda_arch_ok FALSE)
+      endif()
+    endforeach()
+    if(NOT _cuda_arch_ok)
+      message(WARNING "sonar_slam_cpp: cached CMAKE_CUDA_ARCHITECTURES "
+        "'${CMAKE_CUDA_ARCHITECTURES}' is below the nvcc "
+        "${CMAKE_CUDA_COMPILER_VERSION} floor (sm_${_cuda_arch_floor}) and "
+        "cannot build — resetting to 86. Reconfigure with "
+        "-DCMAKE_CUDA_ARCHITECTURES=<arch> to pick your own GPU.")
+      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual CACHE STRING "" FORCE)
     endif()
     set(HAVE_CUDA TRUE)
     message(STATUS "sonar_slam_cpp: CUDA kernels enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")
@@ -94,6 +124,7 @@ if(HAVE_CUDA)
     src/cuda/cfar_cuda.cu
     src/cuda/remap_cuda.cu
     src/cuda/cost_cuda.cu
+    src/cuda/nn_cuda.cu
   )
   set_target_properties(sonar_slam_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF

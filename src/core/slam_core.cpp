@@ -202,18 +202,35 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   IcpCovResult result;
 
   std::vector<Eigen::Vector3d> sample_transforms;
-  const auto start = std::chrono::steady_clock::now();
-  for (const auto& g : guesses) {
-    Eigen::Matrix3f gm = g.matrix().cast<float>();
-    auto [message, T] = icp.compute(source_points, target_points, gm);
-    if (message == "success") {
-      sample_transforms.emplace_back(T(0, 2), T(1, 2),
-                                     std::atan2(T(1, 0), T(0, 0)));
+  if (parallel_cov_samples) {
+    // per-thread engine pool; each guess's registration is identical to the
+    // sequential loop's (deterministic chain), collected in guess order. The
+    // 2 s cap (slam.py) still applies, but in parallel it rarely fires — so
+    // MCD typically sees all cov_samples instead of however many one core
+    // got through in 2 s.
+    std::vector<Eigen::Matrix3f> gm(guesses.size());
+    for (std::size_t i = 0; i < guesses.size(); ++i)
+      gm[i] = guesses[i].matrix().cast<float>();
+    const auto batch = icp.compute_batch(source_points, target_points, gm, 2000);
+    for (const auto& r : batch) {
+      if (!r.success) continue;
+      sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
+                                     std::atan2(r.T(1, 0), r.T(0, 0)));
     }
-    // enforce a max run time for this loop (slam.py: 2 s)
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start);
-    if (elapsed.count() >= 2000) break;
+  } else {
+    const auto start = std::chrono::steady_clock::now();
+    for (const auto& g : guesses) {
+      Eigen::Matrix3f gm = g.matrix().cast<float>();
+      auto [message, T] = icp.compute(source_points, target_points, gm);
+      if (message == "success") {
+        sample_transforms.emplace_back(T(0, 2), T(1, 2),
+                                       std::atan2(T(1, 0), T(0, 0)));
+      }
+      // enforce a max run time for this loop (slam.py: 2 s)
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+      if (elapsed.count() >= 2000) break;
+    }
   }
 
   if (sample_transforms.size() < 5) {
@@ -854,11 +871,24 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     return false;
   }
   const gtsam::Values values = isam_.calculateEstimate();
+  // Extract the optimized poses sequentially (gtsam map lookups; throws
+  // loudly on a missing key, and a throw must not originate inside an OpenMP
+  // region), then re-transform every keyframe's cloud in PARALLEL — on a
+  // loop-closure correction every keyframe moves, and this transform sweep
+  // over the whole map history was the sequential half of the CPU spike
+  // (the other half, ISAM2 relinearization, is TBB-parallel inside GTSAM).
+  if (values.size() > keyframes.size())
+    throw std::out_of_range(
+      "solver returned more states than keyframes");  // was .at()'s job
+  std::vector<gtsam::Pose3> new_poses(values.size());
+  for (std::size_t x = 0; x < values.size(); ++x)
+    new_poses[x] = values.at<gtsam::Pose3>(X(static_cast<int>(x)));
+#pragma omp parallel for schedule(dynamic)
+  for (std::size_t x = 0; x < new_poses.size(); ++x)
+    keyframes[x]->update(new_poses[x]);
+  // the newest optimized pose, for the marginal refresh below
   gtsam::Pose3 pose;
-  for (std::size_t x = 0; x < values.size(); ++x) {
-    pose = values.at<gtsam::Pose3>(X(static_cast<int>(x)));
-    keyframes.at(x)->update(pose);  // .at() fails loudly if the counts diverge
-  }
+  if (!new_poses.empty()) pose = new_poses.back();
 
   // rtabmap-style optimize-then-verify (RGBD/OptimizeMaxError analog, using
   // the reference rtabmap doesn't have — an absolute compass): when this

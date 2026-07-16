@@ -1,12 +1,20 @@
 #include "sonar_slam_cpp/cloud_ops.hpp"
+#include "sonar_slam_cpp/gpu.hpp"
 
 #include <pointmatcher/PointMatcher.h>
 
 #include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/point_types.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <mutex>
 
 namespace sonar_slam {
 
@@ -115,6 +123,44 @@ std::pair<Eigen::MatrixXi, Matrix> match(const Matrix& mat_ref,
                                          const Matrix& mat_in, int knn,
                                          float max_dist)
 {
+#ifdef SONAR_SLAM_WITH_CUDA
+  // GPU brute-force twin for the 1-NN case (every caller: the overlap
+  // estimates and the Censi correspondences). Exact — scans all reference
+  // points, so it can only differ from the KDTree by ULP-level distance
+  // rounding on a point sitting exactly at max_dist. Below the size gate the
+  // KDTree wins on transfer/launch overhead; on any device failure the
+  // wrapper returns false and the CPU path below runs.
+  if (knn == 1 && mat_ref.cols() == 2 && mat_in.cols() == 2 &&
+      gpu::available() &&
+      static_cast<std::size_t>(mat_ref.rows()) *
+          static_cast<std::size_t>(mat_in.rows()) >=
+        static_cast<std::size_t>(1) << 16) {
+    // row-major x,y buffers (Matrix is row-per-point)
+    std::vector<float> ref(2 * mat_ref.rows()), query(2 * mat_in.rows());
+    for (int i = 0; i < mat_ref.rows(); ++i) {
+      ref[2 * i] = mat_ref(i, 0);
+      ref[2 * i + 1] = mat_ref(i, 1);
+    }
+    for (int i = 0; i < mat_in.rows(); ++i) {
+      query[2 * i] = mat_in(i, 0);
+      query[2 * i + 1] = mat_in(i, 1);
+    }
+    std::vector<int> ids(mat_in.rows());
+    std::vector<float> dists2(mat_in.rows());
+    if (gpu::nn1_cuda(ref.data(), static_cast<int>(mat_ref.rows()),
+                      query.data(), static_cast<int>(mat_in.rows()), max_dist,
+                      ids.data(), dists2.data())) {
+      Eigen::MatrixXi ids_out(1, mat_in.rows());
+      Matrix dists_out(1, mat_in.rows());
+      for (int i = 0; i < mat_in.rows(); ++i) {
+        ids_out(0, i) = ids[i];
+        dists_out(0, i) = dists2[i];
+      }
+      return std::make_pair(ids_out, dists_out);
+    }
+  }
+#endif
+
   PointMatcherSupport::Parametrizable::Parameters params;
   params["knn"] = std::to_string(knn);
   params["maxDist"] = std::to_string(max_dist);
@@ -133,6 +179,23 @@ std::pair<Eigen::MatrixXi, Matrix> match(const Matrix& mat_ref,
 struct ICP::Impl
 {
   PM::ICP icp;
+  // config source for the per-thread engine pool (compute_batch); empty ->
+  // libpointmatcher defaults, mirroring load_from_yaml's fallback
+  std::string yaml_filename;
+  // lazily built per-OpenMP-thread engines. PM::ICP is not safe for
+  // concurrent compute on one object, so each worker gets its own instance
+  // configured identically; the pool persists across calls.
+  std::vector<std::unique_ptr<PM::ICP>> pool;
+  std::mutex pool_mutex;
+
+  void configure(PM::ICP& engine) const
+  {
+    std::ifstream ifs(yaml_filename);
+    if (yaml_filename.empty() || !ifs.is_open())
+      engine.setDefault();
+    else
+      engine.loadFromYaml(ifs);
+  }
 };
 
 ICP::ICP() : impl_(new Impl) { impl_->icp.setDefault(); }
@@ -147,9 +210,14 @@ void ICP::load_from_yaml(const std::string& filename)
     std::cout << "Failed to load " << filename << ". Use default configuration."
               << std::endl;
     impl_->icp.setDefault();
+    impl_->yaml_filename.clear();
   } else {
     impl_->icp.loadFromYaml(ifs);
+    impl_->yaml_filename = filename;
   }
+  // the pool engines mirror the main config — rebuild them on the next batch
+  std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+  impl_->pool.clear();
 }
 
 std::pair<std::string, Eigen::Matrix3f> ICP::compute(const Matrix& source,
@@ -165,6 +233,74 @@ std::pair<std::string, Eigen::Matrix3f> ICP::compute(const Matrix& source,
     return std::make_pair(std::string(e.what()), Eigen::Matrix3f(guess));
   }
   return std::make_pair(std::string("success"), Eigen::Matrix3f(T));
+}
+
+std::vector<ICP::BatchResult> ICP::compute_batch(
+  const Matrix& source, const Matrix& target,
+  const std::vector<Eigen::Matrix3f>& guesses, int max_ms)
+{
+  std::vector<BatchResult> results(guesses.size());
+
+#ifdef _OPENMP
+  {
+    // one engine per potential worker, configured like the main engine.
+    // Registrations are deterministic given the config (the chain has no
+    // sampling filters), so per-guess results are identical to running them
+    // through the shared engine sequentially.
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    const int n_threads = omp_get_max_threads();
+    while (static_cast<int>(impl_->pool.size()) < n_threads) {
+      auto engine = std::make_unique<PM::ICP>();
+      impl_->configure(*engine);
+      impl_->pool.push_back(std::move(engine));
+    }
+  }
+
+  // the clouds are read-only across workers; each engine copies internally
+  DPPtr pc_source = from_eigen(source);
+  DPPtr pc_target = from_eigen(target);
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto expired = [&]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - start)
+             .count() >= max_ms;
+  };
+
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < static_cast<int>(guesses.size()); ++i) {
+    // time cap: guesses whose slot opens after the cap are skipped, the
+    // parallel analog of the sequential loop's post-sample break
+    if (i > 0 && expired()) continue;
+    PM::ICP& engine = *impl_->pool[omp_get_thread_num()];
+    PM::TransformationParameters T = guesses[i];
+    try {
+      T = engine(*pc_source, *pc_target, T);
+    } catch (...) {
+      // convergence errors mark the sample failed like the sequential loop;
+      // anything else must ALSO be swallowed here — an exception escaping an
+      // OpenMP region is std::terminate, not a throw to the caller
+      continue;
+    }
+    results[i].success = true;
+    results[i].T = T;
+  }
+#else
+  // no OpenMP: identical to the historical sequential sampling loop
+  const auto start = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < guesses.size(); ++i) {
+    auto [message, T] = compute(source, target, guesses[i]);
+    if (message == "success") {
+      results[i].success = true;
+      results[i].T = T;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+    if (elapsed.count() >= max_ms) break;
+  }
+#endif
+
+  return results;
 }
 
 }  // namespace sonar_slam

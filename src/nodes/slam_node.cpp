@@ -11,10 +11,14 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "sonar_slam_cpp/approx_sync.hpp"
 #include "sonar_slam_cpp/gpu.hpp"
@@ -89,6 +93,10 @@ public:
                                " must be 'sampled' or 'censi'");
     };
     slam_.censi_sensor_noise = get_double("censi_sensor_noise", 0.1);
+    // parallelize the cov_samples registrations of the "sampled" method
+    // across an ICP engine pool (see slam_core.hpp); false = the historical
+    // one-core sequential loop
+    slam_.parallel_cov_samples = get_bool("parallel_cov_samples", true);
 
     slam_.ssm_params.enable = get_bool("ssm/enable");
     slam_.ssm_params.min_points = get_int("ssm/min_points");
@@ -186,7 +194,9 @@ public:
     if (cloud_republish_period_ > 0.0) {
       cloud_republish_timer_ = create_wall_timer(
         std::chrono::duration<double>(cloud_republish_period_), [this]() {
-          std::lock_guard<std::mutex> lock(mutex_);
+          // the cached cloud is produced by the viz worker thread — its own
+          // mutex, so this timer never contends with the SLAM callback
+          std::lock_guard<std::mutex> lock(viz_mutex_);
           if (last_cloud_msg_.data.empty()) return;
           if ((now() - last_cloud_pub_).seconds() < cloud_republish_period_)
             return;
@@ -204,6 +214,13 @@ public:
     // SONAR_SLAM_FORCE_CPU=1); libpointmatcher ICP itself is CPU
     RCLCPP_INFO(get_logger(), "SLAM node is initialized (GPU: %s)",
                 gpu::available() ? "on" : "off");
+  }
+
+  ~SlamNode() override
+  {
+    // the viz worker publishes through this node's publishers — join it
+    // before they are destroyed
+    if (viz_thread_.joinable()) viz_thread_.join();
   }
 
 private:
@@ -306,15 +323,47 @@ private:
       // The constraint markers and the aggregated map cloud re-walk the
       // ENTIRE keyframe history (O(n) per keyframe, growing for the whole
       // mission) — they are pure viz, so rebuild them at most every
-      // viz_min_period seconds instead of on every keyframe.
+      // viz_min_period seconds, and on a WORKER THREAD: on a loop-closure
+      // correction the O(map) rebuild + octree downsample otherwise stalls
+      // this callback for the whole sweep.
       const auto now = this->now();
       if (viz_min_period_ <= 0.0 ||
           (now - last_viz_publish_).seconds() >= viz_min_period_) {
-        last_viz_publish_ = now;
-        publish_constraint();
-        publish_point_cloud();
+        if (schedule_viz_rebuild()) last_viz_publish_ = now;
       }
     }
+  }
+
+  // Snapshot of the per-keyframe state the viz products need — tiny (poses +
+  // loop-closure links); kf->points is immutable after keyframe creation, so
+  // the worker reads the clouds through the shared_ptr without the lock.
+  struct VizKeyframe
+  {
+    KeyframePtr kf;
+    gtsam::Pose2 pose;
+    double p3x, p3y, p3z, dr_z;
+    std::vector<std::pair<int, gtsam::Pose2>> constraints;
+  };
+
+  // called under mutex_; returns false when a previous rebuild is still
+  // running (viz is periodic — the next window retries)
+  bool schedule_viz_rebuild()
+  {
+    if (viz_busy_.exchange(true)) return false;
+    if (viz_thread_.joinable()) viz_thread_.join();  // finished; reclaim
+
+    std::vector<VizKeyframe> snap;
+    snap.reserve(slam_.keyframes.size());
+    for (const auto& kf : slam_.keyframes)
+      snap.push_back({kf, kf->pose, kf->pose3.x(), kf->pose3.y(),
+                      kf->pose3.z(), kf->dr_pose3.z(), kf->constraints});
+    const auto stamp = slam_.current_keyframe()->time;
+
+    viz_thread_ = std::thread([this, snap = std::move(snap), stamp]() {
+      build_and_publish_viz(snap, stamp);
+      viz_busy_ = false;
+    });
+    return true;
   }
 
   // conjugation by the roll-pi transform: flip a z-down graph-frame pose
@@ -443,33 +492,80 @@ private:
     }
   }
 
-  void publish_constraint()
+  // Worker-thread body: builds and publishes the constraint markers and the
+  // aggregated map cloud from the snapshot — no slam_ / mutex_ access.
+  // rclcpp publishers are thread-safe; the cached-cloud fields for the
+  // republish timer live under viz_mutex_.
+  void build_and_publish_viz(const std::vector<VizKeyframe>& snap,
+                             const builtin_interfaces::msg::Time& stamp)
   {
-    // viz output follows the external (ENU when enu_world) convention
+    // ---- constraint markers (viz follows the ENU convention when set) ----
     const double sy = enu_world_ ? -1.0 : 1.0;
     auto P = [&](double x, double y, double z) {
       return Eigen::Vector3d(x, sy * y, sy * z);
     };
     std::vector<ConstraintLink> links;
-    for (int x = 1; x < slam_.current_key(); ++x) {
-      const auto& prev = slam_.keyframes[x - 1];
-      const auto& curr = slam_.keyframes[x];
-      const Eigen::Vector3d p1 = P(prev->pose3.x(), prev->pose3.y(), prev->dr_pose3.z());
-      const Eigen::Vector3d p2 = P(curr->pose3.x(), curr->pose3.y(), curr->dr_pose3.z());
+    for (std::size_t x = 1; x < snap.size(); ++x) {
+      const auto& prev = snap[x - 1];
+      const auto& curr = snap[x];
+      const Eigen::Vector3d p1 = P(prev.p3x, prev.p3y, prev.dr_z);
+      const Eigen::Vector3d p2 = P(curr.p3x, curr.p3y, curr.dr_z);
       links.push_back({{p1, p2}, "green"});
 
-      for (const auto& [k, _] : curr->constraints) {
-        const auto& target = slam_.keyframes[k];
-        const Eigen::Vector3d p0 =
-          P(target->pose3.x(), target->pose3.y(), target->dr_pose3.z());
+      for (const auto& [k, _] : curr.constraints) {
+        if (k < 0 || k >= static_cast<int>(snap.size())) continue;
+        const auto& target = snap[k];
+        const Eigen::Vector3d p0 = P(target.p3x, target.p3y, target.dr_z);
         links.push_back({{p0, p2}, "red"});
       }
     }
-    if (links.empty()) return;
+    if (!links.empty()) {
+      visualization_msgs::msg::Marker msg = ros_constraints(links);
+      msg.header.stamp = stamp;
+      constraint_pub_->publish(msg);
+    }
 
-    visualization_msgs::msg::Marker msg = ros_constraints(links);
-    msg.header.stamp = slam_.current_keyframe()->time;
-    constraint_pub_->publish(msg);
+    // ---- aggregated map cloud ----
+    long total = 0;
+    for (const auto& s : snap) total += s.kf->points.rows();
+    Matrix all_points(total, 3), all_keys(total, 1);
+    long at = 0;
+    for (std::size_t key = 0; key < snap.size(); ++key) {
+      const auto& s = snap[key];
+      const long n = s.kf->points.rows();
+      // x/y through the optimized SE2 pose; z in ENU world = the point's
+      // up-positive elevation (col2) minus vehicle depth (pose3.z carries the
+      // relay's down-positive z across updates). The graph corrects x/y/yaw;
+      // z and attitude ride from dead-reckoning.
+      all_points.middleRows(at, n).leftCols(2) =
+        Keyframe::transform_points(s.kf->points, s.pose);
+      all_points.middleRows(at, n).col(2) =
+        s.kf->points.col(2).array() - static_cast<float>(s.p3z);
+      all_keys.middleRows(at, n).setConstant(static_cast<float>(key));
+      at += n;
+    }
+
+    // 3D octree downsample (OctreeGridDataPointsFilter is dimension-agnostic)
+    auto [pts, keys] =
+      downsample(all_points, all_keys, static_cast<float>(slam_.point_resolution));
+    if (pts.rows() == 0) return;
+
+    // [x, y, z, key] — col2 was built ENU (up-positive); the non-ENU (slam
+    // z-down) output flips it along with y, completing the roll-pi transform
+    Matrix xyzi(pts.rows(), 4);
+    xyzi.col(0) = pts.col(0);
+    xyzi.col(1) = enu_world_ ? Matrix(-pts.col(1)) : Matrix(pts.col(1));
+    xyzi.col(2) = enu_world_ ? Matrix(pts.col(2)) : Matrix(-pts.col(2));
+    xyzi.col(3) = keys.col(0);
+
+    sensor_msgs::msg::PointCloud2 msg = make_cloud({"x", "y", "z", "i"}, xyzi);
+    msg.header.stamp = stamp;
+    msg.header.frame_id = "map";
+    cloud_pub_->publish(msg);
+    // cache for the periodic republish timer (see constructor)
+    std::lock_guard<std::mutex> lock(viz_mutex_);
+    last_cloud_msg_ = std::move(msg);
+    last_cloud_pub_ = now();
   }
 
   void publish_trajectory()
@@ -501,51 +597,13 @@ private:
     traj_pub_->publish(msg);
   }
 
-  void publish_point_cloud()
-  {
-    long total = 0;
-    for (const auto& kf : slam_.keyframes) total += kf->points.rows();
-    Matrix all_points(total, 3), all_keys(total, 1);
-    long at = 0;
-    for (int key = 0; key < slam_.current_key(); ++key) {
-      const auto& kf = slam_.keyframes[key];
-      const long n = kf->points.rows();
-      // x/y through the optimized SE2 pose; z in ENU world = the point's
-      // up-positive elevation (col2) minus vehicle depth (pose3.z carries the
-      // relay's down-positive z across updates). The graph corrects x/y/yaw;
-      // z and attitude ride from dead-reckoning.
-      all_points.middleRows(at, n).leftCols(2) =
-        Keyframe::transform_points(kf->points, kf->pose);
-      all_points.middleRows(at, n).col(2) =
-        kf->points.col(2).array() - static_cast<float>(kf->pose3.z());
-      all_keys.middleRows(at, n).setConstant(static_cast<float>(key));
-      at += n;
-    }
-
-    // 3D octree downsample (OctreeGridDataPointsFilter is dimension-agnostic)
-    auto [pts, keys] =
-      downsample(all_points, all_keys, static_cast<float>(slam_.point_resolution));
-    if (pts.rows() == 0) return;
-
-    // [x, y, z, key] — col2 was built ENU (up-positive); the non-ENU (slam
-    // z-down) output flips it along with y, completing the roll-pi transform
-    Matrix xyzi(pts.rows(), 4);
-    xyzi.col(0) = pts.col(0);
-    xyzi.col(1) = enu_world_ ? Matrix(-pts.col(1)) : Matrix(pts.col(1));
-    xyzi.col(2) = enu_world_ ? Matrix(pts.col(2)) : Matrix(-pts.col(2));
-    xyzi.col(3) = keys.col(0);
-
-    sensor_msgs::msg::PointCloud2 msg = make_cloud({"x", "y", "z", "i"}, xyzi);
-    msg.header.stamp = slam_.current_keyframe()->time;
-    msg.header.frame_id = "map";
-    cloud_pub_->publish(msg);
-    // cache for the periodic republish timer (see constructor)
-    last_cloud_msg_ = std::move(msg);
-    last_cloud_pub_ = now();
-  }
-
   Slam slam_;
   std::mutex mutex_;
+  // background viz rebuild (see schedule_viz_rebuild); viz_mutex_ guards the
+  // cached republish cloud shared between the worker and the timer
+  std::thread viz_thread_;
+  std::atomic<bool> viz_busy_{false};
+  std::mutex viz_mutex_;
   bool enable_slam_ = true;
   bool enu_world_ = false;
   bool publish_tf_ = true;

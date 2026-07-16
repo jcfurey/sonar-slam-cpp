@@ -37,6 +37,12 @@ public:
   double point_noise = 0.5;       // noise radius in overlap estimation
   // per-point sonar coordinate noise std (m) for the Censi covariance path
   double censi_sensor_noise = 0.1;
+  // run the sampled-covariance registrations (cov_samples per scan match)
+  // across an OpenMP per-thread ICP engine pool instead of one core
+  // sequentially. Per-guess results are unchanged (deterministic chain); the
+  // only divergence is that the 2 s cap rarely fires, so MCD sees the full
+  // sample set. See docs/DIVERGENCES.md.
+  bool parallel_cov_samples = true;
 
   SMParams ssm_params;
   SMParams nssm_params;

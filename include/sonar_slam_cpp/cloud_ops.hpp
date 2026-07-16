@@ -46,6 +46,23 @@ public:
                                                   const Matrix& target,
                                                   const Eigen::Matrix3f& guess);
 
+  // One registration per guess for the sampled-covariance path, run in
+  // parallel across a persistent per-thread engine pool (the configured chain
+  // is deterministic, so each guess's result is identical to compute()'s).
+  // Guesses whose slot opens after max_ms elapsed are skipped — the parallel
+  // analog of the sequential loop's time cap. Results keep guess order;
+  // entries that failed to converge or were skipped have success == false.
+  // Without OpenMP this degrades to the sequential loop.
+  struct BatchResult
+  {
+    bool success = false;
+    Eigen::Matrix3f T = Eigen::Matrix3f::Identity();
+  };
+  std::vector<BatchResult> compute_batch(const Matrix& source,
+                                         const Matrix& target,
+                                         const std::vector<Eigen::Matrix3f>& guesses,
+                                         int max_ms);
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

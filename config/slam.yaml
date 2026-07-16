@@ -35,6 +35,10 @@
     # per-point sonar coordinate noise std (m) for the Censi ICP-covariance path
     # (only used when a scan matcher sets cov_method: censi)
     censi_sensor_noise: 0.1
+    # run the "sampled" method's cov_samples registrations across an OpenMP
+    # per-thread ICP engine pool instead of one core sequentially (per-guess
+    # results unchanged; the 2 s cap rarely fires — see docs/DIVERGENCES.md)
+    parallel_cov_samples: true
 
     # max stamp difference (s) when pairing feature clouds with odometry
     feature_odom_sync_max_delay: 0.5

@@ -52,6 +52,13 @@ bool grid_cost_cuda(const float* points, int n_points, const float* transforms,
                     int n_samples, const std::uint8_t* grid, int grid_rows,
                     int grid_cols, float xmin, float ymin, float resolution,
                     float* costs_out);
+
+// Exact brute-force 1-NN of query_xy against ref_xy (both row-major x,y
+// pairs), libnabo contract: ids_out[q] = -1 and dists2_out[q] = inf when the
+// nearest reference point is farther than max_dist (dists are SQUARED, like
+// KDTreeMatcher's). Backs cloud_ops match() for the overlap estimates.
+bool nn1_cuda(const float* ref_xy, int n_ref, const float* query_xy,
+              int n_query, float max_dist, int* ids_out, float* dists2_out);
 #endif
 
 }  // namespace gpu

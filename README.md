@@ -43,6 +43,18 @@ to CPU-only silently otherwise):
   semantics).
 - **Batched global scan-match cost** — all Sobol candidate poses of the
   SSM/NSSM initialization evaluated in one launch.
+- **Overlap/correspondence 1-NN** (`cloud_ops match()`) — exact brute force,
+  same id/-1 + dist²/inf contract as the KDTree; serves the SSM/NSSM overlap
+  gates, the NSSM target-key refinement, and the Censi correspondences.
+  Size-gated (small queries stay on the CPU KDTree).
+
+Not a kernel but related: `parallel_cov_samples` (default true) runs the
+"sampled" covariance method's 30 registrations per scan match across a
+per-thread pool of identically-configured libpointmatcher engines instead of
+one core sequentially — per-guess results unchanged (deterministic chain);
+see `docs/DIVERGENCES.md` #8. The registrations themselves stay on the CPU by
+decision (GPU ICP would rewrite deployed registration math — repo-root
+`GPU_ACCELERATION.md` §4).
 
 Runtime dispatch: `gpu::available()` = built with CUDA ∧ device present ∧
 `SONAR_SLAM_FORCE_CPU` unset. CPU twins are OpenMP-parallel and are the same
@@ -86,12 +98,19 @@ covariance instead of `cov_samples` registrations + FAST-MCD. The default
 
 ## Build
 
-Inside the `nautilus-robot-gpu-1` container (ROS 2 Jazzy, CUDA 12.8):
+Inside the `nautilus-robot-gpu-1` container (ROS 2 Jazzy, CUDA 12.8 toolkit —
+nvidia-smi's "13.x" is the driver UMD version, not nvcc — RTX 3090 = `sm_86`):
 
 ```bash
 source /opt/ros/jazzy/setup.bash && source install/setup.bash
 colcon build --packages-select sonar_slam_cpp --merge-install
 ```
+
+The CUDA architecture defaults to `86-real;86-virtual`; a stale cached
+`CMAKE_CUDA_ARCHITECTURES` below sm_75 (the observed case: 52, which nvcc 12.8
+still accepts and ships as PTX the sm_86 device must JIT) self-heals to 86 on
+reconfigure — see the repo-root `GPU_ACCELERATION.md` for the full audit and
+the sonar_proc GPU/OpenMP work.
 
 Requires standard ROS 2 messages (`marine_acoustic_msgs`, `sensor_msgs`,
 `geometry_msgs`, `nav_msgs`, `std_msgs`) plus system
