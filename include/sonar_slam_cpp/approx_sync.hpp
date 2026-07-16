@@ -57,6 +57,21 @@ void trim(std::deque<Stamped<T>>& q, std::size_t max_size)
   while (q.size() > max_size) q.pop_front();
 }
 
+// Secondary-queue trim: evict by TIME with the configured count as a floor.
+// A count-only trim makes the retained window rate-dependent — above
+// queue_size/(2*slop) Hz the true nearest neighbour is evicted before the
+// primary can emit, and every pair silently rides the window edge. Entries
+// older than `keep_after` (oldest pending primary − slop) can never match a
+// pending or future in-order primary; `max_size` only bounds memory when the
+// primary stream stalls.
+template <typename T>
+void trim_secondary(std::deque<Stamped<T>>& q, double keep_after,
+                    std::size_t min_keep, std::size_t max_size)
+{
+  while (q.size() > max_size) q.pop_front();
+  while (q.size() > min_keep && q.front().t < keep_after) q.pop_front();
+}
+
 }  // namespace detail
 
 // ------------------------------------------------------------------- 2-way
@@ -96,11 +111,14 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     qb_.push_back({t, b});
-    detail::trim(qb_, queue_size_);
+    const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
+    detail::trim_secondary(qb_, keep_after, queue_size_, kMaxSecondary);
     try_emit();
   }
 
 private:
+  static constexpr std::size_t kMaxSecondary = 4096;  // stall memory bound
+
   void try_emit()
   {
     while (!qa_.empty()) {
@@ -167,7 +185,8 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     qb_.push_back({t, b});
-    detail::trim(qb_, queue_size_);
+    const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
+    detail::trim_secondary(qb_, keep_after, queue_size_, kMaxSecondary);
     try_emit();
   }
 
@@ -175,11 +194,14 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     qc_.push_back({t, c});
-    detail::trim(qc_, queue_size_);
+    const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
+    detail::trim_secondary(qc_, keep_after, queue_size_, kMaxSecondary);
     try_emit();
   }
 
 private:
+  static constexpr std::size_t kMaxSecondary = 4096;  // stall memory bound
+
   void try_emit()
   {
     while (!qa_.empty()) {

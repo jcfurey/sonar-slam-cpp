@@ -11,10 +11,12 @@
 #endif
 
 #include <chrono>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 
 namespace sonar_slam {
 
@@ -179,9 +181,14 @@ std::pair<Eigen::MatrixXi, Matrix> match(const Matrix& mat_ref,
 struct ICP::Impl
 {
   PM::ICP icp;
-  // config source for the per-thread engine pool (compute_batch); empty ->
-  // libpointmatcher defaults, mirroring load_from_yaml's fallback
+  // Config source for the per-thread engine pool (compute_batch): the YAML
+  // TEXT cached at load_from_yaml time, never re-read from disk. A lazy disk
+  // re-read could fail after startup and silently hand pool engines
+  // setDefault() — whose chain includes a RandomSamplingDataPointsFilter,
+  // i.e. a nondeterministic config diverging from the main engine. Empty
+  // text <=> the main engine is also on setDefault(), so both stay in sync.
   std::string yaml_filename;
+  std::string yaml_text;
   // lazily built per-OpenMP-thread engines. PM::ICP is not safe for
   // concurrent compute on one object, so each worker gets its own instance
   // configured identically; the pool persists across calls.
@@ -190,11 +197,12 @@ struct ICP::Impl
 
   void configure(PM::ICP& engine) const
   {
-    std::ifstream ifs(yaml_filename);
-    if (yaml_filename.empty() || !ifs.is_open())
+    if (yaml_text.empty()) {
       engine.setDefault();
-    else
-      engine.loadFromYaml(ifs);
+    } else {
+      std::istringstream iss(yaml_text);
+      engine.loadFromYaml(iss);
+    }
   }
 };
 
@@ -211,8 +219,15 @@ void ICP::load_from_yaml(const std::string& filename)
               << std::endl;
     impl_->icp.setDefault();
     impl_->yaml_filename.clear();
+    impl_->yaml_text.clear();
   } else {
-    impl_->icp.loadFromYaml(ifs);
+    // cache the text once; the main engine and every pool engine configure
+    // from this same string (see Impl::configure)
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    impl_->yaml_text = oss.str();
+    std::istringstream iss(impl_->yaml_text);
+    impl_->icp.loadFromYaml(iss);
     impl_->yaml_filename = filename;
   }
   // the pool engines mirror the main config — rebuild them on the next batch
@@ -267,23 +282,52 @@ std::vector<ICP::BatchResult> ICP::compute_batch(
              .count() >= max_ms;
   };
 
+  // cap-skips are recorded per index so the truncation below can reproduce
+  // the sequential loop's PREFIX semantics (schedule(dynamic) otherwise keeps
+  // an arbitrary subset — whichever slots opened before expiry)
+  std::vector<char> cap_skipped(guesses.size(), 0);
+  std::exception_ptr fatal;
+
 #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < static_cast<int>(guesses.size()); ++i) {
     // time cap: guesses whose slot opens after the cap are skipped, the
     // parallel analog of the sequential loop's post-sample break
-    if (i > 0 && expired()) continue;
+    if (i > 0 && expired()) {
+      cap_skipped[i] = 1;
+      continue;
+    }
     PM::ICP& engine = *impl_->pool[omp_get_thread_num()];
     PM::TransformationParameters T = guesses[i];
     try {
       T = engine(*pc_source, *pc_target, T);
+    } catch (const PM::ConvergenceError&) {
+      // a failed sample, exactly like the sequential loop
+      continue;
     } catch (...) {
-      // convergence errors mark the sample failed like the sequential loop;
-      // anything else must ALSO be swallowed here — an exception escaping an
-      // OpenMP region is std::terminate, not a throw to the caller
+      // Sequential semantics: any non-convergence exception is frame-fatal
+      // (it propagates out of compute_icp_with_cov to the frame-level catch).
+      // It cannot escape an OpenMP region (std::terminate), so capture the
+      // first one and rethrow after the loop instead of silently degrading
+      // to "Too few samples".
+#pragma omp critical(sonar_slam_icp_batch_fatal)
+      if (!fatal) fatal = std::current_exception();
       continue;
     }
     results[i].success = true;
     results[i].T = T;
+  }
+  if (fatal) std::rethrow_exception(fatal);
+
+  // Prefix truncation: drop everything at/after the FIRST cap-skipped guess.
+  // The sequential loop's break keeps the best-cost prefix of the (cost-
+  // sorted) guesses; without this, a fired cap would keep an arbitrary,
+  // schedule-dependent subset and the MCD location/covariance would ride on
+  // scheduling noise.
+  for (std::size_t e = 0; e < cap_skipped.size(); ++e) {
+    if (cap_skipped[e]) {
+      for (std::size_t j = e; j < results.size(); ++j) results[j].success = false;
+      break;
+    }
   }
 #else
   // no OpenMP: identical to the historical sequential sampling loop

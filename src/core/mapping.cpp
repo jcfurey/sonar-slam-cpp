@@ -92,7 +92,8 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
 
   // (Re)build the sonar-fan pixel geometry only when the range/aperture
   // changed (mapping.py:152-168 — keyframes otherwise reuse the previous fan).
-  if ((changed || !sonar_xy_ || sub_rows_ == 0) &&
+  if ((changed || !sonar_xy_ || sub_rows_ == 0 ||
+       ping.range_min != fan_range_min_) &&
       oculus_.range_resolution > 0.0 && num_ranges > 0 && num_bearings > 0) {
     r_skip_ = std::max(1, static_cast<int>(std::floor(resolution / oculus_.range_resolution)));
     const double bearing_arc_res = oculus_.angular_resolution * oculus_.max_range;
@@ -100,11 +101,16 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
 
     sub_rows_ = (num_ranges + r_skip_ - 1) / r_skip_;
     sub_cols_ = (num_bearings + c_skip_ - 1) / c_skip_;
+    // polar row ri sits at range_min + (1+ri)*res, matching the feature
+    // node's row<->range convention. An Oculus has range_min == 0 and this
+    // reduces to the original ranges[ri]; a payload with a real minimum range
+    // no longer has every tile compressed toward the sensor by range_min.
+    fan_range_min_ = ping.range_min;
 
     Matrix xy(sub_rows_ * sub_cols_, 2);
     int idx = 0;
     for (int ri = 0; ri < num_ranges; ri += r_skip_) {
-      const double R = oculus_.range_resolution * (1 + ri);  // ranges[ri]
+      const double R = fan_range_min_ + oculus_.range_resolution * (1 + ri);  // ranges[ri]
       for (int ci = 0; ci < num_bearings; ci += c_skip_) {
         const double B = oculus_.bearings[ci];
         xy(idx, 0) = static_cast<float>(std::cos(B) * R);
@@ -119,6 +125,19 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
     std::vector<double> by(num_bearings);
     for (int i = 0; i < num_bearings; ++i) by[i] = i;
     b2c_ = Interp1d(bx, by, Interp1d::LINEAR, 0.0);
+
+    // Mirrored beam lookup for the intensity mosaic: the feature cloud's
+    // lateral coordinate is the NEGATED native bearing (feature_extraction
+    // publishes x = -sin(B)*R), and the trajectory/occupancy products live in
+    // that chirality. The fan grid's placement uses native-signed bearings,
+    // so backscatter for fan column ci must be read from the beam at
+    // -bearings[ci] — otherwise the mosaic mirrors port<->starboard against
+    // the occupancy grid and the (bag-validated) trajectory.
+    mirror_col_.assign(num_bearings, 0);
+    for (int i = 0; i < num_bearings; ++i) {
+      const int m = static_cast<int>(std::lround(b2c_(-oculus_.bearings[i])));
+      mirror_col_[i] = std::min(std::max(m, 0), num_bearings - 1);
+    }
   }
   kf.sonar_xy = sonar_xy_;
   // no valid fan geometry yet (e.g. a malformed first ping): store an empty
@@ -126,7 +145,13 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
   const bool have_geom = sonar_xy_ && sub_rows_ > 0 && sub_cols_ > 0;
 
   // --------- occupancy logodds tile (mapping.py:170-228) ---------
-  if (have_geom && pub_occupancy1) {
+  if (have_geom && pub_occupancy1 &&
+      static_cast<int>(points.rows()) < free_tile_min_points) {
+    // too few returns to trust a free-space claim (a CFAR whiff would stamp
+    // the upstream all-free wedge over real structure): deposit a neutral
+    // tile — logodds 0 adds nothing and stays exactly reversible
+    kf.logodds.assign(static_cast<size_t>(sub_rows_) * sub_cols_, 0.0f);
+  } else if (have_geom && pub_occupancy1) {
     cv::Mat mask = cv::Mat::zeros(sub_rows_, sub_cols_, CV_32F);
 
     Matrix xy2(0, 2);
@@ -147,7 +172,8 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
         int col = static_cast<int>(std::lround(b2c_(bearing)));
         col = std::min(std::max(col, 0), num_bearings - 1);
         const double range = std::hypot(px, py);
-        int row = static_cast<int>(std::lround(range / oculus_.range_resolution - 1.0));
+        int row = static_cast<int>(std::lround(
+          (range - fan_range_min_) / oculus_.range_resolution - 1.0));
         row = std::min(std::max(row, 0), num_ranges - 1);
         mask.at<float>(row / r_skip_, col / c_skip_) = 1.0f;
       }
@@ -201,8 +227,12 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
     for (int ri = 0; ri < num_ranges; ri += r_skip_) {
       for (int ci = 0; ci < num_bearings; ci += c_skip_) {
         uint32_t v = 0;
-        if (ri < ping.image.rows && ci < ping.image.cols)
-          v = ping.image.at<uint8_t>(ri, ci);
+        // mirrored beam read (see mirror_col_): keeps the mosaic on the same
+        // side of the track as the occupancy/feature evidence
+        const int mc =
+          ci < static_cast<int>(mirror_col_.size()) ? mirror_col_[ci] : ci;
+        if (ri < ping.image.rows && mc < ping.image.cols)
+          v = ping.image.at<uint8_t>(ri, mc);
         if (idx < kf.intensity.size()) kf.intensity[idx] = v;
         ++idx;
       }
@@ -214,6 +244,20 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
 
   // pad any missed keyframe slots, then store at index `key` (mapping.py:252-255)
   while (static_cast<int>(keyframes_.size()) < key) keyframes_.push_back(Submap{});
+  keyframes_.push_back(std::move(kf));
+}
+
+void Mapping::add_skipped(int key, const gtsam::Pose2& pose)
+{
+  // keyframe with no recoverable ping/feature data: store an empty, invalid
+  // tile so the in-order builder advances past it instead of wedging every
+  // later keyframe behind it. Invisible to the grids (no sonar_xy -> fit_grid
+  // no-ops) and to update_pose (valid == false).
+  while (static_cast<int>(keyframes_.size()) < key) keyframes_.push_back(Submap{});
+  Submap kf;
+  kf.k = static_cast<int>(keyframes_.size());
+  kf.pose = pose;
+  kf.valid = false;
   keyframes_.push_back(std::move(kf));
 }
 

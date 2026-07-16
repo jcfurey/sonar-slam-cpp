@@ -9,10 +9,13 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
 
-#include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include "sonar_slam_cpp/cfar.hpp"
@@ -159,7 +162,19 @@ public:
       tilt_sub_ = create_subscription<std_msgs::msg::Float32>(
         tilt_topic, rclcpp::SensorDataQoS(),
         [this](const std_msgs::msg::Float32& m) {
-          head_tilt_rad_.store(m.data * static_cast<float>(M_PI) / 180.0f);
+          // Float32 carries no stamp: pair each sample with its arrival time
+          // so per-ping lookups interpolate at the ping stamp instead of
+          // trusting the latest value — the head sweeps ~0.5 rad/s, and a
+          // lagging latch both admits floor-bowl frames through the pitch
+          // gate with a stale "level" reading and mis-projects z on the
+          // frames it passes
+          const int64_t t = this->now().nanoseconds();
+          const float rad = m.data * static_cast<float>(M_PI) / 180.0f;
+          std::lock_guard<std::mutex> lock(tilt_mutex_);
+          if (!tilt_buf_.empty() && t < tilt_buf_.back().first)
+            tilt_buf_.clear();  // time jumped backwards (bag loop): restart
+          tilt_buf_.emplace_back(t, rad);
+          while (tilt_buf_.size() > kTiltBufMax) tilt_buf_.pop_front();
         });
     }
 
@@ -168,6 +183,24 @@ public:
   }
 
 private:
+  // head pitch (rad) at time t: linear interpolation between the buffered
+  // samples bracketing t, clamped to the nearest sample beyond the buffer
+  // ends. An empty buffer (topic absent) returns 0 — the level assumption.
+  float tilt_at(int64_t t_ns)
+  {
+    std::lock_guard<std::mutex> lock(tilt_mutex_);
+    if (tilt_buf_.empty()) return 0.0f;
+    if (t_ns <= tilt_buf_.front().first) return tilt_buf_.front().second;
+    if (t_ns >= tilt_buf_.back().first) return tilt_buf_.back().second;
+    const auto hi = std::lower_bound(
+      tilt_buf_.begin(), tilt_buf_.end(), t_ns,
+      [](const std::pair<int64_t, float>& s, int64_t t) { return s.first < t; });
+    const auto lo = std::prev(hi);
+    const double span = static_cast<double>(hi->first - lo->first);
+    const double a = span > 0.0 ? static_cast<double>(t_ns - lo->first) / span : 0.0;
+    return static_cast<float>((1.0 - a) * lo->second + a * hi->second);
+  }
+
   // build (or refresh) the polar -> Cartesian maps when geometry changes
   void generate_map_xy(const SonarPing& ping)
   {
@@ -233,7 +266,7 @@ private:
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
-                        const Matrix& points)
+                        const Matrix& points, float phi)
   {
     // Publish honest planar base_link coordinates: [x, y, 0]. The python
     // original packed the lateral coordinate into z ([x, 0, y] — a leftover
@@ -244,8 +277,8 @@ private:
     // Rotate the sonar-plane fan (col0 = forward along the bore, col1 =
     // lateral) by the head pitch about the lateral axis: forward tips into
     // -z as the head looks down (tilt < 0). Lateral is the pitch axis and is
-    // unchanged. head_tilt_rad_ == 0 reduces this to the old [x, y, 0].
-    const float phi = apply_head_tilt_ ? head_tilt_rad_.load() : 0.0f;
+    // unchanged. phi == 0 reduces this to the old [x, y, 0]; the caller
+    // interpolates phi at the ping stamp (tilt_at).
     const float cphi = std::cos(phi);
     const float sphi = std::sin(phi);
     Matrix xyz(points.rows(), 3);
@@ -328,20 +361,24 @@ private:
     // the SLAM node's time synchronizer keeps advancing
     ++frame_count_;
     const int ping_id = ping.ping_id != 0 ? ping.ping_id : frame_count_;
+    // head pitch AT THE PING STAMP (interpolated), used by both the frame
+    // gate and the published fan's z-fold
+    const float phi = apply_head_tilt_
+      ? tilt_at(rclcpp::Time(ping.stamp).nanoseconds()) : 0.0f;
     if (skip_ > 0 && ping_id % skip_ != 0) {
       Matrix nan(1, 2);
       nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan);
+      publish_features(ping.stamp, nan, phi);
       return;
     }
 
     // head-pitch frame gate (see constructor): swept frames are floor- or
     // surface-dominated — poison for the planar registration and the tiles
     if (max_head_pitch_ > 0.0 &&
-        std::fabs(head_tilt_rad_.load()) > static_cast<float>(max_head_pitch_)) {
+        std::fabs(phi) > static_cast<float>(max_head_pitch_)) {
       Matrix nan(1, 2);
       nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan);
+      publish_features(ping.stamp, nan, phi);
       return;
     }
 
@@ -421,7 +458,7 @@ private:
         points = remove_outlier(points, outlier_filter_radius_,
                                 outlier_filter_min_points_);
 
-      publish_features(ping.stamp, points);
+      publish_features(ping.stamp, points, phi);
     } catch (const cv::Exception& e) {
       RCLCPP_WARN(get_logger(), "Dropping sonar ping: OpenCV error: %s", e.what());
     } catch (const std::exception& e) {
@@ -455,9 +492,12 @@ private:
   double tvg_spread_db_ = 0.0;
   double tvg_absorption_db_per_m_ = 0.0;
 
-  // sonar head pitch (rad), latest value from /base/sensor_tilt_angle; 0 = level
+  // sonar head pitch samples (arrival ns, rad) from /base/sensor_tilt_angle,
+  // interpolated at each ping's stamp by tilt_at(); empty = level (0)
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr tilt_sub_;
-  std::atomic<float> head_tilt_rad_{0.0f};
+  std::mutex tilt_mutex_;
+  std::deque<std::pair<int64_t, float>> tilt_buf_;
+  static constexpr std::size_t kTiltBufMax = 1024;
   bool apply_head_tilt_ = true;
   // skip feature frames when |head pitch| exceeds this (rad); 0 = no gate
   double max_head_pitch_ = 0.0;

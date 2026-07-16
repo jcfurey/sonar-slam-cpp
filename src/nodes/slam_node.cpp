@@ -141,8 +141,22 @@ public:
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");
     if (icp_config.empty() || !std::filesystem::is_regular_file(icp_config)) {
-      icp_config = ament_index_cpp::get_package_share_directory("sonar_slam_cpp") +
-                   "/config/icp.yaml";
+      const std::string fallback =
+        ament_index_cpp::get_package_share_directory("sonar_slam_cpp") +
+        "/config/icp.yaml";
+      if (!icp_config.empty()) {
+        // an EXPLICIT path that doesn't resolve (e.g. a harness loading the
+        // deployed yaml without launch substitution) must be loud: the
+        // package default carries open-water matcher distances and registers
+        // materially differently from the deployed config
+        RCLCPP_ERROR(get_logger(),
+                     "icp_config '%s' is not a readable file — falling back "
+                     "to package default '%s' (different matcher distances; "
+                     "registration behavior will not match the deployed "
+                     "config)",
+                     icp_config.c_str(), fallback.c_str());
+      }
+      icp_config = fallback;
     }
     slam_.icp.load_from_yaml(icp_config);
 
@@ -164,6 +178,15 @@ public:
       20, feature_odom_sync_max_delay_,
       [this](const sensor_msgs::msg::PointCloud2& feature,
              const nav_msgs::msg::Odometry& odom) { slam_callback(feature, odom); });
+    // an odom outage silently drops feature frames from the sync queue —
+    // surface it instead of losing keyframes with no log line
+    sync_->set_overflow_callback([this](std::size_t dropped) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "feature<->odom sync dropped %zu unmatched feature frame(s) — "
+        "odometry stalled or lagging beyond feature_odom_sync_max_delay",
+        dropped);
+    });
 
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       SONAR_FEATURE_TOPIC, 20, [this](const sensor_msgs::msg::PointCloud2& msg) {

@@ -94,6 +94,9 @@ public:
 
     map_.outlier_filter_radius = get_double("outlier_filter_radius", 5.0);
     map_.outlier_filter_min_points = get_int("outlier_filter_min_points", 20);
+    // below this many feature points a keyframe deposits a NEUTRAL occupancy
+    // tile instead of the all-free wedge (0 = upstream policy)
+    map_.free_tile_min_points = get_int("free_tile_min_points", 0);
 
     map_.min_translation = get_double("min_translation", 0.5);
     map_.min_rotation = get_double("min_rotation", 0.05);
@@ -191,6 +194,11 @@ private:
   }
 
   // Build every trajectory keyframe whose ping + feature are now available.
+  // A keyframe whose inputs are conclusively gone — the buffered stream has
+  // already advanced past its stamp with no match (a dropped best-effort
+  // message, or a restart against the latched trajectory carrying history we
+  // never received) — is skipped with an empty tile: the build is strictly
+  // in-order, so waiting for it would wedge every later keyframe forever.
   bool try_build()
   {
     bool built = false;
@@ -199,12 +207,29 @@ private:
       const int64_t s = traj_[k].stamp_ns;
       auto pit = find_near(ping_buf_, s);
       auto fit = find_near(feat_buf_, s);
-      if (pit == ping_buf_.end() || fit == feat_buf_.end()) break;  // await data
+      if (pit == ping_buf_.end() && !stream_passed(ping_buf_, s)) break;
+      if (fit == feat_buf_.end() && !stream_passed(feat_buf_, s)) break;
+      if (pit == ping_buf_.end() || fit == feat_buf_.end()) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "keyframe %d: %s stream passed its stamp with no match — "
+          "skipping (empty tile)",
+          k, pit == ping_buf_.end() ? "ping" : "feature");
+        map_.add_skipped(k, gtsam::Pose2(traj_[k].x, traj_[k].y, traj_[k].yaw));
+        continue;
+      }
       map_.add_keyframe(k, gtsam::Pose2(traj_[k].x, traj_[k].y, traj_[k].yaw),
                         pit->second, fit->second);
       built = true;
     }
     return built;
+  }
+
+  // has the (in-order) buffered stream conclusively moved past stamp `key`?
+  template <class M>
+  static bool stream_passed(const M& buf, int64_t key)
+  {
+    return !buf.empty() && buf.rbegin()->first > key + kSyncTolNs;
   }
 
   template <class M>

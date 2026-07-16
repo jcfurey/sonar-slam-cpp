@@ -257,10 +257,24 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   cov.topRows<2>() = R.transpose() * cov.topRows<2>();
   cov.leftCols<2>() = cov.leftCols<2>() * R;
 
-  // never report a covariance smaller than the fixed ICP model
-  const Eigen::Matrix3d default_cov =
-    icp_odom_sigmas.array().square().matrix().asDiagonal();
-  if (cov.determinant() < default_cov.determinant()) cov = default_cov;
+  // Never report a covariance smaller than the fixed ICP model — but floor
+  // PER AXIS, not by determinant. The historical whole-matrix swap on
+  // det(cov) < det(default) replaced exactly the elongated matrices (one
+  // collapsed axis crushes the determinant) with the confident isotropic
+  // default, blinding the NSSM degeneracy gate in the wall-sliding regime it
+  // was built for. Clamping the translation-block eigenvalues and the yaw
+  // variance up to the default's floors keeps the collapsed axis honest while
+  // preserving the elongation (sigma_max survives for the gates). Raising a
+  // diagonal block's eigenvalues adds a PSD term, so the matrix stays PSD.
+  const Eigen::Vector3d floor_var = icp_odom_sigmas.array().square().matrix();
+  {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
+    const double vmin = std::min(floor_var[0], floor_var[1]);
+    const Eigen::Vector2d ev = es.eigenvalues().cwiseMax(vmin);
+    cov.topLeftCorner<2, 2>() =
+      es.eigenvectors() * ev.asDiagonal() * es.eigenvectors().transpose();
+    cov(2, 2) = std::max(cov(2, 2), floor_var[2]);
+  }
 
   result.message = "success";
   result.odom = m;
@@ -494,8 +508,9 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
     const double delta_translation =
       std::hypot(delta.translation().x(), delta.translation().y());
     const double delta_rotation = std::abs(delta.theta());
-    if (delta_translation > ssm_params.max_translation ||
-        delta_rotation > ssm_params.max_rotation) {
+    // inverted comparisons so a NaN delta (degenerate transform) fails closed
+    if (!(delta_translation <= ssm_params.max_translation) ||
+        !(delta_rotation <= ssm_params.max_rotation)) {
       ret2.status = Status(Status::LARGE_TRANSFORMATION);
       ret2.status.description = "trans " + std::to_string(delta_translation) +
                                 " rot " + std::to_string(delta_rotation);
@@ -508,7 +523,9 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
                                     &ret2.estimated_transform);
     if (overlap < ssm_params.min_points)
       ret2.status = Status(Status::NOT_ENOUGH_OVERLAP);
-    ret2.status.description = "overlap " + std::to_string(overlap);
+    // append — don't clobber the success path's "N samples" diagnostic
+    if (!ret2.status.description.empty()) ret2.status.description += ", ";
+    ret2.status.description += "overlap " + std::to_string(overlap);
   }
 
   if (ret2.status) {
@@ -736,8 +753,9 @@ bool Slam::add_nonsequential_scan_matching()
     const double delta_translation =
       std::hypot(delta.translation().x(), delta.translation().y());
     const double delta_rotation = std::abs(delta.theta());
-    if (delta_translation > nssm_params.max_translation ||
-        delta_rotation > nssm_params.max_rotation) {
+    // inverted comparisons so a NaN delta (degenerate transform) fails closed
+    if (!(delta_translation <= nssm_params.max_translation) ||
+        !(delta_rotation <= nssm_params.max_rotation)) {
       ret2.status = Status(Status::LARGE_TRANSFORMATION);
       ret2.status.description = "trans " + std::to_string(delta_translation) +
                                 " rot " + std::to_string(delta_rotation);
@@ -749,7 +767,9 @@ bool Slam::add_nonsequential_scan_matching()
                                     &ret2.estimated_transform);
     if (overlap < nssm_params.min_points)
       ret2.status = Status(Status::NOT_ENOUGH_OVERLAP);
-    ret2.status.description = std::to_string(overlap);
+    // append — don't clobber the success path's "N samples" diagnostic
+    if (!ret2.status.description.empty()) ret2.status.description += ", ";
+    ret2.status.description += "overlap " + std::to_string(overlap);
   }
 
   // Compass-consistency gate (ABSOLUTE, added 2026-07-15 night after two
@@ -785,9 +805,14 @@ bool Slam::add_nonsequential_scan_matching()
   if (ret2.status && ret2.has_cov) {
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
       ret2.cov.topLeftCorner<2, 2>());
-    const double sig_max = std::sqrt(std::max(0.0, es.eigenvalues()[1]));
-    const double sig_min = std::sqrt(std::max(1e-12, es.eigenvalues()[0]));
-    if (sig_max > nssm_max_sigma || sig_max / sig_min > nssm_max_anisotropy) {
+    const double ev_lo = es.eigenvalues()[0];
+    const double ev_hi = es.eigenvalues()[1];
+    const double sig_max = std::sqrt(std::max(0.0, ev_hi));
+    const double sig_min = std::sqrt(std::max(1e-12, ev_lo));
+    // check the RAW eigenvalues for NaN — std::max launders NaN to its other
+    // argument, so a NaN covariance would otherwise sail through as sigma 0
+    if (!std::isfinite(ev_lo) || !std::isfinite(ev_hi) ||
+        sig_max > nssm_max_sigma || sig_max / sig_min > nssm_max_anisotropy) {
       ret2.status = Status(Status::NOT_CONVERGED);
       ret2.status.description = "degenerate: sigma " + std::to_string(sig_max) +
                                 " aniso " + std::to_string(sig_max / sig_min);

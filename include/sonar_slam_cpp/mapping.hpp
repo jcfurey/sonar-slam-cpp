@@ -86,6 +86,12 @@ public:
   double outlier_filter_radius = 5.0;
   int outlier_filter_min_points = 20;
 
+  // Keyframes with fewer feature points than this deposit a NEUTRAL occupancy
+  // tile (logodds 0) instead of the upstream all-free wedge — a CFAR whiff on
+  // low-contrast structure must not stamp miss-logodds to max range over real
+  // walls. 0 keeps the upstream policy (any point count claims free space).
+  int free_tile_min_points = 0;
+
   // only re-place a keyframe when it moved at least this much (skip micro
   // jitter — the O(cells) dec/inc is wasted below the grid resolution)
   double min_translation = 0.5;
@@ -105,6 +111,12 @@ public:
   // intermediate slots are padded so indices stay aligned with the graph.
   void add_keyframe(int key, const gtsam::Pose2& pose, const SonarPing& ping,
                     const Matrix& points);
+
+  // Advance past keyframe `key` with an empty, invalid tile — for keyframes
+  // whose ping/feature data is conclusively unrecoverable (dropped message,
+  // or a restart against a latched trajectory carrying unseen history). The
+  // in-order builder must not wedge behind them.
+  void add_skipped(int key, const gtsam::Pose2& pose);
 
   // Re-place keyframe `key` at `new_pose` if it moved enough — the loop
   // closure correction (dec old tile -> refit -> inc new tile).
@@ -149,6 +161,11 @@ private:
   Interp1d b2c_;       // bearing (rad) -> beam column, linear (sonar.py)
   int r_skip_ = 1, c_skip_ = 1;
   int sub_rows_ = 0, sub_cols_ = 0;  // downsampled fan image dims
+  double fan_range_min_ = 0.0;       // range of the first polar row's origin
+  // image beam column whose echo belongs at fan column ci: the feature (and
+  // therefore trajectory) frame's lateral is the NEGATED native bearing, so
+  // the mosaic reads the mirrored beam (bearings[mirror_col_[ci]] == -bearings[ci])
+  std::vector<int> mirror_col_;
 
   std::vector<Submap> keyframes_;
 };
