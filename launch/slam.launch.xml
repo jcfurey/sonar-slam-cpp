@@ -21,6 +21,11 @@
        See docs/PAYLOADS.md for the full matrix. -->
   <arg name="payload_config" default="$(var config_dir)/payloads/none.yaml"/>
 
+  <!-- Keyframe-anchored, loop-closure-correctable occupancy + backscatter
+       mosaic maps (port of bruce_slam mapping.py). Consumes the SLAM
+       trajectory, so it corrects the map when a loop closure moves keyframes. -->
+  <arg name="enable_mapping" default="true"/>
+
   <group unless="$(var kalman_dead_reckoning)">
     <node pkg="sonar_slam_cpp" exec="gyro_node" name="gyro_fusion"
           namespace="bruce/slam" output="screen" if="$(var enable_gyro)">
@@ -56,6 +61,14 @@
     <param from="$(var payload_config)"/>
     <param name="enable_slam" value="$(var enable_slam)"/>
     <param name="icp_config" value="$(var config_dir)/icp.yaml"/>
+  </node>
+
+  <node pkg="sonar_slam_cpp" exec="mapping_node" name="mapping"
+        namespace="bruce/slam" output="screen" if="$(var enable_mapping)">
+    <param from="$(var config_dir)/mapping.yaml"/>
+    <!-- mapping subscribes to the sonar for the ping image, so it needs the
+         payload's sonar driver/topic like feature_extraction and slam -->
+    <param from="$(var payload_config)"/>
   </node>
 
   <!-- map -> world so everything is visualized in a z-down frame -->

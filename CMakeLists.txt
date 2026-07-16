@@ -112,6 +112,7 @@ add_library(sonar_slam_core SHARED
   src/core/global_init.cpp
   src/core/mcd.cpp
   src/core/icp_covariance.cpp
+  src/core/mapping.cpp
   src/core/slam_core.cpp
 )
 target_include_directories(sonar_slam_core PUBLIC
@@ -172,6 +173,7 @@ endfunction()
 
 sonar_slam_node(feature_extraction_node src/nodes/feature_extraction_node.cpp)
 sonar_slam_node(slam_node               src/nodes/slam_node.cpp)
+sonar_slam_node(mapping_node            src/nodes/mapping_node.cpp)
 sonar_slam_node(dead_reckoning_node     src/nodes/dead_reckoning_node.cpp)
 sonar_slam_node(gyro_node               src/nodes/gyro_node.cpp)
 sonar_slam_node(kalman_node             src/nodes/kalman_node.cpp)

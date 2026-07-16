@@ -1,0 +1,49 @@
+# ROS 2 parameter file for mapping_node (port of bruce_slam mapping.py).
+# Keyframe-anchored, loop-closure-correctable map products:
+#   * occupancy (additive logodds, from the feature point cloud), and
+#   * intensity / backscatter mosaic (from the sonar ping image),
+# both re-placed when the pose graph moves a keyframe (see src/core/mapping.cpp).
+# The "/**" wildcard applies these to whatever node name loads the file.
+/**:
+  ros__parameters:
+    # initial map extent + growth (the grid grows automatically as the survey
+    # expands past it — these are just the starting allocation)
+    origin: [-50.0, -50.0]   # world (x, y) of the grid corner (m)
+    size: [100.0, 100.0]     # initial (width, height) (m)
+    resolution: 0.2          # m per cell
+    inc: 50.0                # grow by this many m when the survey runs off the grid
+
+    # OCCUPANCY (additive logodds, from the feature cloud). Additive — not a
+    # clamped update — so a keyframe's contribution can be removed and re-added
+    # at its optimized pose when a loop closure moves it.
+    pub_occupancy1: true
+    hit_prob: 0.8            # occupancy deposited at a return
+    miss_prob: 0.3           # occupancy deposited along the free ray before it
+    inflation_angle: 0.05    # rad, occupied-cell bearing inflation (Gaussian)
+    inflation_range: 0.5     # m,   occupied-cell range inflation (Gaussian)
+
+    # INTENSITY / backscatter mosaic (mean raw echo per cell, 0..100). Also
+    # keyframe-anchored and correctable. A survey-grade backscatter deliverable.
+    pub_intensity: true
+
+    # radius outlier removal on the feature cloud before marking hits
+    outlier_filter_radius: 5.0
+    outlier_filter_min_points: 20
+
+    # only re-place a keyframe's tile once the graph moved it at least this much
+    # (the dec/inc re-render is wasted below the grid resolution)
+    min_translation: 0.5
+    min_rotation: 0.05
+
+    # MUST match slam_node's enu_world so the reconstructed sonar fan lands in
+    # the same frame as the trajectory poses (true -> standard ENU trajectory).
+    enu_world: true
+
+    # optional min seconds between map publishes (0 = publish every keyframe)
+    publish_period: 0.0
+
+    # raw sonar ping (same driver/topic as feature_extraction). Left blank here
+    # so the sensor-payload overlay sets them, like the other nodes.
+    sonar:
+      driver: ""    # e.g. "oculus_compressed", "projected_sonar", "image"
+      topic: ""     # "" -> the driver's default topic

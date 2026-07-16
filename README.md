@@ -22,10 +22,16 @@ against the Python SLAM node or vice versa.
 | `gyro_node` | FOG delta-angle integration | `gyro.py` |
 | `kalman_node` | 12-state Kalman filter | `kalman.py` |
 | `enu_odom_relay_node` | ENU→z-down odometry relay | `scripts/enu_odom_relay.py` |
+| `mapping_node` | keyframe-anchored, loop-closure-correctable occupancy grid + intensity/backscatter mosaic | `mapping.py` |
 | `parity_check` | CPU/GPU parity + perf self-test | — |
 
-Not ported: `mapping_node` (not launched by `slam.launch.py`) and the offline
-bag-pump mode (use `ros2 bag play` instead).
+`mapping_node` consumes the latched `/bruce/slam/slam/traj` (whole optimized
+trajectory) plus the ping + feature cloud, and re-renders its 2D map products
+when a loop closure moves keyframes (`dec`/`inc` per moved tile) — the map
+correction the live accumulator lacks. See `SONAR_MAPPING_ARCHITECTURE.md` §5.
+Its `mapping/enu_world` MUST match `slam/enu_world`.
+
+Not ported: the offline bag-pump mode (use `ros2 bag play` instead).
 
 ## GPU acceleration & CPU fallback
 

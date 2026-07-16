@@ -74,6 +74,21 @@ at the time of comparison.
   `parity_vs_python` harness is also unaffected (it consumes τ values from
   the Python fixture).
 
+### 7. Mapping grid column-growth — wrong axis for the intensity/counter grids
+- **Upstream:** `mapping.py:557-565, 576-583` — in `adjust_bounds`, the two
+  COLUMN-growth branches grow the intensity and counter grids with `np.r_`
+  (row concatenation) and `self.inc_r`, i.e. they pad rows when they must pad
+  columns. Only the logodds grid (grown with `np.c_`) is correct. The bug is
+  latent upstream because `pub_intensity` defaults False, so the intensity
+  branch never runs.
+- **Here:** `src/core/mapping.cpp adjust_bounds` grows all three grids
+  (logodds, intensity, counter) by the SAME column primitive (`grow_cols` /
+  `grow_rows`) with the matching increment, so the intensity mosaic stays
+  aligned as the map expands sideways. The port enables `pub_intensity` (the
+  backscatter mosaic is a shipped product), so the branch is now live and had
+  to be correct. (`mapping_node`, the port of `mapping.py`; see
+  `SONAR_MAPPING_ARCHITECTURE.md` §5.)
+
 ## Carried-over limitations left in place (with rationale)
 
 ### A. Only the newest keyframe's covariance is refreshed

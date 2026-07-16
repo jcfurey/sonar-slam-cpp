@@ -29,6 +29,9 @@ inline const std::string SLAM_CLOUD_TOPIC = std::string(SLAM_NS) + "slam/cloud";
 inline const std::string SLAM_CONSTRAINT_TOPIC = std::string(SLAM_NS) + "slam/constraint";
 inline const std::string SONAR_FEATURE_TOPIC = std::string(SLAM_NS) + "feature_extraction/feature";
 inline const std::string SONAR_FEATURE_IMG_TOPIC = std::string(SLAM_NS) + "feature_extraction/feature_img";
+// keyframe-anchored, loop-closure-correctable map products (mapping_node)
+inline const std::string MAPPING_INTENSITY_TOPIC = std::string(SLAM_NS) + "mapping/intensity";
+inline const std::string MAPPING_OCCUPANCY_TOPIC = std::string(SLAM_NS) + "mapping/occupancy";
 
 inline double to_sec(const builtin_interfaces::msg::Time& t)
 {
