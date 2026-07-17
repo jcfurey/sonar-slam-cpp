@@ -877,6 +877,37 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
   if (keyframe) keyframes.push_back(keyframe);
 
+  // |optimized - DR| separation for one consecutive keyframe pair. DR is
+  // drift-free over a single ~0.75 m keyframe interval, so a deviation here is
+  // the optimizer having torn the chain to satisfy a loop closure.
+  const auto link_tear = [this](std::size_t k) {
+    const double d_opt = (keyframes[k + 1]->pose.translation() -
+                          keyframes[k]->pose.translation())
+                           .norm();
+    const double d_dr = (keyframes[k + 1]->dr_pose.translation() -
+                         keyframes[k]->dr_pose.translation())
+                          .norm();
+    return std::fabs(d_opt - d_dr);
+  };
+
+  // Pre-round snapshot, loop rounds only (add_nonsequential_scan_matching
+  // fills pending_loops_ before calling us; a plain keyframe round leaves it
+  // empty and skips the post-loop verification below). It serves two jobs
+  // down there: the delta semantics of the chain-tear check, and an exact
+  // revert.
+  std::vector<gtsam::Pose3> pre_round_poses;
+  std::vector<double> pre_tear;
+  if (!pending_loops_.empty()) {
+    pre_round_poses.reserve(keyframes.size());
+    for (const auto& kf : keyframes)
+      pre_round_poses.push_back(kf->horizon_pose3());
+    if (post_loop_max_translation_err > 0.0 && keyframes.size() > 1) {
+      pre_tear.resize(keyframes.size() - 1);
+      for (std::size_t k = 0; k + 1 < keyframes.size(); ++k)
+        pre_tear[k] = link_tear(k);
+    }
+  }
+
   // isam_.update can throw (e.g. IndeterminantLinearSystem on a rank-deficient
   // scan-match factor), and GTSAM gives NO exception guarantee: by the time
   // elimination throws, the new factor is already in nonlinearFactors_, X(n)
@@ -937,46 +968,60 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     // are compact (degeneracy gate blind), and mutually-consistent aliases
     // give PCM a perfect clique (md 0.0 observed) — but the optimizer can
     // only satisfy them by stretching weak (DR-only) consecutive links by
-    // many meters (8-18 m edges observed in the folded graph). DR is
-    // drift-free over ONE keyframe interval, so compare each consecutive
-    // optimized separation against its DR separation.
-    double max_tear = 0.0;
+    // many meters (8-18 m edges observed in the folded graph).
+    //
+    // Judged PER LINK and as a DELTA against the pre-round snapshot: a link
+    // is this round's fault only if it both breaks the bound AND is worse
+    // than it already was. The original form — global max against the
+    // absolute bound — latched: one link left stretched ~1.02 m read above
+    // the 1.0 m bound on every subsequent round, vetoing closures on evidence
+    // that had nothing to do with them. Per link rather than max-vs-max
+    // because one old stretched link would otherwise mask a fresh tear
+    // elsewhere in the chain — exactly the fold this check exists to catch.
+    double worst_tear = 0.0;
+    bool tear_bad = false;
     if (post_loop_max_translation_err > 0.0) {
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
-        const double d_opt =
-          (keyframes[k + 1]->pose.translation() - keyframes[k]->pose.translation())
-            .norm();
-        const double d_dr =
-          (keyframes[k + 1]->dr_pose.translation() -
-           keyframes[k]->dr_pose.translation())
-            .norm();
-        max_tear = std::max(max_tear, std::fabs(d_opt - d_dr));
+        const double tear = link_tear(k);
+        const double before = k < pre_tear.size() ? pre_tear[k] : 0.0;
+        // covers re-solve jitter on a link this round never touched (~5 mm
+        // observed), and sits orders below any real fold — a numerical guard,
+        // not a tuning lever, so it stays out of the config
+        constexpr double tear_jitter_eps = 0.01;  // m
+        if (tear > post_loop_max_translation_err &&
+            tear > before + tear_jitter_eps) {
+          tear_bad = true;
+          worst_tear = std::max(worst_tear, tear);
+        }
       }
     }
     const bool yaw_bad = rms > post_loop_max_yaw_rms;
-    const bool tear_bad = post_loop_max_translation_err > 0.0 &&
-                          max_tear > post_loop_max_translation_err;
     if (yaw_bad || tear_bad) {
       last_error_ = yaw_bad
         ? ("post-loop compass check failed: optimized-vs-DR yaw RMS " +
            std::to_string(rms) + " rad > " +
            std::to_string(post_loop_max_yaw_rms))
-        : ("post-loop chain-tear check failed: consecutive-keyframe "
-           "separation deviates from DR by " + std::to_string(max_tear) +
-           " m > " + std::to_string(post_loop_max_translation_err));
+        : ("post-loop chain-tear check failed: this round tore a consecutive "
+           "keyframe link to " + std::to_string(worst_tear) +
+           " m from DR > " + std::to_string(post_loop_max_translation_err));
       last_nssm_status = "REVERTED (" + last_error_ + ")";
       graph_.resize(0);
       values_.clear();
       rollback_pending_loops();
+      // Restore the pre-round poses EXACTLY, then rebuild from them. They are
+      // the converged optimum of committed_graph_ — this round appends to it
+      // only on success (below), so nothing it constrains has changed — which
+      // means the rebuilt estimator relinearizes AT the optimum and holds
+      // them. Seeding the rebuild from the bent poses instead (what the sweep
+      // above wrote into the keyframes) left a residual bend that a single
+      // isam_.update could not walk back, and that residual is itself a chain
+      // tear: the delta check above would read it as pre-existing and excuse
+      // it from then on.
+      const std::size_t n = std::min(pre_round_poses.size(), keyframes.size());
+#pragma omp parallel for schedule(dynamic)
+      for (std::size_t x = 0; x < n; ++x)
+        keyframes[x]->update(pre_round_poses[x]);
       rebuild_isam();
-      // keyframes were already updated with the bent estimates — re-extract
-      // from the rebuilt estimator (linearized at the bent poses, so the
-      // first re-solve may retain some residual; subsequent keyframe updates
-      // converge it back)
-      const gtsam::Values reverted = isam_.calculateEstimate();
-      for (std::size_t x = 0; x < reverted.size() && x < keyframes.size(); ++x)
-        keyframes.at(x)->update(
-          reverted.at<gtsam::Pose3>(X(static_cast<int>(x))));
       return false;
     }
   }
