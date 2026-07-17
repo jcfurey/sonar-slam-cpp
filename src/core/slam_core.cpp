@@ -931,10 +931,39 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       ss += e * e;
     }
     const double rms = std::sqrt(ss / static_cast<double>(keyframes.size()));
-    if (rms > post_loop_max_yaw_rms) {
-      last_error_ = "post-loop compass check failed: optimized-vs-DR yaw RMS " +
-                    std::to_string(rms) + " rad > " +
-                    std::to_string(post_loop_max_yaw_rms);
+    // Chain-tear check (2026-07-16 CHL_Pool fold): parallel-wall
+    // TRANSLATIONAL aliases beat every per-closure gate — compass agrees
+    // between parallel walls seen at the same heading, wall-to-wall locks
+    // are compact (degeneracy gate blind), and mutually-consistent aliases
+    // give PCM a perfect clique (md 0.0 observed) — but the optimizer can
+    // only satisfy them by stretching weak (DR-only) consecutive links by
+    // many meters (8-18 m edges observed in the folded graph). DR is
+    // drift-free over ONE keyframe interval, so compare each consecutive
+    // optimized separation against its DR separation.
+    double max_tear = 0.0;
+    if (post_loop_max_translation_err > 0.0) {
+      for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
+        const double d_opt =
+          (keyframes[k + 1]->pose.translation() - keyframes[k]->pose.translation())
+            .norm();
+        const double d_dr =
+          (keyframes[k + 1]->dr_pose.translation() -
+           keyframes[k]->dr_pose.translation())
+            .norm();
+        max_tear = std::max(max_tear, std::fabs(d_opt - d_dr));
+      }
+    }
+    const bool yaw_bad = rms > post_loop_max_yaw_rms;
+    const bool tear_bad = post_loop_max_translation_err > 0.0 &&
+                          max_tear > post_loop_max_translation_err;
+    if (yaw_bad || tear_bad) {
+      last_error_ = yaw_bad
+        ? ("post-loop compass check failed: optimized-vs-DR yaw RMS " +
+           std::to_string(rms) + " rad > " +
+           std::to_string(post_loop_max_yaw_rms))
+        : ("post-loop chain-tear check failed: consecutive-keyframe "
+           "separation deviates from DR by " + std::to_string(max_tear) +
+           " m > " + std::to_string(post_loop_max_translation_err));
       last_nssm_status = "REVERTED (" + last_error_ + ")";
       graph_.resize(0);
       values_.clear();

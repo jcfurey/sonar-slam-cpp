@@ -137,6 +137,8 @@ public:
     slam_.nssm_max_anisotropy = get_double("nssm/max_anisotropy", 8.0);
     slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.15);
     slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
+    slam_.post_loop_max_translation_err =
+      get_double("post_loop_max_translation_err", 1.0);
 
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");

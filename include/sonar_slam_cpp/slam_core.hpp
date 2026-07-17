@@ -68,6 +68,14 @@ public:
   // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
   // under this bound or the loops are rolled back (see update_factor_graph)
   double post_loop_max_yaw_rms = 0.15;  // rad
+  // post-loop CHAIN-TEAR check: max allowed |optimized - DR| consecutive
+  // keyframe separation (m). Parallel-wall translational aliases pass every
+  // per-closure gate (compass agrees between parallel walls, wall-to-wall
+  // locks are compact, mutually-consistent aliases satisfy PCM) — but to
+  // win they must stretch weak sequential links by many meters. DR is
+  // drift-free over one ~0.75 m keyframe interval, so a large tear is
+  // unambiguous. 0 disables.
+  double post_loop_max_translation_err = 1.0;  // m
 
   OculusProperty oculus;
 
