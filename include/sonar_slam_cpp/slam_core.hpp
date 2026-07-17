@@ -8,6 +8,7 @@
 #include <gtsam/nonlinear/Values.h>
 
 #include <deque>
+#include <map>
 #include <optional>
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
@@ -98,6 +99,13 @@ public:
   int nssm_queued = 0;
   int nssm_best_clique = 0;
   int nssm_queue_depth() const { return static_cast<int>(nssm_queue_.size()); }
+  // cumulative histogram of terminal NSSM rejection reasons over the whole run,
+  // keyed by Status category (LARGE_TRANSFORMATION is split into "(compass)" vs
+  // geometric so the tunable rot/trans bar stays distinct from the untouchable
+  // aliasing guard). Turns the sampled "last NSSM" reason into a full
+  // distribution so tuning targets the biggest bar, not whatever fired last.
+  std::map<std::string, int> nssm_reject_hist;
+  std::string nssm_reject_summary() const;
   // PCM introspection: the smallest pairwise Mahalanobis distance seen in
   // the last verify (how close the queue is to forming an edge; threshold
   // 11.34 = chi2.ppf(0.99, 3)) and how many consistency edges formed

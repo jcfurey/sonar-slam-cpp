@@ -729,6 +729,22 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   return ret;
 }
 
+namespace {
+// Histogram bucket for a terminal NSSM rejection. Status::name() already gives
+// a stable category, but LARGE_TRANSFORMATION covers both the geometric
+// trans/rot bound (tunable via max_translation/max_rotation) AND the
+// compass-consistency gate (the aliasing guard — do NOT loosen), so split them
+// by the description prefix set at their respective gate sites.
+std::string nssm_hist_key(const Status& s)
+{
+  std::string key = s.name();
+  const std::string& d = s.description;
+  if (d.rfind("compass-inconsistent", 0) == 0) key += " (compass)";
+  else if (d.rfind("degenerate", 0) == 0) key += " (degenerate)";
+  return key;
+}
+}  // namespace
+
 bool Slam::add_nonsequential_scan_matching()
 {
   // current_frame is assigned at the END of the SLAM callback, so it is null
@@ -740,6 +756,7 @@ bool Slam::add_nonsequential_scan_matching()
   if (!ret.status) {
     last_nssm_status =
       std::string(ret.status.name()) + " (" + ret.status.description + ")";
+    ++nssm_reject_hist[nssm_hist_key(ret.status)];
     return false;
   }
 
@@ -866,8 +883,20 @@ bool Slam::add_nonsequential_scan_matching()
   } else {
     last_nssm_status =
       std::string(ret2.status.name()) + " (" + ret2.status.description + ")";
+    ++nssm_reject_hist[nssm_hist_key(ret2.status)];
   }
   return accepted;
+}
+
+std::string Slam::nssm_reject_summary() const
+{
+  if (nssm_reject_hist.empty()) return "none";
+  std::string out;
+  for (const auto& [reason, count] : nssm_reject_hist) {
+    if (!out.empty()) out += ", ";
+    out += reason + ":" + std::to_string(count);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

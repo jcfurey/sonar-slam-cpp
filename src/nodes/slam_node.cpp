@@ -506,14 +506,15 @@ private:
                   "SLAM status: keyframes %d (last kf %ld pts), SSM factors %d, "
                   "NSSM accepted %d, last SSM: %s | NSSM attempts %d, queued %d, "
                   "best clique %d, queue depth %d, PCM min md %.1f (thresh 11.3, "
-                  "%d edges), last NSSM: %s",
+                  "%d edges), last NSSM: %s | NSSM rejects [%s]",
                   slam_.current_key(),
                   static_cast<long>(slam_.current_keyframe()->points.rows()),
                   slam_.ssm_accepted, slam_.nssm_accepted,
                   slam_.last_ssm_status.c_str(), slam_.nssm_attempts,
                   slam_.nssm_queued, slam_.nssm_best_clique,
                   slam_.nssm_queue_depth(), slam_.last_pcm_min_md,
-                  slam_.last_pcm_edges, slam_.last_nssm_status.c_str());
+                  slam_.last_pcm_edges, slam_.last_nssm_status.c_str(),
+                  slam_.nssm_reject_summary().c_str());
     }
   }
 
