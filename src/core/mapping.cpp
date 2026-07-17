@@ -83,7 +83,9 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
   const bool changed = oculus_.configure(ping);
 
   Submap kf;
-  kf.k = static_cast<int>(keyframes_.size());
+  // the slot this keyframe will occupy — keyframes_.size() disagrees with it
+  // when the padding loop below fills missed slots first
+  kf.k = key;
   kf.pose = pose;
   kf.valid = true;
 
@@ -135,7 +137,14 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
     // the occupancy grid and the (bag-validated) trajectory.
     mirror_col_.assign(num_bearings, 0);
     for (int i = 0; i < num_bearings; ++i) {
-      const int m = static_cast<int>(std::lround(b2c_(-oculus_.bearings[i])));
+      // clamp the query into the aperture: for an asymmetric fan the negated
+      // bearing can fall outside [front, back], where the interp's fill value
+      // (0.0) would silently alias every such beam to column 0
+      const double q = std::min(
+        std::max(-static_cast<double>(oculus_.bearings[i]),
+                 static_cast<double>(oculus_.bearings.front())),
+        static_cast<double>(oculus_.bearings.back()));
+      const int m = static_cast<int>(std::lround(b2c_(q)));
       mirror_col_[i] = std::min(std::max(m, 0), num_bearings - 1);
     }
   }
@@ -145,21 +154,24 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
   const bool have_geom = sonar_xy_ && sub_rows_ > 0 && sub_cols_ > 0;
 
   // --------- occupancy logodds tile (mapping.py:170-228) ---------
+  // Filter FIRST: the free-space policy must judge the FILTERED cloud. A
+  // cloud the outlier filter empties carries no more evidence than an empty
+  // one, and letting it through to the all-free wedge would stamp
+  // miss-logodds over real structure — the exact failure free_tile_min_points
+  // exists to prevent.
+  Matrix xy2(0, 2);
+  if (have_geom && pub_occupancy1 && points.rows() > 0) {
+    xy2 = points.leftCols(2);
+    if (outlier_filter_min_points > 1 && xy2.rows() > 0)
+      xy2 = remove_outlier(xy2, outlier_filter_radius, outlier_filter_min_points);
+  }
   if (have_geom && pub_occupancy1 &&
-      static_cast<int>(points.rows()) < free_tile_min_points) {
-    // too few returns to trust a free-space claim (a CFAR whiff would stamp
-    // the upstream all-free wedge over real structure): deposit a neutral
-    // tile — logodds 0 adds nothing and stays exactly reversible
+      static_cast<int>(xy2.rows()) < free_tile_min_points) {
+    // too few surviving returns to trust a free-space claim: deposit a
+    // neutral tile — logodds 0 adds nothing and stays exactly reversible
     kf.logodds.assign(static_cast<size_t>(sub_rows_) * sub_cols_, 0.0f);
   } else if (have_geom && pub_occupancy1) {
     cv::Mat mask = cv::Mat::zeros(sub_rows_, sub_cols_, CV_32F);
-
-    Matrix xy2(0, 2);
-    if (points.rows() > 0) {
-      xy2 = points.leftCols(2);
-      if (outlier_filter_min_points > 1 && xy2.rows() > 0)
-        xy2 = remove_outlier(xy2, outlier_filter_radius, outlier_filter_min_points);
-    }
 
     if (xy2.rows() > 0 && num_bearings > 0 && num_ranges > 0) {
       const double b_lo = oculus_.bearings.front();
@@ -167,7 +179,14 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
       for (int p = 0; p < xy2.rows(); ++p) {
         const double px = xy2(p, 0), py = xy2(p, 1);
         if (!std::isfinite(px) || !std::isfinite(py)) continue;
-        double bearing = std::atan2(py, px);
+        // Bin the hit into the fan column that fit_grid will place AT the
+        // feature's coordinates: the fan's local Y is frame_y_sign*sin(B)*R,
+        // so the matching column satisfies sin(B_col) = py/(frame_y_sign*R),
+        // i.e. atan2(frame_y_sign*py, px). For enu_world (+1) this is the
+        // historical atan2(py, px); for frame_y_sign = -1 the old form put
+        // every hit in the mirrored column, flipping both map products
+        // port<->starboard against the trajectory.
+        double bearing = std::atan2(frame_y_sign * py, px);
         bearing = std::min(std::max(bearing, b_lo), b_hi);
         int col = static_cast<int>(std::lround(b2c_(bearing)));
         col = std::min(std::max(col, 0), num_bearings - 1);
@@ -227,10 +246,15 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
     for (int ri = 0; ri < num_ranges; ri += r_skip_) {
       for (int ci = 0; ci < num_bearings; ci += c_skip_) {
         uint32_t v = 0;
-        // mirrored beam read (see mirror_col_): keeps the mosaic on the same
-        // side of the track as the occupancy/feature evidence
+        // Beam read matching the occupancy evidence's chirality: with
+        // frame_y_sign = +1 the evidence in fan column ci comes from the
+        // NEGATED native bearing (mirrored read, see mirror_col_); with
+        // frame_y_sign = -1 the corrected hit binning above puts evidence at
+        // the native bearing, so read the native column.
         const int mc =
-          ci < static_cast<int>(mirror_col_.size()) ? mirror_col_[ci] : ci;
+          (frame_y_sign > 0 && ci < static_cast<int>(mirror_col_.size()))
+            ? mirror_col_[ci]
+            : ci;
         if (ri < ping.image.rows && mc < ping.image.cols)
           v = ping.image.at<uint8_t>(ri, mc);
         if (idx < kf.intensity.size()) kf.intensity[idx] = v;

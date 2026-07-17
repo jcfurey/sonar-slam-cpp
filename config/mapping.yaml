@@ -30,10 +30,24 @@
     outlier_filter_radius: 5.0
     outlier_filter_min_points: 20
 
-    # only re-place a keyframe's tile once the graph moved it at least this much
-    # (the dec/inc re-render is wasted below the grid resolution)
-    min_translation: 0.5
-    min_rotation: 0.05
+    # below this many FILTERED feature points a keyframe deposits a NEUTRAL
+    # occupancy tile instead of the upstream all-free wedge — a CFAR whiff must
+    # not stamp miss-logodds over real walls (0 = upstream all-free policy)
+    free_tile_min_points: 5
+
+    # Only re-place a keyframe's tile once the graph moved it at least this
+    # much. Set near the grid resolution: sub-threshold corrections are
+    # SILENTLY ABSORBED (the tile stays at its stale pose), so thresholds much
+    # larger than a cell re-introduce per-pass ghosting — at the previous
+    # 0.5 m / 0.05 rad the map could ghost by half the ~1 m wall-doubling gap
+    # the current campaign is chasing (MAP_DOUBLING_FIX_PLAN.md).
+    min_translation: 0.2
+    min_rotation: 0.02
+
+    # how far (s) a ping/feature stream must advance past a keyframe's stamp
+    # before its inputs are declared conclusively lost and the keyframe is
+    # skipped with an empty tile (the pairing tolerance itself stays 2 ms)
+    stream_grace: 1.0
 
     # MUST match slam_node's enu_world so the reconstructed sonar fan lands in
     # the same frame as the trajectory poses (true -> standard ENU trajectory).

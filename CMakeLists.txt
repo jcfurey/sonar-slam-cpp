@@ -31,25 +31,39 @@ if(SONAR_SLAM_ENABLE_CUDA)
     # colcon continue-on-error keeps the stale install. Treat anything below
     # sm_75 (Turing) as a stale cache on any modern toolkit and self-heal to
     # sm_86 so the kernels actually rebuild for the device.
+    # Only the LEGACY CMake auto-default (sm_52 and below, Maxwell) is treated
+    # as a stale cache and force-reset: that is the value old configure runs
+    # actually left behind, and no modern deliberate target uses it. Anything
+    # in (52, 75) — P100/GTX10xx/V100/Xavier are all real nvcc-12 targets —
+    # is respected with a warning, so a user's -DCMAKE_CUDA_ARCHITECTURES=70
+    # is never silently replaced with cubins their device cannot load.
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
-      set(_cuda_arch_floor 75)
+      set(_cuda_arch_stale_max 52)
+      set(_cuda_arch_warn_max 74)
     else()
-      set(_cuda_arch_floor 0)
+      set(_cuda_arch_stale_max 0)
+      set(_cuda_arch_warn_max 0)
     endif()
-    set(_cuda_arch_ok TRUE)
+    set(_cuda_arch_stale FALSE)
+    set(_cuda_arch_old FALSE)
     foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
       string(REGEX MATCH "^[0-9]+" _an "${_a}")
-      if(_an AND _an LESS _cuda_arch_floor)
-        set(_cuda_arch_ok FALSE)
+      if(_an AND _an LESS_EQUAL _cuda_arch_stale_max)
+        set(_cuda_arch_stale TRUE)
+      elseif(_an AND _an LESS_EQUAL _cuda_arch_warn_max)
+        set(_cuda_arch_old TRUE)
       endif()
     endforeach()
-    if(NOT _cuda_arch_ok)
+    if(_cuda_arch_stale)
       message(WARNING "sonar_slam_cpp: cached CMAKE_CUDA_ARCHITECTURES "
-        "'${CMAKE_CUDA_ARCHITECTURES}' is below the nvcc "
-        "${CMAKE_CUDA_COMPILER_VERSION} floor (sm_${_cuda_arch_floor}) and "
-        "cannot build — resetting to 86. Reconfigure with "
+        "'${CMAKE_CUDA_ARCHITECTURES}' is the legacy CMake default (<= sm_52) "
+        "— treating as a stale cache and resetting to 86. Reconfigure with "
         "-DCMAKE_CUDA_ARCHITECTURES=<arch> to pick your own GPU.")
       set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual CACHE STRING "" FORCE)
+    elseif(_cuda_arch_old)
+      message(WARNING "sonar_slam_cpp: CMAKE_CUDA_ARCHITECTURES "
+        "'${CMAKE_CUDA_ARCHITECTURES}' targets a pre-Turing GPU; keeping it "
+        "as configured (kernels will build for that device).")
     endif()
     set(HAVE_CUDA TRUE)
     message(STATUS "sonar_slam_cpp: CUDA kernels enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")

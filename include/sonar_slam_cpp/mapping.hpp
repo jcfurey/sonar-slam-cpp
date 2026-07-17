@@ -51,16 +51,19 @@ struct Submap
   // y-left), shared across keyframes that share the sonar geometry (rebuilt
   // only when the range/aperture changes — mapping.py reuses the previous).
   std::shared_ptr<const Matrix> sonar_xy;
-  // Per-pixel deposits (aligned with sonar_xy rows).
+  // Per-pixel deposits (aligned with sonar_xy rows). Intensity is a raw
+  // 0..255 pixel per cell — uint8 (the uint32 SUMS live only in the global
+  // grids); at ~1 tile/keyframe this is a 4x memory saving on the dominant
+  // per-keyframe allocation of a long mission.
   std::vector<float> logodds;      // occupancy logodds
-  std::vector<uint32_t> intensity;  // raw backscatter 0..255
+  std::vector<uint8_t> intensity;  // raw backscatter 0..255
 
   // Current placement into the global grid (recomputed by fit_grid). r/c are
   // cell indices; l/i are the deduplicated per-cell deposits actually summed
   // into the grids by inc_grid (and subtracted by dec_grid).
   std::vector<int> r, c;
   std::vector<float> l;
-  std::vector<uint32_t> i;
+  std::vector<uint8_t> i;
 };
 
 class Mapping

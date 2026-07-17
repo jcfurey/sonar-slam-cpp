@@ -7,6 +7,10 @@
     keyframe_duration: 1.0
     keyframe_translation: 3.0
     keyframe_rotation: 0.5235987755982988   # deg(30)
+    # min feature points for a frame to become a keyframe (0 = off). Empty
+    # clouds (~8% of pool pings) otherwise become 0-point keyframes that
+    # dilute the graph and deposit empty map tiles (MAP_DOUBLING_FIX_PLAN 3b).
+    keyframe_min_points: 10
 
     # is the SLAM back-end enabled (vs. pure dead reckoning); overridden from launch
     enable_slam: true
@@ -73,7 +77,21 @@
       initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30
       cov_method: sampled     # sampled (many ICPs + FAST-MCD) | censi (1 ICP + closed-form)
+      # -- loop-closure defense gates (see MAP_DOUBLING_FIX_PLAN.md) --
+      # covariance degeneracy gate: reject closures whose sampled/Censi
+      # covariance is too large or too elongated (wall-sliding signature)
+      max_sigma: 0.5          # max sqrt(largest translation eigenvalue), m
+      max_anisotropy: 8.0     # max sigma_max / sigma_min
+      # absolute compass gate AND (fix 3a) the clamp on the global-init yaw
+      # search window — candidates beyond this band can only be rejected
+      max_yaw_vs_compass: 0.15   # rad (~8.6 deg, above compass noise)
 
     # the PCM params for rejecting outlier loop closures
     pcm_queue_size: 5         # the sliding window size for PCM
     min_pcm: 2                # the min number of pairwise consistent loop closures
+
+    # optimize-then-verify: revert the round when the optimized graph bends
+    # away from the compass-anchored DR (worst sliding-window yaw RMS) or
+    # tears a consecutive keyframe link vs its DR link (0 disables)
+    post_loop_max_yaw_rms: 0.15        # rad
+    post_loop_max_translation_err: 1.0 # m

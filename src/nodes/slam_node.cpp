@@ -47,6 +47,10 @@ public:
     slam_.keyframe_duration = get_double("keyframe_duration");
     slam_.keyframe_translation = get_double("keyframe_translation");
     slam_.keyframe_rotation = get_double("keyframe_rotation");
+    // MAP_DOUBLING_FIX_PLAN.md 3b: a genuinely empty feature cloud must not
+    // become a 0-point keyframe (dilutes the graph, deposits an empty map
+    // tile); odometry still carries the pose across the gap. 0 = off.
+    slam_.keyframe_min_points = get_int("keyframe_min_points", 0);
 
     enable_slam_ = get_bool("enable_slam");
     RCLCPP_INFO(get_logger(), "SLAM STATUS: %s", enable_slam_ ? "true" : "false");
@@ -289,6 +293,11 @@ private:
       frame->status = false;
     else
       frame->status = slam_.is_keyframe(*frame);
+    // 3b: near-empty clouds don't carry enough structure to register — keep
+    // them off the graph (DR odometry bridges the gap)
+    if (frame->status && slam_.keyframe_min_points > 0 &&
+        points.rows() < slam_.keyframe_min_points)
+      frame->status = false;
 
     frame->twist = odom_msg.twist.twist;
 

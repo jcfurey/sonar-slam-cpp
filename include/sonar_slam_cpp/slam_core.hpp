@@ -29,6 +29,11 @@ public:
   double keyframe_duration = 1.0;
   double keyframe_translation = 3.0;
   double keyframe_rotation = 0.5;
+  // Minimum feature points for a frame to become a keyframe (0 = off,
+  // upstream parity). Genuinely empty clouds (~8% of pings on the pool bags)
+  // otherwise become 0-point keyframes that dilute the graph and deposit
+  // empty map tiles — MAP_DOUBLING_FIX_PLAN.md fix 3b.
+  int keyframe_min_points = 0;
 
   Eigen::Vector3d prior_sigmas = Eigen::Vector3d(0.1, 0.1, 0.01);
   Eigen::Vector3d odom_sigmas = Eigen::Vector3d(0.2, 0.2, 0.02);
@@ -181,7 +186,10 @@ private:
   // written before a failed solve, and reconstruct ISAM2 from the committed
   // factor mirror (a thrown ISAM2::update leaves the estimator in an
   // undefined, partially-mutated state — GTSAM gives no exception guarantee)
-  void rollback_pending_loops();
+  // quarantine=true additionally marks the rolled-back loops rejected (a
+  // verification revert: the clique is demonstrably bad); false leaves them
+  // eligible for retry (a solver failure says nothing about the loops)
+  void rollback_pending_loops(bool quarantine);
   void rebuild_isam();
 
   gtsam::ISAM2 isam_;

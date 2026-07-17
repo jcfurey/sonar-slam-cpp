@@ -680,10 +680,22 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(ret.cov.topLeftCorner<2, 2>());
   const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());
   const double rotation_std = std::sqrt(ret.cov(2, 2));
+  // Compass-clamped init yaw (MAP_DOUBLING_FIX_PLAN.md fix 3a): the compass
+  // gate downstream rejects any closure whose relative yaw disagrees with DR
+  // by more than nssm_max_yaw_vs_compass, so yaw candidates beyond that band
+  // can only produce closures the gate will kill — and on near-square
+  // geometry a loose ±5σ window spans the ~90° alias basin, where the Sobol
+  // search then lands (56% of CHL_Pool rejects were compass rejects).
+  // Translation keeps the full ±5σ freedom; only yaw is clamped to the band
+  // the gate already enforces.
+  const double yaw_bound =
+    nssm_max_yaw_vs_compass > 0.0
+      ? std::min(5.0 * rotation_std, nssm_max_yaw_vs_compass)
+      : 5.0 * rotation_std;
   Eigen::Matrix<double, 3, 2> bounds;
   bounds << -5.0 * translation_std, 5.0 * translation_std,
             -5.0 * translation_std, 5.0 * translation_std,
-            -5.0 * rotation_std, 5.0 * rotation_std;
+            -yaw_bound, yaw_bound;
 
   const GlobalInitResult init = global_scan_match_init(
     ret.source_points, ret.source_pose, ret.target_points, ret.target_pose,
@@ -854,7 +866,9 @@ bool Slam::add_nonsequential_scan_matching()
 
     for (int m : pcm) {
       ICPResult& loop = nssm_queue_[m];
-      if (loop.inserted) continue;
+      // rejected: quarantined by a post-loop verification revert — never
+      // re-insert a closure that already demonstrably bent the graph
+      if (loop.inserted || loop.rejected) continue;
 
       // Robust kernel on loop factors (rtabmap/Vertigo-style damage
       // limitation): DCS (Agarwal et al., dynamic covariance scaling)
@@ -906,17 +920,23 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
   if (keyframe) keyframes.push_back(keyframe);
 
-  // |optimized - DR| separation for one consecutive keyframe pair. DR is
+  // Optimized-vs-DR discrepancy for one consecutive keyframe link. DR is
   // drift-free over a single ~0.75 m keyframe interval, so a deviation here is
-  // the optimizer having torn the chain to satisfy a loop closure.
+  // the optimizer having torn the chain to satisfy a loop closure. Each
+  // chart's link vector is rotated into its own keyframe-k heading: the two
+  // charts share compass-anchored yaw, so the BODY-frame vectors are directly
+  // comparable — and direction-sensitive, unlike the earlier length-only
+  // |d_opt| - |d_dr| form, which reads exactly 0 for the classic fold-back
+  // that REVERSES a link while preserving its length.
   const auto link_tear = [this](std::size_t k) {
-    const double d_opt = (keyframes[k + 1]->pose.translation() -
-                          keyframes[k]->pose.translation())
-                           .norm();
-    const double d_dr = (keyframes[k + 1]->dr_pose.translation() -
-                         keyframes[k]->dr_pose.translation())
-                          .norm();
-    return std::fabs(d_opt - d_dr);
+    const auto body_link = [](const gtsam::Pose2& a, const gtsam::Pose2& b) {
+      const double c = std::cos(a.theta()), s = std::sin(a.theta());
+      const double dx = b.x() - a.x(), dy = b.y() - a.y();
+      return Eigen::Vector2d(c * dx + s * dy, -s * dx + c * dy);  // R(θ)ᵀ·d
+    };
+    return (body_link(keyframes[k]->pose, keyframes[k + 1]->pose) -
+            body_link(keyframes[k]->dr_pose, keyframes[k + 1]->dr_pose))
+      .norm();
   };
 
   // Pre-round snapshot, loop rounds only (add_nonsequential_scan_matching
@@ -951,10 +971,22 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     graph_.resize(0);
     values_.clear();
     if (keyframe) keyframes.pop_back();
-    rollback_pending_loops();
+    // solver failure says nothing about the loops themselves — no quarantine
+    rollback_pending_loops(/*quarantine=*/false);
     rebuild_isam();
     return false;
   }
+  // The factors are inside the estimator the moment update() returns — mirror
+  // them NOW so committed_graph_ can never desync from isam_ if anything below
+  // throws. A verification revert truncates back to committed_before, which
+  // restores the "committed graph excludes the reverted round" property the
+  // rebuild depends on.
+  const std::size_t committed_before = committed_graph_.size();
+  committed_graph_.push_back(graph_);
+  graph_.resize(0);
+  values_.clear();
+
+  try {
   const gtsam::Values values = isam_.calculateEstimate();
   // Extract the optimized poses sequentially (gtsam map lookups; throws
   // loudly on a missing key, and a throw must not originate inside an OpenMP
@@ -984,13 +1016,28 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // yaw correction" diagnostic, automated. On failure the loops are rolled
   // back and the estimator rebuilt without them.
   if (!pending_loops_.empty()) {
-    double ss = 0.0;
-    for (const auto& kf : keyframes) {
-      const double e =
-        std::remainder(kf->pose.theta() - kf->dr_pose.theta(), 2.0 * M_PI);
-      ss += e * e;
+    // WINDOWED max-RMS: a fold bends a LOCAL run of keyframes, and a global
+    // RMS dilutes as ~1/sqrt(N) with mission length until any localized fold
+    // slips under a fixed threshold (a 5-frame 90° fold passes a 0.15 rad
+    // global RMS once N ≳ 550). The worst sliding-window RMS keeps the
+    // detector's sensitivity constant over the whole mission while still
+    // averaging out per-frame compass noise; W spans several times the
+    // observed fold extents.
+    constexpr int kYawRmsWindow = 20;
+    const std::size_t n_kf = keyframes.size();
+    std::vector<double> prefix(n_kf + 1, 0.0);
+    for (std::size_t i = 0; i < n_kf; ++i) {
+      const double e = std::remainder(
+        keyframes[i]->pose.theta() - keyframes[i]->dr_pose.theta(), 2.0 * M_PI);
+      prefix[i + 1] = prefix[i] + e * e;
     }
-    const double rms = std::sqrt(ss / static_cast<double>(keyframes.size()));
+    const std::size_t win =
+      std::min<std::size_t>(n_kf, static_cast<std::size_t>(kYawRmsWindow));
+    double worst_ms = 0.0;
+    for (std::size_t i = 0; win > 0 && i + win <= n_kf; ++i)
+      worst_ms =
+        std::max(worst_ms, (prefix[i + win] - prefix[i]) / static_cast<double>(win));
+    const double rms = std::sqrt(worst_ms);
     // Chain-tear check (2026-07-16 CHL_Pool fold): parallel-wall
     // TRANSLATIONAL aliases beat every per-closure gate — compass agrees
     // between parallel walls seen at the same heading, wall-to-wall locks
@@ -1027,25 +1074,27 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     const bool yaw_bad = rms > post_loop_max_yaw_rms;
     if (yaw_bad || tear_bad) {
       last_error_ = yaw_bad
-        ? ("post-loop compass check failed: optimized-vs-DR yaw RMS " +
+        ? ("post-loop compass check failed: optimized-vs-DR windowed yaw RMS " +
            std::to_string(rms) + " rad > " +
            std::to_string(post_loop_max_yaw_rms))
         : ("post-loop chain-tear check failed: this round tore a consecutive "
            "keyframe link to " + std::to_string(worst_tear) +
            " m from DR > " + std::to_string(post_loop_max_translation_err));
       last_nssm_status = "REVERTED (" + last_error_ + ")";
-      graph_.resize(0);
-      values_.clear();
-      rollback_pending_loops();
+      // un-mirror this round's factors so the rebuild excludes them, and
+      // QUARANTINE the loops: the clique demonstrably bent the graph, so it
+      // must not re-form and re-fail (accept/revert/rebuild churn) on the
+      // next candidate.
+      committed_graph_.resize(committed_before);
+      rollback_pending_loops(/*quarantine=*/true);
       // Restore the pre-round poses EXACTLY, then rebuild from them. They are
-      // the converged optimum of committed_graph_ — this round appends to it
-      // only on success (below), so nothing it constrains has changed — which
-      // means the rebuilt estimator relinearizes AT the optimum and holds
-      // them. Seeding the rebuild from the bent poses instead (what the sweep
-      // above wrote into the keyframes) left a residual bend that a single
-      // isam_.update could not walk back, and that residual is itself a chain
-      // tear: the delta check above would read it as pre-existing and excuse
-      // it from then on.
+      // the converged optimum of committed_graph_ (truncated back above, so
+      // nothing it constrains has changed) — which means the rebuilt
+      // estimator relinearizes AT the optimum and holds them. Seeding the
+      // rebuild from the bent poses instead (what the sweep above wrote into
+      // the keyframes) left a residual bend that a single isam_.update could
+      // not walk back, and that residual is itself a chain tear: the delta
+      // check above would read it as pre-existing and excuse it from then on.
       const std::size_t n = std::min(pre_round_poses.size(), keyframes.size());
 #pragma omp parallel for schedule(dynamic)
       for (std::size_t x = 0; x < n; ++x)
@@ -1055,11 +1104,8 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     }
   }
 
-  // verified (or no loops this round): the factors become permanent; mirror
-  // them for failure recovery, and let this round's loop-closure marks stand
-  committed_graph_.push_back(graph_);
-  graph_.resize(0);
-  values_.clear();
+  // verified (or no loops this round): the mirrored factors stand, and this
+  // round's loop-closure marks become permanent
   pending_loops_.clear();
 
   // Only the latest keyframe's covariance is refreshed — a known limitation
@@ -1112,20 +1158,38 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       ret.estimated_transform = ret.target_pose.between(ret.source_pose);
   }
   return true;
+  } catch (const std::exception& e) {
+    // Any throw between a successful solve and the end of this round (the
+    // estimate sweep's own consistency throw, an allocation failure, ...)
+    // would otherwise strand a half-applied round: mirrored factors for a
+    // keyframe we are about to drop, loop marks with no surviving factors,
+    // half-swept poses. Unwind exactly like a verification revert — minus the
+    // quarantine, since the loops themselves were never judged.
+    last_error_ = std::string("post-solve failure: ") + e.what();
+    committed_graph_.resize(committed_before);
+    if (keyframe) keyframes.pop_back();
+    rollback_pending_loops(/*quarantine=*/false);
+    const std::size_t n = std::min(pre_round_poses.size(), keyframes.size());
+    for (std::size_t x = 0; x < n; ++x) keyframes[x]->update(pre_round_poses[x]);
+    rebuild_isam();
+    return false;
+  }
 }
 
-void Slam::rollback_pending_loops()
+void Slam::rollback_pending_loops(bool quarantine)
 {
   // Loops are marked inserted (and appended to their keyframe's constraints)
   // in add_nonsequential_scan_matching, BEFORE the update that actually
   // incorporates their factors. If that update failed, the factors were
-  // discarded — un-mark them so PCM can re-insert on a later round instead of
-  // carrying phantom constraints forever.
+  // discarded — un-mark them; with quarantine=true (a verification revert)
+  // they are additionally flagged rejected so the same demonstrably-bad
+  // clique can neither re-insert nor vote in future PCM cliques.
   for (int m : pending_loops_) {
     if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
     ICPResult& loop = nssm_queue_[m];
     if (!loop.inserted) continue;
     loop.inserted = false;
+    if (quarantine) loop.rejected = true;
     if (loop.source_key >= 0 &&
         loop.source_key < static_cast<int>(keyframes.size())) {
       auto& constraints = keyframes[loop.source_key]->constraints;
@@ -1203,10 +1267,14 @@ std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
   last_pcm_edges = 0;
   if (static_cast<int>(queue.size()) < min_pcm_value) return {};
 
-  // build the consistency graph
+  // build the consistency graph; quarantined (rejected) closures neither
+  // insert nor vote — a reverted alias clique must not lend consistency to
+  // the next alias that joins the queue
   std::map<int, std::set<int>> adj;
-  for (std::size_t a = 0; a < queue.size(); ++a)
+  for (std::size_t a = 0; a < queue.size(); ++a) {
+    if (queue[a].rejected) continue;
     for (std::size_t b = a + 1; b < queue.size(); ++b) {
+      if (queue[b].rejected) continue;
       const ICPResult& ret_il = queue[a];
       const ICPResult& ret_jk = queue[b];
 
@@ -1225,13 +1293,22 @@ std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
       // between the two closures' source keyframes (plk) — its uncertainty
       // (the drift PCM exists to tolerate) must appear in the chi2
       // denominator or honest pairs on a drifted segment always fail.
-      // Approximate the relative covariance as the sum of the (freshly
-      // refreshed) world marginals, unrotated into pj's frame — the same
-      // world->local pattern as compute_icp_with_cov. Ignoring the (helpful)
-      // cross-correlation makes this an over-estimate: permissive, so PCM
-      // still relies on the per-closure gates for outright junk.
-      Eigen::Matrix3d rel = keyframes[ret_il.source_key]->cov +
-                            keyframes[ret_jk.source_key]->cov;
+      // GTSAM marginals are BODY-frame tangent covariances (the tangent chart
+      // sits at the pose, Exp on the right), so rotate each keyframe's
+      // marginal into the world frame FIRST, sum there, then take the sum
+      // into pj's frame — the earlier code treated the body marginals as
+      // world and applied a spurious unrotation. Ignoring the (helpful)
+      // cross-correlation still makes this an over-estimate: permissive, so
+      // PCM keeps relying on the per-closure gates for outright junk.
+      const auto body_to_world = [](Eigen::Matrix3d c, const gtsam::Pose2& p) {
+        const Eigen::Matrix2d Rb = p.rotation().matrix();
+        c.topRows<2>() = Rb * c.topRows<2>();
+        c.leftCols<2>() = c.leftCols<2>() * Rb.transpose();
+        return c;
+      };
+      Eigen::Matrix3d rel =
+        body_to_world(keyframes[ret_il.source_key]->cov, ret_il.source_pose) +
+        body_to_world(keyframes[ret_jk.source_key]->cov, ret_jk.source_pose);
       const Eigen::Matrix2d R = pj.rotation().matrix();
       rel.topRows<2>() = R.transpose() * rel.topRows<2>();
       rel.leftCols<2>() = rel.leftCols<2>() * R;
@@ -1245,6 +1322,7 @@ std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
         adj[static_cast<int>(b)].insert(static_cast<int>(a));
       }
     }
+  }
 
   if (adj.empty()) return {};
 

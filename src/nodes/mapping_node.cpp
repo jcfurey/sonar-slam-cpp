@@ -101,6 +101,14 @@ public:
     map_.min_translation = get_double("min_translation", 0.5);
     map_.min_rotation = get_double("min_rotation", 0.05);
 
+    // Grace window before a keyframe's inputs are declared conclusively lost:
+    // the pairing tolerance (2 ms) is far too tight for that verdict — a
+    // best-effort message delivered milliseconds late would be irreversibly
+    // skipped the moment any newer stamp arrived. Wait until the stream has
+    // advanced this far past the keyframe's stamp before giving up on it.
+    stream_grace_ns_ = static_cast<int64_t>(
+      get_double("stream_grace", 1.0) * 1e9);
+
     // must match slam_node's enu_world so the reconstructed sonar fan lands in
     // the same frame chirality as the trajectory poses
     const bool enu = get_bool("enu_world", true);
@@ -145,6 +153,12 @@ private:
   {
     double x = 0, y = 0, yaw = 0;
     int64_t stamp_ns = 0;
+    // pairing tolerance for this keyframe: the trajectory carries stamps as
+    // float32 SECONDS offsets from the message stamp, whose absolute error
+    // grows with the offset (~1.2e-7 relative) — past ~4 h of mission it
+    // exceeds the fixed 2 ms tolerance and every older keyframe would
+    // spuriously miss its ping/feature and be skipped
+    int64_t tol_ns = kSyncTolNs;
   };
 
   void on_ping(const SonarPing& ping)
@@ -179,7 +193,12 @@ private:
       traj_[k].x = *ix;
       traj_[k].y = *iy;
       traj_[k].yaw = *iyaw;
-      traj_[k].stamp_ns = msg_ns + llround(static_cast<double>(*it) * 1e9);
+      const double off_s = static_cast<double>(*it);
+      traj_[k].stamp_ns = msg_ns + llround(off_s * 1e9);
+      // float32 quantization of the offset (relative eps ~1.19e-7), with a
+      // small safety factor; never below the base 2 ms tolerance
+      traj_[k].tol_ns = std::max<int64_t>(
+        kSyncTolNs, llround(std::abs(off_s) * 1e9 * 2.4e-7));
     }
 
     // add the newest keyframe's tile, then correct every prior keyframe the
@@ -205,10 +224,27 @@ private:
     while (map_.num_keyframes() < static_cast<int>(traj_.size())) {
       const int k = map_.num_keyframes();
       const int64_t s = traj_[k].stamp_ns;
-      auto pit = find_near(ping_buf_, s);
-      auto fit = find_near(feat_buf_, s);
-      if (pit == ping_buf_.end() && !stream_passed(ping_buf_, s)) break;
-      if (fit == feat_buf_.end() && !stream_passed(feat_buf_, s)) break;
+      const int64_t tol = traj_[k].tol_ns;
+      auto pit = find_near(ping_buf_, s, tol);
+      auto fit = find_near(feat_buf_, s, tol);
+      if (pit == ping_buf_.end() && !stream_passed(ping_buf_, s)) {
+        // a dead/misrouted ping stream stalls the whole builder forever with
+        // no output at all — say so instead of publishing an empty map quietly
+        if (ping_buf_.empty())
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+                               "mapping: %d keyframe(s) waiting but no sonar "
+                               "pings received — check sonar/driver + topic",
+                               static_cast<int>(traj_.size()) - k);
+        break;
+      }
+      if (fit == feat_buf_.end() && !stream_passed(feat_buf_, s)) {
+        if (feat_buf_.empty())
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+                               "mapping: %d keyframe(s) waiting but no feature "
+                               "clouds received — check the feature topic",
+                               static_cast<int>(traj_.size()) - k);
+        break;
+      }
       if (pit == ping_buf_.end() || fit == feat_buf_.end()) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 10000,
@@ -226,26 +262,29 @@ private:
   }
 
   // has the (in-order) buffered stream conclusively moved past stamp `key`?
+  // Judged against the GRACE window, not the 2 ms pairing tolerance: a
+  // milliseconds-late best-effort delivery must not be irreversibly skipped.
   template <class M>
-  static bool stream_passed(const M& buf, int64_t key)
+  bool stream_passed(const M& buf, int64_t key) const
   {
-    return !buf.empty() && buf.rbegin()->first > key + kSyncTolNs;
+    return !buf.empty() && buf.rbegin()->first > key + stream_grace_ns_;
   }
 
   template <class M>
-  static typename M::iterator find_near(M& buf, int64_t key)
+  static typename M::iterator find_near(M& buf, int64_t key,
+                                        int64_t tol = kSyncTolNs)
   {
     auto best = buf.end();
-    int64_t bestd = kSyncTolNs + 1;
+    int64_t bestd = tol + 1;
     auto it = buf.lower_bound(key);
     if (it != buf.end()) {
       const int64_t d = std::llabs(it->first - key);
-      if (d <= kSyncTolNs && d < bestd) { best = it; bestd = d; }
+      if (d <= tol && d < bestd) { best = it; bestd = d; }
     }
     if (it != buf.begin()) {
       auto p = std::prev(it);
       const int64_t d = std::llabs(p->first - key);
-      if (d <= kSyncTolNs && d < bestd) { best = p; bestd = d; }
+      if (d <= tol && d < bestd) { best = p; bestd = d; }
     }
     return best;
   }
@@ -285,7 +324,8 @@ private:
     return m;
   }
 
-  static constexpr int64_t kSyncTolNs = 2000000;  // 2 ms
+  static constexpr int64_t kSyncTolNs = 2000000;  // 2 ms (pairing tolerance)
+  int64_t stream_grace_ns_ = 1000000000;  // conclusively-lost verdict window
   static constexpr int kBufMax = 400;
 
   Mapping map_;

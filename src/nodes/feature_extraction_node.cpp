@@ -190,6 +190,24 @@ private:
   {
     std::lock_guard<std::mutex> lock(tilt_mutex_);
     if (tilt_buf_.empty()) return 0.0f;
+    // Clock-domain guard: samples are stamped with the node clock at ARRIVAL
+    // (Float32 carries no stamp) while pings carry the driver clock. If the
+    // two domains disagree (bag replay without use_sim_time, a driver on
+    // device time), the ping stamp sits far outside the buffer and the edge
+    // clamp below would pin every lookup to the OLDEST buffered sample —
+    // strictly worse than the latest-value latch this interpolation replaced.
+    // Fall back to the newest sample (the latch behavior) and say so once in
+    // a while. The same fallback also covers a tilt stream that stalled.
+    constexpr int64_t kDomainSlackNs = 5000000000LL;  // 5 s
+    if (t_ns + kDomainSlackNs < tilt_buf_.front().first ||
+        t_ns > tilt_buf_.back().first + kDomainSlackNs) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 30000,
+        "head-tilt stamps and ping stamps are >5 s apart (different clock "
+        "domains, or a stalled tilt stream); using the latest tilt sample "
+        "instead of interpolating");
+      return tilt_buf_.back().second;
+    }
     if (t_ns <= tilt_buf_.front().first) return tilt_buf_.front().second;
     if (t_ns >= tilt_buf_.back().first) return tilt_buf_.back().second;
     const auto hi = std::lower_bound(

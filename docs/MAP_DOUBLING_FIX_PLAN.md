@@ -136,6 +136,26 @@ and residual SSM drift still contribute.
 - `slam_node.cpp` / `slam_core.{hpp,cpp}`: added the **NSSM rejection histogram** to the status log.
 - `nssm/enable` toggled off for the A/B, then **reverted to true**.
 
+### 2026-07-17 (implemented)
+
+- **3a IMPLEMENTED** — `slam_core.cpp initialize_nonsequential_scan_matching`:
+  the init yaw bound is now `±min(5·rotation_std, nssm/max_yaw_vs_compass)`;
+  translation bounds unchanged. Ready for the §5 replay.
+- **3b IMPLEMENTED** — new `keyframe_min_points` (slam.yaml, default 10 in the
+  repo config; 0 disables): near-empty clouds no longer become keyframes.
+- Related mapping-side changes that affect the §5 metrics: the tile re-render
+  thresholds were exposed and tightened (`min_translation 0.5 → 0.2`,
+  `min_rotation 0.05 → 0.02` in mapping.yaml) — at the old values the mosaic
+  silently absorbed sub-threshold graph corrections, so judge the doubling
+  metric on the SLAM cloud AND expect the grids to track corrections more
+  closely now; `free_tile_min_points: 5` (judged on the FILTERED cloud) stops
+  CFAR-whiff keyframes stamping the all-free wedge over walls.
+- Post-loop verification hardening in the same pass: windowed (W=20) yaw-RMS
+  instead of global (a localized fold no longer dilutes away with mission
+  length), direction-sensitive body-frame chain-tear metric (catches link
+  reversals the length-only form missed), and quarantine of reverted closures
+  (a rejected clique can neither re-insert nor vote in PCM again).
+
 ## 8. Open / follow-up
 
 - If 3a under-delivers, revisit SSM constraint weighting (sampled ICP covariance vs

@@ -250,6 +250,12 @@ struct ICPResult
   bool has_cov = false;
   Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
   bool inserted = false;
+  // quarantined by a post-loop verification revert: this closure (as part of
+  // its clique) demonstrably bent the graph, so it must not be re-inserted or
+  // vote in PCM cliques again — without this the same clique re-forms on the
+  // next candidate, re-fails verify, and triggers an O(map) estimator rebuild
+  // every NSSM round until the queue window slides past it.
+  bool rejected = false;
   int n_sample_transforms = 0;
 };
 
