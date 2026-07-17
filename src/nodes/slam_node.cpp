@@ -294,8 +294,14 @@ private:
     else
       frame->status = slam_.is_keyframe(*frame);
     // 3b: near-empty clouds don't carry enough structure to register — keep
-    // them off the graph (DR odometry bridges the gap)
-    if (frame->status && slam_.keyframe_min_points > 0 &&
+    // them off the graph (DR odometry bridges the gap). NEVER gate the prior
+    // (keyframes.empty()): is_keyframe() makes the first frame the graph anchor
+    // regardless of density, and without it publish_all() bails, so map->odom
+    // is never broadcast until a >=min_points frame arrives (a cold-start
+    // "Could not transform map to odom" when the run opens on a sparse/
+    // head-swept stretch). The gate is for empty INTERMEDIATE keyframes only.
+    if (frame->status && !slam_.keyframes.empty() &&
+        slam_.keyframe_min_points > 0 &&
         points.rows() < slam_.keyframe_min_points)
       frame->status = false;
 
