@@ -143,6 +143,11 @@ public:
     slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
     slam_.post_loop_max_translation_err =
       get_double("post_loop_max_translation_err", 1.0);
+    // loop-factor robust kernel (default OFF — see slam_core.hpp: DCS muted
+    // exactly the meaningful corrections; verify+revert is the protection)
+    slam_.nssm_use_dcs = get_bool("nssm/use_dcs", false);
+    slam_.nssm_dcs_phi = get_double("nssm/dcs_phi", 1.0);
+    slam_.loop_extra_iterations = get_int("loop_extra_iterations", 3);
 
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");
@@ -193,6 +198,15 @@ public:
         "odometry stalled or lagging beyond feature_odom_sync_max_delay",
         dropped);
     });
+    sync_->set_nomatch_callback([this](std::size_t) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "feature frames are being passed by the odometry stream with no "
+        "sample within feature_odom_sync_max_delay — sonar and DVL driver "
+        "clocks likely disagree (cross-device stamp offset). Every keyframe "
+        "would carry a stale pose; measure the offset and set "
+        "sonar.stamp_offset / dvl.stamp_offset.");
+    });
 
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       SONAR_FEATURE_TOPIC, 20, [this](const sensor_msgs::msg::PointCloud2& msg) {
@@ -227,9 +241,15 @@ public:
           // mutex, so this timer never contends with the SLAM callback
           std::lock_guard<std::mutex> lock(viz_mutex_);
           if (last_cloud_msg_.data.empty()) return;
-          if ((now() - last_cloud_pub_).seconds() < cloud_republish_period_)
-            return;
-          last_cloud_msg_.header.stamp = now();
+          // negative elapsed = the node clock jumped backwards (bag loop
+          // under sim time): treat as expired instead of suppressing the
+          // republish for the entire looped pass
+          const double since = (now() - last_cloud_pub_).seconds();
+          if (since >= 0.0 && since < cloud_republish_period_) return;
+          // KEEP the cloud's original (data-domain) stamp: restamping with
+          // now() put wall time on bag-time data, and TF-timed consumers
+          // (rviz, STVL) reject a cloud whose stamp has no transform. The
+          // cloud is latched state, not a new observation.
           cloud_pub_->publish(last_cloud_msg_);
           last_cloud_pub_ = now();
         });
@@ -367,8 +387,10 @@ private:
       // correction the O(map) rebuild + octree downsample otherwise stalls
       // this callback for the whole sweep.
       const auto now = this->now();
-      if (viz_min_period_ <= 0.0 ||
-          (now - last_viz_publish_).seconds() >= viz_min_period_) {
+      const double since = (now - last_viz_publish_).seconds();
+      // since < 0 = clock jumped backwards (bag loop): rebuild rather than
+      // suppress viz for the whole looped pass
+      if (viz_min_period_ <= 0.0 || since < 0.0 || since >= viz_min_period_) {
         if (schedule_viz_rebuild()) last_viz_publish_ = now;
       }
     }

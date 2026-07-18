@@ -51,6 +51,12 @@
       driver: rti_dvl
       topic: /rti/body_velocity/raw
       # require_valid: true    # dvl_standard/dvl_a50: drop invalid/water-track
+      # stamp_offset: 0.0      # s, added to incoming stamps. Every sensor
+      #                        # (dvl/imu/gyro/depth/sonar) accepts one: the
+      #                        # drivers stamp from independent device clocks,
+      #                        # and a constant cross-device offset biases every
+      #                        # sync pairing (or starves it past the slop) —
+      #                        # the no-match ERROR log names the symptom
     depth:
       # bar30 (vendor) | fluid_pressure (sensor_msgs/FluidPressure) |
       # odom (nav_msgs/Odometry z) | float (std_msgs/Float64, m positive-down)

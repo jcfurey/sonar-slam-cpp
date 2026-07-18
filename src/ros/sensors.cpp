@@ -79,6 +79,33 @@ bool get_bool_param(rclcpp::Node* node, const std::string& name,
   throw std::invalid_argument("Unknown " + kind + " driver '" + driver + "'");
 }
 
+// Per-sensor stamp offset (<kind>.stamp_offset, seconds, default 0): the
+// DVL/IMU/gyro/depth/sonar drivers stamp from INDEPENDENT device clocks with
+// no normalization point anywhere in the stack, and every synchronizer pairs
+// on those stamps. A constant cross-device offset delta biases every pairing
+// by delta (position error v*delta, heading error omega*delta baked into
+// EVERY keyframe) or, past the sync slop, silently starves the consumer.
+// Measure the offset (e.g. median stamp difference of concurrently-arriving
+// messages) and correct it here, at the single adapter choke point.
+template <typename Reading>
+std::function<void(const Reading&)> with_stamp_offset(
+  rclcpp::Node* node, const std::string& kind,
+  std::function<void(const Reading&)> cb)
+{
+  const double off = get_double_param(node, kind + ".stamp_offset", 0.0);
+  if (off == 0.0) return cb;
+  const int64_t off_ns = static_cast<int64_t>(off * 1e9);
+  return [cb = std::move(cb), off_ns](const Reading& r_in) {
+    Reading r = r_in;
+    int64_t t = static_cast<int64_t>(r.stamp.sec) * 1000000000LL +
+                static_cast<int64_t>(r.stamp.nanosec) + off_ns;
+    if (t < 0) t = 0;
+    r.stamp.sec = static_cast<int32_t>(t / 1000000000LL);
+    r.stamp.nanosec = static_cast<uint32_t>(t % 1000000000LL);
+    cb(r);
+  };
+}
+
 // A vendor driver was requested but its message package was not on the build.
 [[noreturn]] void driver_not_compiled(const std::string& kind,
                                       const std::string& driver,
@@ -155,6 +182,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_dvl(
     if (!r.velocity.allFinite()) return;
     inner(r);
   };
+  cb = with_stamp_offset(node, "dvl", std::move(cb));
 
   if (driver == "rti_dvl") {
 #ifdef HAVE_RTI_DVL
@@ -253,6 +281,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_depth(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const DepthReading&)> cb)
 {
+  cb = with_stamp_offset(node, "depth", std::move(cb));
   if (driver == "bar30") {
 #ifdef HAVE_BAR30_DEPTH
     return node->create_subscription<bar30_depth::msg::Depth>(
@@ -315,6 +344,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_gyro(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const GyroReading&)> cb)
 {
+  cb = with_stamp_offset(node, "gyro", std::move(cb));
   if (driver == "kvh_gyro") {
 #ifdef HAVE_KVH_GYRO
     return node->create_subscription<kvh_gyro::msg::Gyro>(
@@ -347,6 +377,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_imu(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const ImuReading&)> cb)
 {
+  cb = with_stamp_offset(node, "imu", std::move(cb));
   const bool enu =
     driver == "enu" || driver == "3dm_gx5" || driver == "microstrain";
   // 'ned' is an AHRS already reporting the pipeline's z-down orientation (no
@@ -387,6 +418,7 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const SonarPing&)> cb)
 {
+  cb = with_stamp_offset(node, "sonar", std::move(cb));
   if (driver == "oculus_compressed") {
 #ifdef HAVE_SONAR_OCULUS
     return node->create_subscription<sonar_oculus::msg::OculusPing>(

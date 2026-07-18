@@ -85,6 +85,12 @@
       # absolute compass gate AND (fix 3a) the clamp on the global-init yaw
       # search window — candidates beyond this band can only be rejected
       max_yaw_vs_compass: 0.15   # rad (~8.6 deg, above compass noise)
+      # DCS robust kernel on loop factors — default OFF: it scaled a genuine
+      # closure correcting drift D to ~2*phi/(D/sigma)^2 of its weight (0.5%
+      # at D=1 m, sigma=5 cm), muting exactly the corrections SLAM exists to
+      # make. Outlier protection is the post-loop verify + revert + quarantine.
+      use_dcs: false
+      dcs_phi: 1.0
 
     # the PCM params for rejecting outlier loop closures
     pcm_queue_size: 5         # the sliding window size for PCM
@@ -95,3 +101,7 @@
     # tears a consecutive keyframe link vs its DR link (0 disables)
     post_loop_max_yaw_rms: 0.15        # rad
     post_loop_max_translation_err: 1.0 # m
+    # extra ISAM2 iterations after inserting loop factors, BEFORE the checks
+    # above judge the graph (one Gauss-Newton pass under-converges a large
+    # correction and the transient would read as a fold)
+    loop_extra_iterations: 3

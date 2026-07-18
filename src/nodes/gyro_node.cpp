@@ -71,8 +71,27 @@ private:
     const double delta_pitch = arr[1];
     double delta_roll = arr[2];
 
-    // subtract the rotation of the earth
-    delta_roll += earth_rate_ / sensor_rate_;
+    // Subtract the rotation of the earth over the MEASURED sample interval.
+    // The nominal 1/sensor_rate made the compensation scale with message
+    // count, not elapsed time (wrong under dropped best-effort samples or a
+    // rate mismatch); dropped DELTA-ANGLE samples themselves are unrecoverable
+    // — warn when a gap implies losses.
+    double dt = 1.0 / sensor_rate_;
+    const double t_now = to_sec(reading.stamp);
+    if (last_stamp_ > 0.0) {
+      const double measured = t_now - last_stamp_;
+      if (measured >= 0.0 && measured < 1.0) {
+        dt = measured;
+        if (measured > 2.5 / sensor_rate_)
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "gyro sample gap %.1f ms (nominal %.1f ms): delta angles were "
+            "dropped and their rotation is lost",
+            measured * 1e3, 1e3 / sensor_rate_);
+      }
+    }
+    last_stamp_ = t_now;
+    delta_roll += earth_rate_ * dt;
 
     pitch_ += delta_pitch;
     yaw_ += delta_yaw;
@@ -92,6 +111,7 @@ private:
   Eigen::Matrix3d offset_matrix_ = Eigen::Matrix3d::Identity();
   double earth_rate_ = 0.0;
   double sensor_rate_ = 250.0;
+  double last_stamp_ = 0.0;
   // Start attitude: 90 deg roll expressed in RADIANS (pi/2). gyro.py wrote the
   // literal 90. and passed it straight to Rot3.Ypr, which expects radians — a
   // unit bug (90 rad). Tracked in radians throughout, matching the radian delta

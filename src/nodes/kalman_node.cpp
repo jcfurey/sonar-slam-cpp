@@ -184,9 +184,23 @@ private:
     kalman_correct(predicted_x, predicted_P, euler_angle, H_imu_, R_imu_,
                    state_vector_, cov_matrix_);
 
-    // use the filtered velocity to update x/y
-    const double trans_x = state_vector_[6] * dt_imu_;
-    const double trans_y = state_vector_[7] * dt_imu_;
+    // Use the filtered velocity to update x/y over the MEASURED stamp dt.
+    // The nominal dt_imu_ made travelled distance scale with message COUNT:
+    // a 1% rate mismatch (or best-effort QoS drops under load) was a 1% scale
+    // error on the whole trajectory. A_imu_ keeps the configured nominal dt
+    // (its dt entries are config data), where the residual error is
+    // second-order; the position integration here is where it accumulates
+    // linearly. Clamped: a gap (dropout/bag jump) must not integrate stale
+    // velocity into a jump; negative dt (bag loop) re-anchors the timebase.
+    double dt = dt_imu_;
+    const double t_now = to_sec(imu.stamp);
+    if (last_imu_stamp_ > 0.0) {
+      const double measured = t_now - last_imu_stamp_;
+      if (measured >= 0.0 && measured < 10.0 * dt_imu_) dt = measured;
+    }
+    last_imu_stamp_ = t_now;
+    const double trans_x = state_vector_[6] * dt;
+    const double trans_y = state_vector_[7] * dt;
     const gtsam::Point2 local_point(trans_x, trans_y);
 
     gtsam::Rot3 R;
@@ -222,6 +236,7 @@ private:
 
   Vec12 state_vector_ = Vec12::Zero();
   Mat12 cov_matrix_ = Mat12::Zero();
+  double last_imu_stamp_ = 0.0;
   Mat12 Q_ = Mat12::Zero(), A_imu_ = Mat12::Identity();
   Eigen::Matrix3d R_dvl_, R_imu_, R_gyro_, R_depth_;
   Mat3x12 H_dvl_, H_imu_, H_gyro_, H_depth_;

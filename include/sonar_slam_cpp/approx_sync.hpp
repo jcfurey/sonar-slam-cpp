@@ -95,9 +95,22 @@ public:
     on_overflow_ = std::move(cb);
   }
 
+  // Fires (mutex held) once per primary popped WITHOUT a match: the secondary
+  // stream advanced past it but no sample lay within slop — the signature of a
+  // constant cross-device stamp offset larger than slop, which otherwise
+  // starves the consumer with no symptom at all.
+  void set_nomatch_callback(std::function<void(std::size_t)> cb)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_nomatch_ = std::move(cb);
+  }
+
   void add_primary(double t, const A& a)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // time jumped backwards (bag loop / restart): stale large stamps would
+    // block try_emit's pass-gate for the whole looped pass — restart clean
+    if (!qa_.empty() && t < qa_.front().t) { qa_.clear(); qb_.clear(); }
     qa_.push_back({t, a});
     if (qa_.size() > queue_size_) {
       const std::size_t dropped = qa_.size() - queue_size_;
@@ -110,6 +123,7 @@ public:
   void add_secondary(double t, const B& b)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!qb_.empty() && t < qb_.front().t) qb_.clear();
     qb_.push_back({t, b});
     const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
     detail::trim_secondary(qb_, keep_after, queue_size_, kMaxSecondary);
@@ -135,6 +149,11 @@ private:
         // which consumes a matched message — here we prefer pairing every
         // primary (each a keyframe candidate) over one-shot secondary use.
         detail::drop_older(qb_, match->t - slop_);
+      } else if (on_nomatch_) {
+        // the secondary passed this primary with nothing inside slop: a
+        // cross-device stamp offset > slop reaches steady state HERE, with
+        // zero emitted pairs — surface it
+        on_nomatch_(1);
       }
       qa_.pop_front();
     }
@@ -144,6 +163,7 @@ private:
   double slop_;
   Callback cb_;
   std::function<void(std::size_t)> on_overflow_;
+  std::function<void(std::size_t)> on_nomatch_;
   std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;
@@ -169,9 +189,23 @@ public:
     on_overflow_ = std::move(cb);
   }
 
+  // Fires (mutex held) once per primary popped WITHOUT a full match — the
+  // cross-device stamp-offset starvation signature (see ApproxSync2).
+  void set_nomatch_callback(std::function<void(std::size_t)> cb)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_nomatch_ = std::move(cb);
+  }
+
   void add_primary(double t, const A& a)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // backward time jump (bag loop / restart): restart clean, see ApproxSync2
+    if (!qa_.empty() && t < qa_.front().t) {
+      qa_.clear();
+      qb_.clear();
+      qc_.clear();
+    }
     qa_.push_back({t, a});
     if (qa_.size() > queue_size_) {
       const std::size_t dropped = qa_.size() - queue_size_;
@@ -184,6 +218,7 @@ public:
   void add_secondary_b(double t, const B& b)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!qb_.empty() && t < qb_.front().t) qb_.clear();
     qb_.push_back({t, b});
     const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
     detail::trim_secondary(qb_, keep_after, queue_size_, kMaxSecondary);
@@ -193,6 +228,7 @@ public:
   void add_secondary_c(double t, const C& c)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!qc_.empty() && t < qc_.front().t) qc_.clear();
     qc_.push_back({t, c});
     const double keep_after = (qa_.empty() ? t : qa_.front().t) - slop_;
     detail::trim_secondary(qc_, keep_after, queue_size_, kMaxSecondary);
@@ -214,6 +250,8 @@ private:
         cb_(head.value, mb->value, mc->value);
         detail::drop_older(qb_, mb->t - slop_);
         detail::drop_older(qc_, mc->t - slop_);
+      } else if (on_nomatch_) {
+        on_nomatch_(1);
       }
       qa_.pop_front();
     }
@@ -223,6 +261,7 @@ private:
   double slop_;
   Callback cb_;
   std::function<void(std::size_t)> on_overflow_;
+  std::function<void(std::size_t)> on_nomatch_;
   std::mutex mutex_;
   std::deque<detail::Stamped<A>> qa_;
   std::deque<detail::Stamped<B>> qb_;

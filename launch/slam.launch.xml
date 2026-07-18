@@ -4,6 +4,12 @@
      world->map flip. Params files are drop-in compatible with bruce_slam. -->
 <launch>
   <arg name="enable_slam" default="true"/>
+  <!-- MUST be true for bag replay (play the bag with the clock option so
+       /clock is published): every node clock then follows bag time, keeping
+       arrival-stamped data (head tilt), republish stamps, and TF lookups in
+       ONE time domain. Without it, node clocks run on wall time while all
+       data/TF sit at bag time. See the README replay section. -->
+  <arg name="use_sim_time" default="false"/>
   <arg name="kalman_dead_reckoning" default="false"/>
   <!-- Omit the FOG gyro integration node. Set false for a payload with no
        fibre-optic gyro (e.g. the Deep Trekker Revolution). MUST match the
@@ -29,11 +35,13 @@
   <group unless="$(var kalman_dead_reckoning)">
     <node pkg="sonar_slam_cpp" exec="gyro_node" name="gyro_fusion"
           namespace="bruce/slam" output="screen" if="$(var enable_gyro)">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
       <param from="$(var config_dir)/gyro.yaml"/>
       <param from="$(var payload_config)"/>
     </node>
     <node pkg="sonar_slam_cpp" exec="dead_reckoning_node" name="localization"
           namespace="bruce/slam" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
       <param from="$(var config_dir)/dead_reckoning.yaml"/>
       <param from="$(var payload_config)"/>
     </node>
@@ -42,6 +50,7 @@
   <group if="$(var kalman_dead_reckoning)">
     <node pkg="sonar_slam_cpp" exec="kalman_node" name="kalman"
           namespace="bruce/slam" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
       <param from="$(var config_dir)/kalman.yaml"/>
       <param from="$(var payload_config)"/>
     </node>
@@ -49,12 +58,14 @@
 
   <node pkg="sonar_slam_cpp" exec="feature_extraction_node"
         name="feature_extraction" namespace="bruce/slam" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var config_dir)/feature.yaml"/>
     <param from="$(var payload_config)"/>
   </node>
 
   <node pkg="sonar_slam_cpp" exec="slam_node" name="slam" namespace="bruce/slam"
         output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var config_dir)/slam.yaml"/>
     <!-- slam_node also subscribes to the sonar (for the fan geometry), so it
          needs the payload's sonar driver/topic like every other node -->
@@ -65,6 +76,7 @@
 
   <node pkg="sonar_slam_cpp" exec="mapping_node" name="mapping"
         namespace="bruce/slam" output="screen" if="$(var enable_mapping)">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var config_dir)/mapping.yaml"/>
     <!-- mapping subscribes to the sonar for the ping image, so it needs the
          payload's sonar driver/topic like feature_extraction and slam -->

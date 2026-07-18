@@ -136,6 +136,23 @@ ros2 launch sonar_slam_cpp slam.launch.xml \
 
 The full driver matrix and how to add a payload are in `docs/PAYLOADS.md`.
 
+## Bag replay — time discipline (required)
+
+Replay MUST run in bag time on every node, or arrival-stamped data, republish
+stamps, and TF lookups split across two clock domains:
+
+```bash
+ros2 bag play <bag> --clock
+ros2 launch sonar_slam_cpp slam.launch.xml use_sim_time:=true [...]
+```
+
+The sensor drivers stamp from independent device clocks. If the sync layers
+report no-match starvation (an ERROR naming `stamp_offset`), measure the
+constant offset between the streams and set the per-sensor
+`<sensor>.stamp_offset` parameter (seconds) — a constant offset δ otherwise
+biases every keyframe pose by v·δ / ω·δ, silently. See
+`docs/SLAM_EFFECTIVENESS_AUDIT.md`.
+
 ## Run
 
 ```bash

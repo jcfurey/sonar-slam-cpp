@@ -63,6 +63,19 @@ public:
   // beyond compass noise are bogus by construction in this anchored frame.
   double nssm_max_sigma = 0.5;       // max sqrt(largest translation eigenvalue), m
   double nssm_max_anisotropy = 8.0;  // max sigma_max / sigma_min
+  // Robust kernel on loop factors. Default OFF: DCS scales a factor's weight
+  // by 2*phi/(phi+chi2), and a GENUINE closure correcting drift D with ICP
+  // sigma s starts at chi2=(D/s)^2 — for D=1 m, s=5 cm that is 400, i.e. 0.5%
+  // weight: exactly the corrections SLAM exists to make are the ones muted.
+  // Outlier protection is the optimize-then-verify revert + quarantine, which
+  // judges the ACTUAL optimized graph instead of pre-shrinking every
+  // correction. Set true (with nssm_dcs_phi) to restore the old behavior.
+  bool nssm_use_dcs = false;
+  double nssm_dcs_phi = 1.0;
+  // extra ISAM2 iterations after inserting loop factors, BEFORE the post-loop
+  // verification: one Gauss-Newton pass under-converges a large correction,
+  // and judging that transient state reverts (and quarantines) genuine loops
+  int loop_extra_iterations = 3;
   // ABSOLUTE yaw gate against the compass (kills discrete rotational
   // aliasing — e.g. a near-square pool aliases at 90°, which ICP matches
   // confidently and symmetric pairs pass PCM): the closure's relative yaw

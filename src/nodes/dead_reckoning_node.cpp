@@ -82,6 +82,7 @@ public:
           callback_with_gyro(imu, dvl, gyro);
         });
       sync3_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
+      sync3_->set_nomatch_callback([this](std::size_t n) { warn_nomatch(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -107,6 +108,7 @@ public:
           callback(imu, dvl);
         });
       sync2_imu_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
+      sync2_imu_->set_nomatch_callback([this](std::size_t n) { warn_nomatch(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -126,6 +128,7 @@ public:
           callback_gyro_only(dvl, gyro);
         });
       sync2_gyro_->set_overflow_callback([this](std::size_t n) { warn_dropped(n); });
+      sync2_gyro_->set_nomatch_callback([this](std::size_t n) { warn_nomatch(n); });
       dvl_sub_ = subscribe_dvl(this, dvl_driver, dvl_topic, rclcpp::SensorDataQoS(rclcpp::KeepLast(50)),
                                [this](const DvlReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
@@ -209,6 +212,21 @@ private:
       "Localization dropped %zu DVL reading(s): an IMU/gyro stream is stalling; "
       "dead reckoning will re-anchor on recovery.",
       n);
+  }
+
+  // DVL primaries passed by the secondaries with NOTHING inside the 0.1 s
+  // slop: the cross-device stamp-offset signature (DVL vs IMU/gyro driver
+  // clocks disagree by more than slop). Distinct from an outage — data flows
+  // on every stream, yet zero pairs ever emit and localization stays mute.
+  void warn_nomatch(std::size_t n)
+  {
+    (void)n;
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "Localization DVL readings are being passed by the IMU/gyro streams "
+      "with no sample within the 0.1 s sync slop — the sensor driver clocks "
+      "likely disagree (cross-device stamp offset). Measure the offset and "
+      "set the <sensor>.stamp_offset parameter(s).");
   }
 
   // adapter-normalized quaternion + mounting rotation (imu_rotation in Python)

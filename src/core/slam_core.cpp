@@ -21,6 +21,22 @@ namespace {
 
 inline gtsam::Key X(int i) { return gtsam::Symbol('x', i); }
 
+// ISAM2 tuned for a pose graph that must absorb loop-closure corrections.
+// The GTSAM defaults (relinearizeThreshold 0.1, relinearizeSkip 10) are batch
+// throughput settings: they let a correction sit un-relinearized for up to 10
+// updates and freeze any variable whose delta stays under 0.1 — a 1 m / few-
+// degree correction then "staircases" across many keyframes, and the post-
+// loop verification (which runs right after the update) judges that
+// under-converged transient. A ~100-1000 keyframe planar graph relinearizes
+// cheaply; favor correctness.
+gtsam::ISAM2Params make_isam2_params()
+{
+  gtsam::ISAM2Params p;
+  p.relinearizeThreshold = 0.01;
+  p.relinearizeSkip = 1;
+  return p;
+}
+
 // SE3 graph chart (FULL_3D_ROADMAP.md Phase 4): states are HORIZON poses
 // (yaw-only rotation, live z). Sonar ICP observes (x, y, yaw); depth is an
 // absolute measurement; roll/pitch are 0 BY CONSTRUCTION in this chart (the
@@ -61,7 +77,7 @@ gtsam::Pose3 lift_planar(const gtsam::Pose2& p)
 
 }  // namespace
 
-Slam::Slam()
+Slam::Slam() : isam_(make_isam2_params())
 {
   // SSM defaults (slam.py __init__)
   ssm_params.initialization = true;
@@ -309,6 +325,10 @@ bool Slam::is_keyframe(const Keyframe& frame) const
   if (keyframes.empty()) return true;
 
   const double duration = to_sec(frame.time) - to_sec(current_keyframe()->time);
+  // negative = time jumped backwards (bag loop / restart): without this the
+  // gate returns false against the last pre-jump keyframe until time catches
+  // up — zero keyframes for the whole looped pass
+  if (duration < 0.0) return true;
   if (duration < keyframe_duration) return false;
 
   const gtsam::Pose2 dr_odom = keyframes.back()->dr_pose.between(frame.dr_pose);
@@ -870,17 +890,23 @@ bool Slam::add_nonsequential_scan_matching()
       // re-insert a closure that already demonstrably bent the graph
       if (loop.inserted || loop.rejected) continue;
 
-      // Robust kernel on loop factors (rtabmap/Vertigo-style damage
-      // limitation): DCS (Agarwal et al., dynamic covariance scaling)
-      // down-weights any closure whose residual grows during optimization —
-      // a bad closure that fools every gate loses the argument with the
-      // odometry chain instead of winning it.
+      // Loop-factor noise model. DCS (Agarwal et al.) is OPT-IN
+      // (nssm_use_dcs): it scales weight by 2*phi/(phi+chi2), and a genuine
+      // closure correcting drift D starts at chi2=(D/sigma)^2 — large BY
+      // DESIGN — so with cm-scale ICP sigmas it muted exactly the meaningful
+      // corrections (0.5% weight at D=1 m, sigma=5 cm) while corrections
+      // small enough to pass were invisible. Outlier damage-limitation is the
+      // optimize-then-verify revert + quarantine below, which judges the real
+      // optimized graph instead of pre-shrinking every correction.
       const gtsam::SharedNoiseModel base =
         loop.has_cov
           ? gtsam::noiseModel::Gaussian::Covariance(embed_planar_cov(loop.cov))
           : icp_odom_model_;
-      const gtsam::SharedNoiseModel model = gtsam::noiseModel::Robust::Create(
-        gtsam::noiseModel::mEstimator::DCS::Create(1.0), base);
+      const gtsam::SharedNoiseModel model =
+        nssm_use_dcs
+          ? gtsam::noiseModel::Robust::Create(
+              gtsam::noiseModel::mEstimator::DCS::Create(nssm_dcs_phi), base)
+          : base;
       graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         X(loop.target_key), X(loop.source_key),
         lift_planar(loop.estimated_transform), model));
@@ -987,6 +1013,12 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   values_.clear();
 
   try {
+  // Converge BEFORE judging: a loop-closure round needs more than the single
+  // Gauss-Newton pass isam_.update() performs — verifying (yaw-RMS/chain-tear)
+  // against the half-relaxed transient would revert and QUARANTINE genuine
+  // closures. A few extra iterations are cheap and only run on loop rounds.
+  if (!pending_loops_.empty())
+    for (int i = 0; i < loop_extra_iterations; ++i) isam_.update();
   const gtsam::Values values = isam_.calculateEstimate();
   // Extract the optimized poses sequentially (gtsam map lookups; throws
   // loudly on a missing key, and a throw must not originate inside an OpenMP
@@ -1206,7 +1238,7 @@ void Slam::rebuild_isam()
   // the last optimized keyframe poses. These factors solved together before,
   // so this update is expected to succeed; if it somehow does not, keep the
   // fresh estimator and report — the next frame retries against it.
-  isam_ = gtsam::ISAM2();
+  isam_ = gtsam::ISAM2(make_isam2_params());
   gtsam::Values estimates;
   for (std::size_t i = 0; i < keyframes.size(); ++i)
     estimates.insert(X(static_cast<int>(i)), keyframes[i]->horizon_pose3());
