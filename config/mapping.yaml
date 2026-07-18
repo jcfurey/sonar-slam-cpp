@@ -6,6 +6,16 @@
 # The "/**" wildcard applies these to whatever node name loads the file.
 /**:
   ros__parameters:
+    # ---- georeferenced export (see README "Georeferenced deliverables") ----
+    # Survey datum [latitude deg, longitude deg, bearing deg]: bearing is the
+    # compass bearing (deg clockwise from true north) of the map +x axis —
+    # the vehicle's initial heading, since dead reckoning zeroes yaw on the
+    # first attitude sample. With a datum set, the /mapping/export_map
+    # service (std_srvs/Trigger) writes <export_prefix>_occupancy.png /
+    # _intensity.png with UTM world files (.pgw + .prj; QGIS/ArcGIS load
+    # them as georeferenced rasters) and _trajectory.geojson (WGS84).
+    # datum: [45.523000, -122.676000, 90.0]
+    export_prefix: /tmp/sonar_slam_survey
     # initial map extent + growth (the grid grows automatically as the survey
     # expands past it — these are just the starting allocation)
     origin: [-50.0, -50.0]   # world (x, y) of the grid corner (m)

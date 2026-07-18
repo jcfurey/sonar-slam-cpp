@@ -162,6 +162,27 @@ public:
   // verification runs. Returns false when there is no keyframe yet or the
   // solve failed (last_error()).
   bool add_manual_correction(const gtsam::Pose2& map_pose);
+  // ------------------------------------------------- persistence + fixes
+  // Serialize/restore the keyframe map (binary; poses + clouds). load_map
+  // must run on an EMPTY session: it restores the keyframes, rebuilds an
+  // anchored chain of tight between factors holding the saved (already
+  // optimized) shape, and arms relocalization — the next dense frame is
+  // globally scan-matched against the loaded map (relocalize()) before
+  // normal operation resumes. Loop factors are not serialized; their effect
+  // is baked into the saved poses.
+  bool save_map(const std::string& path);
+  bool load_map(const std::string& path);
+  bool relocalize(const KeyframePtr& frame);
+  bool awaiting_relocalization() const { return awaiting_relocalization_; }
+  int loaded_keyframes() const { return loaded_key_count_; }
+  // min fraction of a frame's points that must land on the loaded map for a
+  // relocalization to be accepted
+  double relocalize_min_overlap = 0.5;
+  // Absolute position fix (USBL/LBL) on keyframe `key`: x/y at sigma_xy,
+  // heading and everything else wide. Runs a normal (non-hard) update —
+  // acoustic fixes are frequent and incremental, unlike operator input.
+  bool add_position_prior(int key, double x, double y, double sigma_xy);
+  int position_priors_applied = 0;
   // Remove the MOST RECENT manual-correction prior from the committed graph
   // and re-solve, relaxing the trajectory back. Stack semantics: call again
   // to peel earlier corrections. Returns false (last_error()) when there is
@@ -252,6 +273,9 @@ private:
   // of FAILED rounds, which are never recorded here, and undo removal
   // null-holes the graph in place instead of shifting indices.
   std::vector<std::size_t> manual_prior_indices_;
+  // map persistence / relocalization state (see load_map)
+  int loaded_key_count_ = 0;
+  bool awaiting_relocalization_ = false;
   std::string last_error_;
 
   // 6D models over the Pose3 tangent (rx, ry, rz, tx, ty, tz); see configure()

@@ -34,6 +34,10 @@
       topic: /dvl/data
       require_valid: true
     dvl_max_velocity: 0.5
+    # require_valid drops lost-lock readings, which makes short DVL outages
+    # routine on this vehicle — bridge them on last velocity + live AHRS
+    # attitude instead of freezing the estimate (see dead_reckoning.yaml)
+    dvl_coast: 3.0
 
     # Depth — internal pressure sensor exposed as sensor_msgs/FluidPressure
     # (absolute Pascals). depth = (P - atmospheric_pressure) / (rho * g).

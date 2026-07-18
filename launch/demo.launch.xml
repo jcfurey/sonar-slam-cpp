@@ -1,0 +1,21 @@
+<!-- Self-contained demo: synthetic pool simulator + the full standard
+     pipeline + RViz. No hardware, bags or vendor packages required.
+       ros2 launch sonar_slam_cpp demo.launch.xml
+     Watch the map build as the vehicle laps the pool; DR carries a small
+     DVL bias, so loop closures visibly pull the trajectory back. Try the
+     RViz "2D Pose Estimate" button for a hand correction, and
+       ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+     to take it back. -->
+<launch>
+  <arg name="rviz" default="true"/>
+  <include file="$(find-pkg-share sonar_slam_cpp)/launch/slam.launch.xml">
+    <arg name="payload_config"
+         value="$(find-pkg-share sonar_slam_cpp)/config/payloads/sim_demo.yaml"/>
+    <arg name="enable_gyro" value="false"/>
+  </include>
+  <node pkg="sonar_slam_cpp" exec="sim_payload" name="sim_payload"
+        output="screen"/>
+  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen"
+        args="-d $(find-pkg-share sonar_slam_cpp)/config/demo.rviz"
+        if="$(var rviz)"/>
+</launch>

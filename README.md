@@ -1,9 +1,26 @@
 # sonar_slam_cpp
 
+[![ci](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml)
+
 All-C++/CUDA port of the `bruce_slam` sonar SLAM stack — zero Python anywhere
 (nodes are `rclcpp`, the launch file is XML). Every GPU kernel has a CPU twin
 selected at runtime, so the same binary runs on the Jetson/desktop GPU or on a
 CPU-only machine with identical behavior.
+
+## Quick demo (no hardware, no bags)
+
+```bash
+ros2 launch sonar_slam_cpp demo.launch.xml
+```
+
+A synthetic pool simulator (`sim_payload`) drives the full standard pipeline
+— CFAR feature extraction, dead reckoning, scan matching, loop closures,
+mapping — with RViz up. The simulated DVL carries a small bias, so dead
+reckoning drifts visibly and loop closures pull the trajectory back. Use the
+RViz **2D Pose Estimate** button for a live hand correction;
+`ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger` takes
+it back. The same synthetic world backs the end-to-end pipeline test that CI
+runs on every commit (`test/test_pipeline_e2e.cpp`).
 
 ## Drop-in compatibility
 
@@ -25,6 +42,8 @@ against the Python SLAM node or vice versa.
 | `mapping_node` | keyframe-anchored, loop-closure-correctable occupancy grid + intensity/backscatter mosaic | `mapping.py` |
 | `parity_check` | CPU/GPU parity + perf self-test | — |
 | `map_metrics` | map-quality metrics (wall thickness, doubled-wall fraction) over the slam cloud | — |
+| `stamp_probe` | cross-device stamp-offset measurement (prints the `stamp_offset` lines to set) | — |
+| `sim_payload` | synthetic pool payload simulator for `demo.launch.xml` | — |
 
 `mapping_node` consumes the latched `/bruce/slam/slam/traj` (whole optimized
 trajectory) plus the ping + feature cloud, and re-renders its 2D map products
@@ -148,11 +167,19 @@ ros2 launch sonar_slam_cpp slam.launch.xml use_sim_time:=true [...]
 ```
 
 The sensor drivers stamp from independent device clocks. If the sync layers
-report no-match starvation (an ERROR naming `stamp_offset`), measure the
-constant offset between the streams and set the per-sensor
-`<sensor>.stamp_offset` parameter (seconds) — a constant offset δ otherwise
-biases every keyframe pose by v·δ / ω·δ, silently. See
-`docs/SLAM_EFFECTIVENESS_AUDIT.md`.
+report no-match starvation (an ERROR naming `stamp_offset`), MEASURE the
+offset instead of guessing:
+
+```bash
+ros2 run sonar_slam_cpp stamp_probe --topics /oculus/sonar_image /dvl/data
+```
+
+reports each stream's median stamp-vs-arrival offset, jitter, and drift, and
+prints the exact `<sensor>.stamp_offset` value to set (a constant offset δ
+otherwise biases every keyframe pose by v·δ / ω·δ, silently — see
+`docs/SLAM_EFFECTIVENESS_AUDIT.md`). It works live and against
+`ros2 bag play` at rate 1.0. If the probe reports a DRIFTING offset, a
+constant `stamp_offset` cannot fully fix that stream.
 
 ## Run
 
@@ -190,6 +217,52 @@ repeatedly to peel earlier corrections.
 stamp-offset starvation signature raises ERROR), the NSSM
 accept/reject/revert funnel, and the manual-correction counters — watch with
 `rqt_runtime_monitor` instead of grepping logs mid-deployment.
+
+### DVL-outage coast
+
+`dvl_coast` (dead reckoning, seconds; 0 = off) bridges DVL dropouts —
+bottom-lock loss, `require_valid` drops, a stalled secondary stream — by
+dead-reckoning on the last good body velocity rotated through the live
+attitude stream, then holding when the budget is spent. Without it the
+estimate freezes for the whole outage while the vehicle keeps moving. The
+Revolution preset arms 3 s.
+
+### Map persistence & relocalization (multi-session)
+
+```bash
+ros2 service call /slam/save_map std_srvs/srv/Trigger   # end of mission 1
+# mission 2:
+ros2 launch sonar_slam_cpp slam.launch.xml ... # with slam/map_load_path set
+```
+
+`save_map` serializes the whole keyframe map (poses + clouds) to
+`map_save_path`; loading it on a later mission restores the map and arms
+relocalization — the first dense feature frame is globally scan-matched
+against the loaded map (start near previously mapped area), then SLAM
+continues in the SAME map frame, closing loops against the previous
+session's keyframes.
+
+### USBL / acoustic absolute positioning
+
+Point `usbl/topic` (slam.yaml) at a map-frame position feed
+(`PoseWithCovarianceStamped` or `Odometry`). Each fix becomes a
+position-only prior on the stamp-nearest keyframe — innovation-gated
+(multipath outliers rejected), one per keyframe — turning bounded-drift
+SLAM into globally-anchored SLAM. Heading is never taken from USBL.
+
+### Georeferenced deliverables
+
+Give the mapping node a survey `datum` (`[lat, lon, bearing-of-map-x]`,
+mapping.yaml) and call `/mapping/export_map` (Trigger): the occupancy and
+intensity grids are written as PNG + UTM world files (`.pgw` + `.prj` —
+QGIS/ArcGIS open them as georeferenced rasters) and the trajectory as a
+WGS84 GeoJSON LineString.
+
+### Live CFAR tuning
+
+The feature node's `CFAR.*` and `filter.threshold` parameters are dynamic:
+`ros2 param set /feature_extraction CFAR.Pfa 0.005` rebuilds the detector on
+the next ping — tune at sea without relaunching.
 
 ### Map-quality metrics
 

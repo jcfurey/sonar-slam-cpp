@@ -10,6 +10,15 @@
     # synchronized cadence.
     dvl_max_gap: 10.0
 
+    # DVL-outage coast (s): when the synchronized DVL goes quiet (bottom-lock
+    # loss, require_valid drops, stalled secondary), dead-reckon on the last
+    # good body velocity rotated through the live attitude stream for up to
+    # this many seconds, then hold position. 0 disables (historic behavior:
+    # the estimate freezes for the whole outage). The returning DVL
+    # integrates only the remaining gap - coasted distance is never
+    # double-counted.
+    dvl_coast: 0.0
+
     # IMU mounting rotation [x y z roll pitch yaw]. The VN100 legacy frame
     # handling uses roll = deg(-90); for a REP-105 IMU (imu.driver: enu, e.g.
     # a 3DM-GX5) mounted aligned with the vehicle, use all zeros.

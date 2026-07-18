@@ -1,0 +1,36 @@
+# Synthetic demo payload — pairs with `ros2 launch sonar_slam_cpp
+# demo.launch.xml`, which starts the sim_payload simulator alongside the
+# standard pipeline. Everything runs on standard messages; no hardware, no
+# bags, no vendor packages. See docs/PAYLOADS.md for the driver matrix.
+/**:
+  ros__parameters:
+    sonar_slam_payload: sim_demo
+
+    dvl:
+      driver: twist_stamped
+      topic: /sim/dvl
+    dvl_max_velocity: 1.0
+    # the simulator "loses bottom lock" only if you make it — but coast is
+    # part of the demo story, so leave it armed
+    dvl_coast: 3.0
+
+    depth:
+      driver: float
+      topic: /sim/depth
+
+    imu:
+      driver: enu
+      topic: /sim/imu
+    imu_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    imu_offset: 0.0
+    use_imu: true
+    use_gyro: false
+
+    # bare polar image (rows = range bins, cols = beams) + geometry params
+    sonar:
+      driver: image
+      topic: /sim/sonar_image
+      range_resolution: 0.08333333333333333   # 25 m over 300 bins
+      horizontal_fov: 2.2689280275926285      # 130 deg
+      range_min: 0.0
+    compressed_images: false

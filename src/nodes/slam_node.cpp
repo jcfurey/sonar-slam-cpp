@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -305,6 +306,65 @@ public:
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     slam_.configure();
+
+    // Map persistence: ~/save_map serializes the whole keyframe map;
+    // map_load_path restores a previous session at startup and arms
+    // relocalization (the first dense frame is globally scan-matched
+    // against the loaded map before normal operation resumes).
+    map_save_path_ = get_string("map_save_path", "/tmp/sonar_slam_map.ssm");
+    save_map_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/save_map",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        save_map(*res);
+      });
+    slam_.relocalize_min_overlap = get_double("relocalize_min_overlap", 0.5);
+    const std::string load_path = get_string("map_load_path", "");
+    if (!load_path.empty()) {
+      if (slam_.load_map(load_path))
+        RCLCPP_INFO(get_logger(),
+                    "loaded %d keyframes from '%s' — relocalizing on the "
+                    "first dense feature frame",
+                    slam_.loaded_keyframes(), load_path.c_str());
+      else
+        RCLCPP_ERROR(get_logger(),
+                     "map_load_path '%s' failed to load (%s); starting fresh",
+                     load_path.c_str(), slam_.last_error().c_str());
+    }
+
+    // USBL/LBL absolute position input: map-frame position fixes become
+    // gated, stamp-matched priors on the nearest keyframe (position-only —
+    // acoustic positioning has no heading). Empty topic disables.
+    const std::string usbl_driver = get_string("usbl/driver", "pose_cov");
+    const std::string usbl_topic = get_string("usbl/topic", "");
+    usbl_max_innovation_ = get_double("usbl/max_innovation", 10.0);
+    usbl_min_sigma_ = get_double("usbl/min_sigma", 0.5);
+    usbl_max_stamp_delta_ = get_double("usbl/max_stamp_delta", 1.0);
+    if (!usbl_topic.empty()) {
+      if (usbl_driver == "pose_cov") {
+        usbl_sub_ = create_subscription<
+          geometry_msgs::msg::PoseWithCovarianceStamped>(
+          usbl_topic, 10,
+          [this](const geometry_msgs::msg::PoseWithCovarianceStamped& m) {
+            usbl_callback(m.header.stamp, m.pose.pose.position.x,
+                          m.pose.pose.position.y, m.pose.covariance[0],
+                          m.pose.covariance[7]);
+          });
+      } else if (usbl_driver == "odom") {
+        usbl_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+          usbl_topic, 10, [this](const nav_msgs::msg::Odometry& m) {
+            usbl_callback(m.header.stamp, m.pose.pose.position.x,
+                          m.pose.pose.position.y, m.pose.covariance[0],
+                          m.pose.covariance[7]);
+          });
+      } else {
+        RCLCPP_ERROR(get_logger(),
+                     "usbl/driver '%s' unknown (pose_cov | odom) — USBL "
+                     "input disabled",
+                     usbl_driver.c_str());
+      }
+    }
+
     // observability parity with the feature node: scan-match global init
     // batches its cost evaluation on the GPU when present (override with
     // SONAR_SLAM_FORCE_CPU=1); libpointmatcher ICP itself is CPU
@@ -354,6 +414,41 @@ private:
     points.col(0) = xyz_h.col(0);
     points.col(1) = -xyz_h.col(1);
     points.col(2) = xyz_h.col(2);
+
+    // A loaded map intercepts the pipeline until relocalization lands: the
+    // DR chain of this session has no relation to the map frame yet, so no
+    // factor may enter and nothing may publish until the global scan match
+    // places the vehicle.
+    if (slam_.awaiting_relocalization()) {
+      if (points.rows() >= slam_.nssm_params.min_points &&
+          !std::isnan(points(0, 0))) {
+        frame->status = true;
+        frame->points = points;
+        frame->twist = odom_msg.twist.twist;
+        bool ok = false;
+        try {
+          ok = slam_.relocalize(frame);
+        } catch (const std::exception& e) {
+          RCLCPP_ERROR(get_logger(), "relocalization attempt threw: %s",
+                       e.what());
+        }
+        if (ok) {
+          RCLCPP_INFO(get_logger(),
+                      "relocalized against loaded map at (%.2f, %.2f, "
+                      "%.1f deg) — resuming SLAM",
+                      frame->pose.x(), frame->pose.y(),
+                      frame->pose.theta() * 180.0 / M_PI);
+          slam_.current_frame = frame;
+          publish_all();
+          return;
+        }
+      }
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "waiting to relocalize against the loaded map (%d keyframes): %s",
+        slam_.loaded_keyframes(), slam_.last_error().c_str());
+      return;
+    }
 
     // NaN cloud means feature extraction skipped this frame
     if (points.rows() > 0 && std::isnan(points(0, 0)))
@@ -784,6 +879,87 @@ private:
     republish_corrected_state();
   }
 
+  void save_map(std_srvs::srv::Trigger::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slam_.keyframes.empty()) {
+      res.success = false;
+      res.message = "no keyframes to save";
+      return;
+    }
+    if (slam_.save_map(map_save_path_)) {
+      res.success = true;
+      res.message = std::to_string(slam_.current_key()) + " keyframes -> " +
+                    map_save_path_;
+      RCLCPP_INFO(get_logger(), "map saved: %s", res.message.c_str());
+    } else {
+      res.success = false;
+      res.message = slam_.last_error();
+      RCLCPP_ERROR(get_logger(), "map save failed: %s", res.message.c_str());
+    }
+  }
+
+  // USBL/LBL fix -> position prior on the stamp-nearest keyframe. Gates:
+  // one fix per keyframe (acoustic rates would otherwise bloat the graph),
+  // innovation bound (a multipath outlier must not yank the map), stamp
+  // match within usbl_max_stamp_delta (USBL latency is real; an unmatched
+  // fix belongs to no keyframe).
+  void usbl_callback(const builtin_interfaces::msg::Time& stamp, double x,
+                     double y, double var_x, double var_y)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slam_.keyframes.empty() || slam_.awaiting_relocalization()) return;
+    if (enu_world_) y = -y;  // displayed map frame -> graph z-down chart
+
+    const double t = to_sec(stamp);
+    int best = -1;
+    double best_dt = usbl_max_stamp_delta_;
+    for (int k = slam_.current_key() - 1; k >= 0; --k) {
+      const double kt = to_sec(slam_.keyframes[k]->time);
+      const double dt = std::fabs(kt - t);
+      if (dt <= best_dt) {
+        best_dt = dt;
+        best = k;
+      }
+      if (kt < t - usbl_max_stamp_delta_) break;  // keyframes are ordered
+    }
+    if (best < 0) {
+      ++usbl_rejected_;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "USBL fix has no keyframe within %.1f s (check usbl stamp domain / "
+        "usbl.max_stamp_delta)",
+        usbl_max_stamp_delta_);
+      return;
+    }
+    if (usbl_applied_.count(best)) return;
+
+    const gtsam::Pose2& kp = slam_.keyframes[best]->pose;
+    const double inno = std::hypot(kp.x() - x, kp.y() - y);
+    if (usbl_max_innovation_ > 0.0 && inno > usbl_max_innovation_) {
+      ++usbl_rejected_;
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "USBL fix rejected: %.1f m from the estimate (> usbl.max_innovation "
+        "%.1f m) — multipath outlier, or the map has genuinely drifted that "
+        "far",
+        inno, usbl_max_innovation_);
+      return;
+    }
+    const double sigma =
+      std::max(usbl_min_sigma_, std::sqrt(std::max(var_x, var_y)));
+    if (!slam_.add_position_prior(best, x, y, sigma)) {
+      RCLCPP_ERROR(get_logger(), "USBL prior failed (%s); estimator rebuilt",
+                   slam_.last_error().c_str());
+      return;
+    }
+    usbl_applied_.insert(best);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "USBL fix on keyframe %d: innovation %.2f m, sigma %.2f m (%d applied)",
+      best, inno, sigma, slam_.position_priors_applied);
+  }
+
   // 1 Hz /diagnostics snapshot of the SLAM funnel + sync health. Level
   // logic: pairing starvation since the last tick is ERROR (keyframes stop
   // silently while streams look alive — the stamp-offset signature);
@@ -823,6 +999,11 @@ private:
           std::to_string(slam_.manual_corrections_undone));
       add("manual_priors_active",
           std::to_string(slam_.manual_corrections_pending()));
+      add("usbl_priors_applied",
+          std::to_string(slam_.position_priors_applied));
+      add("usbl_rejected", std::to_string(usbl_rejected_));
+      add("awaiting_relocalization",
+          slam_.awaiting_relocalization() ? "true" : "false");
     }
     add("sync_nomatch_total", std::to_string(nomatch));
     add("sync_dropped_total", std::to_string(dropped));
@@ -899,6 +1080,15 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     manual_correction_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undo_srv_;
+  // map persistence + USBL input
+  std::string map_save_path_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_srv_;
+  rclcpp::SubscriptionBase::SharedPtr usbl_sub_;
+  double usbl_max_innovation_ = 10.0;
+  double usbl_min_sigma_ = 0.5;
+  double usbl_max_stamp_delta_ = 1.0;
+  std::set<int> usbl_applied_;
+  std::uint64_t usbl_rejected_ = 0;
   // diagnostics: sync counters bump on the subscription path while the 1 Hz
   // timer reads them — atomics keep this executor-agnostic (slam_ state is
   // snapshotted under mutex_ instead)

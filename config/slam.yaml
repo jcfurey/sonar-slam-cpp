@@ -118,3 +118,27 @@
     # compass-anchored and the post-loop verification assumes it — tighten
     # yaw only if the compass itself is what is being corrected.
     manual_correction_sigmas: [0.2, 0.2, 0.5]
+
+    # ---- map persistence (multi-session) ----
+    # /slam/save_map (std_srvs/Trigger) serializes the whole keyframe map
+    # (poses + clouds) here; set map_load_path to that file on a later
+    # mission to restore it. A loaded map arms RELOCALIZATION: nothing is
+    # published and no factor enters until the first dense feature frame
+    # globally scan-matches into the loaded map (start near previously
+    # mapped area). Loop closures then tie the new pass to the old map.
+    map_save_path: /tmp/sonar_slam_map.ssm
+    map_load_path: ""
+    # min fraction of a frame's points that must land on the loaded map for
+    # the relocalization to be accepted
+    relocalize_min_overlap: 0.5
+
+    # ---- USBL / LBL absolute position input ----
+    # Map-frame position fixes become gated position-only priors on the
+    # stamp-nearest keyframe (one per keyframe). The fix must be in the SLAM
+    # map frame (same convention as the published pose; ENU when enu_world).
+    usbl:
+      driver: pose_cov     # pose_cov (PoseWithCovarianceStamped) | odom
+      topic: ""            # empty disables
+      max_innovation: 10.0 # reject fixes farther than this from the estimate
+      min_sigma: 0.5       # floor on the per-fix sigma (m)
+      max_stamp_delta: 1.0 # max |fix stamp - keyframe stamp| to associate

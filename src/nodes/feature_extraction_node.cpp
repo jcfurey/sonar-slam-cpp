@@ -78,12 +78,60 @@ public:
   FeatureExtractionNode() : SlamNodeBase("feature_extraction_node")
   {
     // CFAR parameters
-    const int ntc = get_int("CFAR/Ntc");
-    const int ngc = get_int("CFAR/Ngc");
-    const double pfa = get_double("CFAR/Pfa");
-    const int rank = get_int("CFAR/rank");
+    ntc_ = get_int("CFAR/Ntc");
+    ngc_ = get_int("CFAR/Ngc");
+    pfa_ = get_double("CFAR/Pfa");
+    rank_ = get_int("CFAR/rank");
     alg_ = CFAR::alg_from_string(get_string("CFAR/alg", "SOCA"));
     threshold_ = get_int("filter/threshold");
+
+    // Live tuning at sea: the CFAR/filter knobs are dynamic —
+    //   ros2 param set /feature_extraction CFAR.Pfa 0.005
+    // rebuilds the detector for the next ping, no relaunch. Safe under the
+    // default single-threaded executor (the swap and detect() serialize).
+    param_cb_ = add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter>& params) {
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        auto as_num = [](const rclcpp::Parameter& p) {
+          return p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+                   ? static_cast<double>(p.as_int())
+                   : p.as_double();
+        };
+        bool rebuild = false;
+        try {
+          for (const auto& p : params) {
+            const std::string& n = p.get_name();
+            if (n == "CFAR.Ntc") {
+              ntc_ = static_cast<int>(as_num(p));
+              rebuild = true;
+            } else if (n == "CFAR.Ngc") {
+              ngc_ = static_cast<int>(as_num(p));
+              rebuild = true;
+            } else if (n == "CFAR.Pfa") {
+              pfa_ = as_num(p);
+              rebuild = true;
+            } else if (n == "CFAR.rank") {
+              rank_ = static_cast<int>(as_num(p));
+              rebuild = true;
+            } else if (n == "CFAR.alg") {
+              alg_ = CFAR::alg_from_string(p.as_string());
+            } else if (n == "filter.threshold") {
+              threshold_ = static_cast<int>(as_num(p));
+            }
+          }
+          if (rebuild) {
+            detector_ = std::make_unique<CFAR>(ntc_, ngc_, pfa_, rank_);
+            RCLCPP_INFO(get_logger(),
+                        "CFAR rebuilt: Ntc %d, Ngc %d, Pfa %g, rank %d",
+                        ntc_, ngc_, pfa_, rank_);
+          }
+        } catch (const std::exception& e) {
+          result.successful = false;
+          result.reason = e.what();
+        }
+        return result;
+      });
 
     // point cloud filtering parameters
     resolution_ = get_double("filter/resolution");
@@ -93,7 +141,7 @@ public:
 
     compressed_images_ = get_bool("compressed_images");
 
-    detector_ = std::make_unique<CFAR>(ntc, ngc, pfa, rank);
+    detector_ = std::make_unique<CFAR>(ntc_, ngc_, pfa_, rank_);
 
     // sonar driver (pluggable adapter + configurable topic); blank driver
     // auto-selects the Oculus adapter matching compressed_images
@@ -487,6 +535,9 @@ private:
   std::unique_ptr<CFAR> detector_;
   CFAR::Alg alg_ = CFAR::SOCA;
   int threshold_ = 0;
+  int ntc_ = 40, ngc_ = 10, rank_ = -1;
+  double pfa_ = 0.1;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
   double resolution_ = 0.5;
   double outlier_filter_radius_ = 1.0;
   int outlier_filter_min_points_ = 5;

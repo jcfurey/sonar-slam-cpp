@@ -235,6 +235,13 @@ install(TARGETS parity_check DESTINATION lib/${PROJECT_NAME})
 # doubled-wall fraction; the MAP_DOUBLING_FIX_PLAN §5 replay numbers)
 sonar_slam_node(map_metrics src/tools/map_metrics.cpp)
 
+# cross-device stamp-offset probe (measures <sensor>.stamp_offset instead of
+# asking the operator to)
+sonar_slam_node(stamp_probe src/tools/stamp_probe.cpp)
+
+# synthetic-pool payload simulator for demo.launch.xml (no hardware/bags)
+sonar_slam_node(sim_payload src/tools/sim_payload.cpp)
+
 # function-level parity harness against the Python bruce_slam originals
 add_executable(parity_vs_python src/tools/parity_vs_python.cpp)
 target_link_libraries(parity_vs_python sonar_slam_core)
@@ -264,6 +271,18 @@ if(BUILD_TESTING)
   ament_add_test(test_manual_correction
     COMMAND $<TARGET_FILE:test_manual_correction>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  # end-to-end pipeline on a synthetic pool: CFAR -> registration -> loop
+  # closure -> persistence -> relocalization -> absolute fixes, no bags/DDS
+  add_executable(test_pipeline_e2e test/test_pipeline_e2e.cpp)
+  target_link_libraries(test_pipeline_e2e sonar_slam_core)
+  ament_target_dependencies(test_pipeline_e2e builtin_interfaces geometry_msgs)
+  target_compile_definitions(test_pipeline_e2e
+    PRIVATE TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  ament_add_test(test_pipeline_e2e
+    COMMAND $<TARGET_FILE:test_pipeline_e2e>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 300)
 endif()
 
 # ------------------------------------------------------------------------- install

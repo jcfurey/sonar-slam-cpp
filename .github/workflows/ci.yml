@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/sonar_slam_cpp
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          apt-get update
+          rosdep update || true
+          # vendor driver message packages are OPTIONAL (the build degrades
+          # to standard-message drivers); skip their rosdep keys
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys "sonar_oculus rti_dvl bar30_depth kvh_gyro dvl_msgs"
+
+      - name: Build (CPU-only)
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --packages-select sonar_slam_cpp \
+            --event-handlers console_cohesion+ \
+            --cmake-args -DSONAR_SLAM_ENABLE_CUDA=OFF
+
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --packages-select sonar_slam_cpp \
+            --event-handlers console_cohesion+
+          colcon test-result --verbose

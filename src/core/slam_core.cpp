@@ -1,4 +1,7 @@
 #include "sonar_slam_cpp/slam_core.hpp"
+
+#include <cstring>
+#include <fstream>
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/global_init.hpp"
 #include "sonar_slam_cpp/icp_covariance.hpp"
@@ -991,6 +994,254 @@ bool Slam::undo_manual_correction()
   force_converge_ = true;
   if (!update_factor_graph()) return false;
   ++manual_corrections_undone;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// map persistence, relocalization, absolute position fixes
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr char kMapMagic[9] = "SSLMMAP2";
+constexpr std::uint32_t kMapVersion = 1;
+
+void put_pose3(std::ofstream& f, const gtsam::Pose3& p)
+{
+  const gtsam::Quaternion q = p.rotation().toQuaternion();
+  const double d[7] = {q.w(), q.x(), q.y(), q.z(), p.x(), p.y(), p.z()};
+  f.write(reinterpret_cast<const char*>(d), sizeof d);
+}
+
+gtsam::Pose3 get_pose3(std::ifstream& f)
+{
+  double d[7];
+  f.read(reinterpret_cast<char*>(d), sizeof d);
+  return gtsam::Pose3(gtsam::Rot3::Quaternion(d[0], d[1], d[2], d[3]),
+                      gtsam::Point3(d[4], d[5], d[6]));
+}
+
+}  // namespace
+
+bool Slam::save_map(const std::string& path)
+{
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (!f) {
+    last_error_ = "cannot open '" + path + "' for writing";
+    return false;
+  }
+  f.write(kMapMagic, 8);
+  const std::uint32_t version = kMapVersion;
+  const std::uint32_t n = static_cast<std::uint32_t>(keyframes.size());
+  f.write(reinterpret_cast<const char*>(&version), 4);
+  f.write(reinterpret_cast<const char*>(&n), 4);
+  for (const auto& kf : keyframes) {
+    const std::int64_t stamp_ns =
+      static_cast<std::int64_t>(kf->time.sec) * 1000000000ll + kf->time.nanosec;
+    f.write(reinterpret_cast<const char*>(&stamp_ns), 8);
+    put_pose3(f, kf->dr_pose3);
+    put_pose3(f, kf->pose3);
+    const double p2[3] = {kf->pose.x(), kf->pose.y(), kf->pose.theta()};
+    f.write(reinterpret_cast<const char*>(p2), sizeof p2);
+    const std::int64_t rows = kf->points.rows();
+    f.write(reinterpret_cast<const char*>(&rows), 8);
+    if (rows > 0) {
+      // row-major float triplets, independent of Eigen's storage order
+      std::vector<float> buf(static_cast<std::size_t>(rows) * 3);
+      for (long r = 0; r < rows; ++r)
+        for (int c = 0; c < 3; ++c)
+          buf[static_cast<std::size_t>(r) * 3 + c] = kf->points(r, c);
+      f.write(reinterpret_cast<const char*>(buf.data()),
+              static_cast<std::streamsize>(buf.size() * sizeof(float)));
+    }
+  }
+  if (!f) {
+    last_error_ = "short write to '" + path + "'";
+    return false;
+  }
+  return true;
+}
+
+bool Slam::load_map(const std::string& path)
+{
+  if (!keyframes.empty()) {
+    last_error_ = "load_map requires an empty session (call before any frame)";
+    return false;
+  }
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    last_error_ = "cannot open '" + path + "'";
+    return false;
+  }
+  char magic[8];
+  std::uint32_t version = 0, n = 0;
+  f.read(magic, 8);
+  f.read(reinterpret_cast<char*>(&version), 4);
+  f.read(reinterpret_cast<char*>(&n), 4);
+  if (!f || std::memcmp(magic, kMapMagic, 8) != 0 || version != kMapVersion) {
+    last_error_ = "'" + path + "' is not a version-" +
+                  std::to_string(kMapVersion) + " sonar_slam map";
+    return false;
+  }
+  constexpr std::uint32_t kMaxKeyframes = 1000000;
+  if (n > kMaxKeyframes) {
+    last_error_ = "map header claims an implausible keyframe count";
+    return false;
+  }
+
+  gtsam::NonlinearFactorGraph g;
+  gtsam::Values v;
+  for (std::uint32_t k = 0; k < n; ++k) {
+    std::int64_t stamp_ns = 0, rows = 0;
+    f.read(reinterpret_cast<char*>(&stamp_ns), 8);
+    const gtsam::Pose3 dr = get_pose3(f);
+    const gtsam::Pose3 p3 = get_pose3(f);
+    double p2[3];
+    f.read(reinterpret_cast<char*>(p2), sizeof p2);
+    f.read(reinterpret_cast<char*>(&rows), 8);
+    if (!f || rows < 0 || rows > 50000000) {
+      last_error_ = "truncated/corrupt map file at keyframe " +
+                    std::to_string(k);
+      keyframes.clear();
+      return false;
+    }
+    builtin_interfaces::msg::Time t;
+    t.sec = static_cast<std::int32_t>(stamp_ns / 1000000000ll);
+    t.nanosec = static_cast<std::uint32_t>(stamp_ns % 1000000000ll);
+    auto kf = std::make_shared<Keyframe>(true, t, dr);
+    kf->points = Matrix(rows, 3);
+    if (rows > 0) {
+      std::vector<float> buf(static_cast<std::size_t>(rows) * 3);
+      f.read(reinterpret_cast<char*>(buf.data()),
+             static_cast<std::streamsize>(buf.size() * sizeof(float)));
+      for (long r = 0; r < rows; ++r)
+        for (int c = 0; c < 3; ++c)
+          kf->points(r, c) = buf[static_cast<std::size_t>(r) * 3 + c];
+    }
+    // restore the optimized estimate through the horizon chart (yaw-only
+    // rotation, saved z); roll/pitch ride from the saved DR pose
+    kf->update(gtsam::Pose3(gtsam::Rot3::Yaw(p2[2]),
+                            gtsam::Point3(p2[0], p2[1], p3.z())));
+    keyframes.push_back(kf);
+
+    // Rebuild an equivalent-strength graph instead of serializing factors:
+    // the saved poses are a solved optimum, so an anchored chain of tight
+    // between factors holds the shape exactly, without the fragility of
+    // serializing arbitrary factor types. Loop closures' effect is baked
+    // into the saved poses.
+    const int key = static_cast<int>(k);
+    if (k == 0) {
+      g.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), kf->horizon_pose3(),
+                                             prior_model_));
+    } else {
+      const gtsam::Pose3 rel =
+        keyframes[k - 1]->horizon_pose3().between(kf->horizon_pose3());
+      g.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        X(key - 1), X(key), rel,
+        lift_sigmas(icp_odom_sigmas, kSigmaTightRP, kSigmaDepthDelta)));
+    }
+    g.add(gtsam::PriorFactor<gtsam::Pose3>(X(key), kf->horizon_dr_pose3(),
+                                           unary_model_));
+    v.insert(X(key), kf->horizon_pose3());
+  }
+
+  try {
+    isam_.update(g, v);
+  } catch (const std::exception& e) {
+    last_error_ = std::string("loaded map failed to solve: ") + e.what();
+    keyframes.clear();
+    isam_ = gtsam::ISAM2(make_isam2_params());
+    return false;
+  }
+  committed_graph_ = g;
+  loaded_key_count_ = static_cast<int>(n);
+  awaiting_relocalization_ = true;
+  return true;
+}
+
+bool Slam::relocalize(const KeyframePtr& frame)
+{
+  if (!awaiting_relocalization_) {
+    last_error_ = "no loaded map awaiting relocalization";
+    return false;
+  }
+  if (frame->points.rows() < nssm_params.min_points) {
+    last_error_ = "frame too sparse (" + std::to_string(frame->points.rows()) +
+                  " < " + std::to_string(nssm_params.min_points) + " points)";
+    return false;
+  }
+  std::vector<int> keys(static_cast<std::size_t>(loaded_key_count_));
+  for (int k = 0; k < loaded_key_count_; ++k) keys[static_cast<std::size_t>(k)] = k;
+  const Matrix target = get_points(keys, -1);
+  if (target.rows() == 0) {
+    last_error_ = "loaded map has no points";
+    return false;
+  }
+
+  // search the whole map footprint; yaw stays near the compass-anchored DR
+  // yaw (both sessions share the compass, so the map yaw offset is small)
+  float min_x = 1e30f, max_x = -1e30f, min_y = 1e30f, max_y = -1e30f;
+  for (long r = 0; r < target.rows(); ++r) {
+    min_x = std::min(min_x, target(r, 0));
+    max_x = std::max(max_x, target(r, 0));
+    min_y = std::min(min_y, target(r, 1));
+    max_y = std::max(max_y, target(r, 1));
+  }
+  const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y),
+                            frame->dr_pose.theta());
+  Eigen::Matrix<double, 3, 2> bounds;
+  bounds << -(0.5 * (max_x - min_x) + 5.0), 0.5 * (max_x - min_x) + 5.0,
+            -(0.5 * (max_y - min_y) + 5.0), 0.5 * (max_y - min_y) + 5.0,
+            -0.35, 0.35;
+
+  const GlobalInitResult init = global_scan_match_init(
+    frame->points, center, target, gtsam::Pose2(), point_noise, bounds,
+    500, 4, 0.01);
+  const double hits = -init.best_cost;
+  const double need = relocalize_min_overlap * static_cast<double>(frame->points.rows());
+  if (!init.success || hits < need) {
+    last_error_ = "relocalization overlap too low (" +
+                  std::to_string(static_cast<int>(hits)) + " hits < " +
+                  std::to_string(static_cast<int>(need)) + " needed)";
+    return false;
+  }
+  const gtsam::Pose2 matched = center.compose(
+    gtsam::Pose2(init.delta.x(), init.delta.y(), init.delta.theta()));
+
+  // enter the map at the matched pose: moderate prior (the global init is
+  // grid-coarse; SSM/NSSM tighten from here), plus the usual state unary
+  frame->update(gtsam::Pose3(gtsam::Rot3::Yaw(matched.theta()),
+                             gtsam::Point3(matched.x(), matched.y(),
+                                           frame->dr_pose3.z())));
+  const int key = current_key();
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+    X(key), frame->horizon_pose3(),
+    lift_sigmas(Eigen::Vector3d(0.5, 0.5, 0.1), kSigmaTightRP, kSigmaDepthAbs)));
+  values_.insert(X(key), frame->horizon_pose3());
+  add_state_unary(key, frame);
+  force_converge_ = true;
+  // stay armed if the solve fails — update_factor_graph rolled the frame
+  // back, so the next dense frame retries cleanly
+  if (!update_factor_graph(frame)) return false;
+  awaiting_relocalization_ = false;
+  return true;
+}
+
+bool Slam::add_position_prior(int key, double x, double y, double sigma_xy)
+{
+  if (key < 0 || key >= current_key()) {
+    last_error_ = "position prior key out of range";
+    return false;
+  }
+  // position-only fix: yaw/attitude stay wide (USBL measures position, not
+  // heading); z target = current estimate so the wide z prior is centered
+  const gtsam::Pose3 h = keyframes[static_cast<std::size_t>(key)]->horizon_pose3();
+  const gtsam::Pose3 target(h.rotation(), gtsam::Point3(x, y, h.z()));
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+    X(key), target,
+    lift_sigmas(Eigen::Vector3d(sigma_xy, sigma_xy, kSigmaWide), kSigmaWide,
+                kSigmaWide)));
+  if (!update_factor_graph()) return false;
+  ++position_priors_applied;
   return true;
 }
 

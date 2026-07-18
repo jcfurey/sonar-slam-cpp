@@ -17,6 +17,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+#include <opencv2/imgcodecs.hpp>
+
+#include <fstream>
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +32,7 @@
 #include <mutex>
 #include <vector>
 
+#include "sonar_slam_cpp/geo.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/mapping.hpp"
 #include "sonar_slam_cpp/node_base.hpp"
@@ -134,6 +140,33 @@ public:
     traj_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       SLAM_TRAJ_TOPIC, latched_qos(10),
       [this](const sensor_msgs::msg::PointCloud2& msg) { on_traj(msg); });
+
+    // Georeferenced deliverables: with a survey datum ([lat deg, lon deg,
+    // bearing deg of the map +x axis, i.e. the vehicle's initial heading]),
+    // ~/export_map writes the occupancy + intensity grids as PNG with UTM
+    // world files (.pgw + .prj — QGIS/ArcGIS open them as georeferenced
+    // rasters) and the trajectory as a WGS84 GeoJSON LineString.
+    const auto datum = get_double_array("datum", {});
+    if (datum.size() == 3) {
+      datum_ = GeoDatum(datum[0], datum[1], datum[2]);
+      has_datum_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "datum set: %.6f, %.6f, map +x bearing %.1f deg (UTM zone "
+                  "%d%c)",
+                  datum[0], datum[1], datum[2], datum_.origin.zone,
+                  datum_.origin.north ? 'N' : 'S');
+    } else if (!datum.empty()) {
+      RCLCPP_ERROR(get_logger(),
+                   "datum must be [lat_deg, lon_deg, map_x_bearing_deg] — "
+                   "georeferenced export disabled");
+    }
+    export_prefix_ = get_string("export_prefix", "/tmp/sonar_slam_survey");
+    export_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/export_map",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        export_map(*res);
+      });
 
     occupancy_pub_ =
       create_publisher<nav_msgs::msg::OccupancyGrid>(MAPPING_OCCUPANCY_TOPIC, latched_qos());
@@ -307,6 +340,101 @@ private:
     }
   }
 
+  // grid -> top-down PNG (map_saver shading) + UTM world file + .prj
+  bool write_grid_geo(const OccGrid& g, const std::string& base,
+                      std::string& out_err)
+  {
+    cv::Mat img(g.height, g.width, CV_8UC1);
+    for (int r = 0; r < g.height; ++r)
+      for (int c = 0; c < g.width; ++c) {
+        const int8_t v = g.data[static_cast<std::size_t>(
+          (g.height - 1 - r) * g.width + c)];
+        img.at<std::uint8_t>(r, c) =
+          v < 0 ? 205 : static_cast<std::uint8_t>(255 - v * 255 / 100);
+      }
+    if (!cv::imwrite(base + ".png", img)) {
+      out_err = "imwrite failed for " + base + ".png";
+      return false;
+    }
+    // world file: column step = map +x, image-row step = map -y (the PNG is
+    // written top-down while the grid's row 0 is ymin)
+    const double res = g.resolution;
+    double C, F;
+    datum_.map_to_utm(g.origin_x + 0.5 * res,
+                      g.origin_y + (g.height - 0.5) * res, C, F);
+    std::ofstream w(base + ".pgw", std::ios::trunc);
+    w.precision(8);
+    w << std::fixed << res * datum_.ex << "\n" << res * datum_.nx << "\n"
+      << -res * datum_.ey << "\n" << -res * datum_.ny << "\n" << C << "\n"
+      << F << "\n";
+    std::ofstream prj(base + ".prj", std::ios::trunc);
+    prj << utm_wkt(datum_.origin.zone, datum_.origin.north);
+    if (!w || !prj) {
+      out_err = "failed writing world/prj sidecars for " + base;
+      return false;
+    }
+    return true;
+  }
+
+  void export_map(std_srvs::srv::Trigger::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_datum_) {
+      res.success = false;
+      res.message =
+        "no datum set — provide the 'datum' parameter [lat_deg, lon_deg, "
+        "map_x_bearing_deg] to georeference the export";
+      return;
+    }
+    std::string written, err;
+    const OccGrid occ = map_.get_occupancy_grid();
+    if (!occ.empty()) {
+      if (!write_grid_geo(occ, export_prefix_ + "_occupancy", err)) {
+        res.success = false;
+        res.message = err;
+        return;
+      }
+      written += export_prefix_ + "_occupancy.png ";
+    }
+    const OccGrid inten = map_.get_intensity_grid();
+    if (!inten.empty()) {
+      if (!write_grid_geo(inten, export_prefix_ + "_intensity", err)) {
+        res.success = false;
+        res.message = err;
+        return;
+      }
+      written += export_prefix_ + "_intensity.png ";
+    }
+    if (!traj_.empty()) {
+      std::ofstream gj(export_prefix_ + "_trajectory.geojson",
+                       std::ios::trunc);
+      gj.precision(9);
+      gj << std::fixed
+         << "{\"type\":\"FeatureCollection\",\"features\":[{\"type\":"
+            "\"Feature\",\"properties\":{\"name\":\"sonar_slam "
+            "trajectory\",\"keyframes\":"
+         << traj_.size()
+         << "},\"geometry\":{\"type\":\"LineString\",\"coordinates\":[";
+      for (std::size_t k = 0; k < traj_.size(); ++k) {
+        double lon, lat;
+        datum_.map_to_lonlat(traj_[k].x, traj_[k].y, lon, lat);
+        gj << (k ? "," : "") << "[" << lon << "," << lat << "]";
+      }
+      gj << "]}}]}\n";
+      if (gj) written += export_prefix_ + "_trajectory.geojson";
+    }
+    if (written.empty()) {
+      res.success = false;
+      res.message = "nothing to export yet (no grids, no trajectory)";
+      return;
+    }
+    res.success = true;
+    res.message = "wrote " + written + "(UTM zone " +
+                  std::to_string(datum_.origin.zone) +
+                  (datum_.origin.north ? "N" : "S") + " sidecars)";
+    RCLCPP_INFO(get_logger(), "%s", res.message.c_str());
+  }
+
   static nav_msgs::msg::OccupancyGrid to_occ_msg(
     const OccGrid& g, const builtin_interfaces::msg::Time& stamp)
   {
@@ -330,6 +458,11 @@ private:
 
   Mapping map_;
   std::mutex mutex_;
+  // georeferenced export (see export_map)
+  GeoDatum datum_;
+  bool has_datum_ = false;
+  std::string export_prefix_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr export_srv_;
 
   std::map<int64_t, SonarPing> ping_buf_;
   std::map<int64_t, Matrix> feat_buf_;

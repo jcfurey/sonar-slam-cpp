@@ -95,12 +95,16 @@ public:
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  imu_seen_ = true;
+                                 last_imu_ = r;
+                                 last_att_stamp_ = r.stamp;
                                  sync3_->add_secondary_b(to_sec(r.stamp), r);
                                });
       gyro_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         GYRO_INTEGRATION_TOPIC, 300, [this](const nav_msgs::msg::Odometry& msg) {
           std::lock_guard<std::mutex> lock(mutex_);
           gyro_seen_ = true;
+          last_gyro_yaw_ = r2g(msg.pose.pose).rotation().yaw();
+          last_att_stamp_ = msg.header.stamp;
           sync3_->add_secondary_c(to_sec(msg.header.stamp), msg);
         });
     } else if (use_imu_) {
@@ -121,6 +125,8 @@ public:
                                [this](const ImuReading& r) {
                                  std::lock_guard<std::mutex> lock(mutex_);
                                  imu_seen_ = true;
+                                 last_imu_ = r;
+                                 last_att_stamp_ = r.stamp;
                                  sync2_imu_->add_secondary(to_sec(r.stamp), r);
                                });
     } else if (use_gyro_) {
@@ -141,6 +147,8 @@ public:
         GYRO_INTEGRATION_TOPIC, 300, [this](const nav_msgs::msg::Odometry& msg) {
           std::lock_guard<std::mutex> lock(mutex_);
           gyro_seen_ = true;
+          last_gyro_yaw_ = r2g(msg.pose.pose).rotation().yaw();
+          last_att_stamp_ = msg.header.stamp;
           sync2_gyro_->add_secondary(to_sec(msg.header.stamp), msg);
         });
       RCLCPP_WARN(get_logger(),
@@ -201,6 +209,21 @@ public:
       if (all_seen) watchdog_->cancel();
     });
 
+    // DVL-outage coast: when the synchronized DVL stream goes quiet
+    // (bottom-lock loss, require_valid drops, secondary stall) the estimate
+    // otherwise FREEZES while the vehicle keeps moving. Coast dead-reckons on
+    // the last good body velocity rotated through the LIVE attitude stream
+    // for up to dvl_coast seconds, then holds. 0 disables (historic
+    // behavior). Covariance consumers see the same odometry topic; the SLAM
+    // keyframe gate keeps coasted stretches from becoming keyframes by
+    // itself only if features pair — treat long coasts as degraded DR.
+    dvl_coast_ = get_double("dvl_coast", 0.0);
+    if (dvl_coast_ > 0.0) {
+      coast_timer_ = create_wall_timer(std::chrono::milliseconds(200),
+                                       [this]() { coast_step(); });
+      RCLCPP_INFO(get_logger(), "DVL coast enabled: up to %.1f s", dvl_coast_);
+    }
+
     // Field diagnostics: the sync-health and gap counters otherwise exist
     // only as throttled log lines — publish them on /diagnostics so pairing
     // starvation is visible in rqt during a deployment (rqt_runtime_monitor /
@@ -250,20 +273,25 @@ private:
     return rot.compose(imu_rot_.inverse());
   }
 
+  // full IMU-mode attitude: mounting rotation + yaw zeroing + the fixed
+  // 90-degree roll offset of the historic VN100 frame handling (legacy
+  // driver only). Shared by the paired callback and the coast path so the
+  // two can never diverge.
+  gtsam::Rot3 composed_imu_rot(const ImuReading& imu) const
+  {
+    const gtsam::Rot3 rot = imu_rotation(imu);
+    double roll = rot.roll();
+    if (imu_legacy_) roll += M_PI / 2.0;
+    return gtsam::Rot3::Ypr(rot.yaw() - imu_yaw0_.value_or(rot.yaw()),
+                            rot.pitch(), roll);
+  }
+
   void callback(const ImuReading& imu, const DvlReading& dvl)
   {
     if (!last_depth_) return;
-
-    gtsam::Rot3 rot = imu_rotation(imu);
-    if (!imu_yaw0_) imu_yaw0_ = rot.yaw();
-
-    // the fixed 90-degree roll offset is part of the historic VN100 frame
-    // handling and only applies to the legacy driver
-    double roll = rot.roll();
-    if (imu_legacy_) roll += M_PI / 2.0;
-    rot = gtsam::Rot3::Ypr(rot.yaw() - *imu_yaw0_, rot.pitch(), roll);
-
-    send_odometry(dvl.velocity, rot, dvl.stamp, last_depth_->depth);
+    if (!imu_yaw0_) imu_yaw0_ = imu_rotation(imu).yaw();
+    send_odometry(dvl.velocity, composed_imu_rot(imu), dvl.stamp,
+                  last_depth_->depth);
   }
 
   void callback_with_gyro(const ImuReading& imu, const DvlReading& dvl,
@@ -296,6 +324,15 @@ private:
                      const builtin_interfaces::msg::Time& dvl_time, double depth)
   {
     ++pairs_total_;
+    // coast bookkeeping: a real pair re-anchors everything
+    last_pair_arrival_ = now();
+    if (prev_time_) {
+      const double dt = to_sec(dvl_time) - to_sec(*prev_time_);
+      if (dt > 0.0 && dt < 5.0)
+        dvl_period_ema_ = 0.9 * dvl_period_ema_ + 0.1 * dt;
+    }
+    coast_elapsed_ = 0.0;
+    coasting_ = false;
     // DVL velocity spike handling (dead_reckoning.py send_odometry)
     if (vel.cwiseAbs().maxCoeff() > dvl_max_velocity_) {
       if (pose_) {
@@ -403,6 +440,79 @@ private:
     }
   }
 
+  // Timer body of the DVL-outage coast (dvl_coast > 0). Attitude keeps
+  // flowing while the DVL is quiet, so the pose advances along the last
+  // good body velocity rotated through the live attitude — bounded by
+  // dvl_coast seconds, after which the position holds (the historic
+  // behavior) until real pairs return. prev_time_ advances with each coast
+  // step, so the returning DVL integrates only the remaining gap — the
+  // coasted distance is never double-counted.
+  void coast_step()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pose_ || !prev_time_) return;
+    const double since_pair = (now() - last_pair_arrival_).seconds();
+    // negative = node clock jumped backwards (bag loop): re-anchor
+    if (since_pair < 0.0) {
+      last_pair_arrival_ = now();
+      return;
+    }
+    if (since_pair < std::max(0.3, 2.5 * dvl_period_ema_)) return;
+
+    // data-domain dt from the attitude stream (falls back to a nominal tick
+    // in the DVL+depth-only mode, which has no attitude stream)
+    double stamp_s;
+    builtin_interfaces::msg::Time stamp;
+    if (last_att_stamp_) {
+      stamp = *last_att_stamp_;
+      stamp_s = to_sec(stamp);
+    } else {
+      stamp = now();
+      stamp_s = to_sec(stamp);
+    }
+    const double dt = stamp_s - to_sec(*prev_time_);
+    if (dt <= 0.0) return;
+    if (coast_elapsed_ + dt > dvl_coast_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "DVL quiet for %.1f s — coast budget (dvl_coast %.1f s) exhausted; "
+        "holding position",
+        since_pair, dvl_coast_);
+      return;
+    }
+    if (!coasting_) {
+      ++coast_events_;
+      RCLCPP_WARN(get_logger(),
+                  "DVL quiet for %.1f s — coasting on last velocity "
+                  "(%.2f, %.2f, %.2f) m/s + live attitude (budget %.1f s)",
+                  since_pair, prev_vel_[0], prev_vel_[1], prev_vel_[2],
+                  dvl_coast_);
+    }
+    coasting_ = true;
+    coast_elapsed_ += dt;
+
+    // live attitude, composed exactly like the paired callbacks
+    gtsam::Rot3 rot = pose_->rotation();
+    if (use_imu_ && last_imu_) {
+      rot = composed_imu_rot(*last_imu_);
+      if (use_gyro_ && last_gyro_yaw_)
+        rot = gtsam::Rot3::Ypr(*last_gyro_yaw_, rot.pitch(), rot.roll());
+    } else if (use_gyro_ && last_gyro_yaw_) {
+      rot = gtsam::Rot3::Yaw(*last_gyro_yaw_);
+    } else if (!use_imu_ && !use_gyro_) {
+      rot = gtsam::Rot3::Yaw(slam_yaw_);
+    }
+    const double depth = last_depth_ ? last_depth_->depth : pose_->z();
+
+    const Eigen::Vector3d trans = prev_vel_ * dt;
+    const gtsam::Pose2 pose2(pose_->x(), pose_->y(), pose_->rotation().yaw());
+    const gtsam::Point2 point =
+      pose2.transformFrom(gtsam::Point2(trans[0], trans[1]));
+    pose_ = gtsam::Pose3(rot, gtsam::Point3(point.x(), point.y(), depth));
+    prev_time_ = stamp;
+    publish_pose(false);
+  }
+
   // 1 Hz /diagnostics snapshot. Level logic: pairing starvation since the
   // last tick (the stamp-offset signature) is ERROR — every downstream
   // consumer is silently frozen while it lasts; overflow drops / gap events
@@ -434,6 +544,9 @@ private:
       add("sync_nomatch_total", std::to_string(nomatch));
       add("sync_dropped_total", std::to_string(dropped));
       add("dvl_gap_events", std::to_string(gaps));
+      add("coasting", coasting_ ? "true" : "false");
+      add("coast_events", std::to_string(coast_events_));
+      add("coast_elapsed", std::to_string(coast_elapsed_));
       add("dvl_seen", dvl_seen_ ? "true" : "false");
       add("imu_seen", imu_seen_ ? "true" : "false");
       add("gyro_seen", gyro_seen_ ? "true" : "false");
@@ -486,6 +599,18 @@ private:
   bool dvl_seen_ = false, imu_seen_ = false, gyro_seen_ = false;
   std::vector<std::pair<double, gtsam::Pose3>> keyframes_;
   rclcpp::TimerBase::SharedPtr watchdog_;
+  // DVL-outage coast state (see coast_step)
+  double dvl_coast_ = 0.0;
+  double dvl_period_ema_ = 0.2;
+  double coast_elapsed_ = 0.0;
+  bool coasting_ = false;
+  std::uint64_t coast_events_ = 0;
+  std::optional<ImuReading> last_imu_;
+  std::optional<double> last_gyro_yaw_;
+  std::optional<builtin_interfaces::msg::Time> last_att_stamp_;
+  rclcpp::Time last_pair_arrival_{0, 0, RCL_ROS_TIME};
+  rclcpp::TimerBase::SharedPtr coast_timer_;
+
   // diagnostics counters (mutated under mutex_ by the sync/odometry paths)
   std::uint64_t pairs_total_ = 0, nomatch_total_ = 0, dropped_total_ = 0,
                 gap_events_ = 0;
