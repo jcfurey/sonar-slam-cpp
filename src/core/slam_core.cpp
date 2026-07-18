@@ -940,6 +940,27 @@ std::string Slam::nssm_reject_summary() const
 }
 
 // ---------------------------------------------------------------------------
+// manual correction
+// ---------------------------------------------------------------------------
+bool Slam::add_manual_correction(const gtsam::Pose2& map_pose)
+{
+  if (keyframes.empty()) return false;
+  const int key = current_key() - 1;
+  // planar prior lifted into the horizon chart: roll/pitch/z stay wide (the
+  // per-keyframe unary owns them; z target = current z so the wide prior is
+  // centered), x/y/yaw at the operator-trust sigmas
+  const gtsam::Pose3 target(
+    gtsam::Rot3::Yaw(map_pose.theta()),
+    gtsam::Point3(map_pose.x(), map_pose.y(),
+                  keyframes[key]->horizon_pose3().z()));
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+    X(key), target,
+    lift_sigmas(manual_correction_sigmas, kSigmaWide, kSigmaWide)));
+  force_converge_ = true;
+  return update_factor_graph();
+}
+
+// ---------------------------------------------------------------------------
 // graph update
 // ---------------------------------------------------------------------------
 bool Slam::update_factor_graph(const KeyframePtr& keyframe)
@@ -996,6 +1017,9 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     last_error_ = e.what();
     graph_.resize(0);
     values_.clear();
+    // a discarded manual-correction prior must not make the NEXT round
+    // converge hard on its behalf
+    force_converge_ = false;
     if (keyframe) keyframes.pop_back();
     // solver failure says nothing about the loops themselves — no quarantine
     rollback_pending_loops(/*quarantine=*/false);
@@ -1013,11 +1037,14 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   values_.clear();
 
   try {
-  // Converge BEFORE judging: a loop-closure round needs more than the single
-  // Gauss-Newton pass isam_.update() performs — verifying (yaw-RMS/chain-tear)
-  // against the half-relaxed transient would revert and QUARANTINE genuine
-  // closures. A few extra iterations are cheap and only run on loop rounds.
-  if (!pending_loops_.empty())
+  // Converge BEFORE judging: a loop-closure (or manual-correction) round
+  // needs more than the single Gauss-Newton pass isam_.update() performs —
+  // verifying (yaw-RMS/chain-tear) against the half-relaxed transient would
+  // revert and QUARANTINE genuine closures. A few extra iterations are cheap
+  // and only run on correction rounds.
+  const bool converge_hard = !pending_loops_.empty() || force_converge_;
+  force_converge_ = false;
+  if (converge_hard)
     for (int i = 0; i < loop_extra_iterations; ++i) isam_.update();
   const gtsam::Values values = isam_.calculateEstimate();
   // Extract the optimized poses sequentially (gtsam map lookups; throws

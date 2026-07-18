@@ -148,6 +148,17 @@ public:
     slam_.nssm_use_dcs = get_bool("nssm/use_dcs", false);
     slam_.nssm_dcs_phi = get_double("nssm/dcs_phi", 1.0);
     slam_.loop_extra_iterations = get_int("loop_extra_iterations", 3);
+    // operator hand-correction trust [x m, y m, yaw rad] — yaw soft by
+    // default (see slam_core.hpp: the verify stack assumes compass yaw)
+    const auto mc_sigmas =
+      get_double_array("manual_correction_sigmas", {0.2, 0.2, 0.5});
+    if (mc_sigmas.size() == 3)
+      slam_.manual_correction_sigmas =
+        Eigen::Vector3d(mc_sigmas[0], mc_sigmas[1], mc_sigmas[2]);
+    else
+      RCLCPP_ERROR(get_logger(),
+                   "manual_correction_sigmas must be [x, y, yaw]; keeping "
+                   "defaults [0.2, 0.2, 0.5]");
 
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");
@@ -216,6 +227,19 @@ public:
       LOCALIZATION_ODOM_TOPIC, 50, [this](const nav_msgs::msg::Odometry& msg) {
         sync_->add_secondary(to_sec(msg.header.stamp), msg);
       });
+
+    // Operator hand-correction: RViz's "2D Pose Estimate" button publishes a
+    // map-frame planar pose on /initialpose — applied as a prior on the
+    // newest keyframe (see manual_correction_callback). Empty topic disables.
+    const std::string mc_topic =
+      get_string("manual_correction_topic", "/initialpose");
+    if (!mc_topic.empty())
+      manual_correction_sub_ =
+        create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+          mc_topic, 1,
+          [this](const geometry_msgs::msg::PoseWithCovarianceStamped& msg) {
+            manual_correction_callback(msg);
+          });
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
       SLAM_POSE_TOPIC, 10);
@@ -660,6 +684,65 @@ private:
     traj_pub_->publish(msg);
   }
 
+  // Operator hand-correction: a map-frame planar pose fix (typically RViz's
+  // "2D Pose Estimate") becomes a prior on the NEWEST keyframe; the elastic
+  // DR chain distributes the correction backwards through the trajectory.
+  // Operator input is ground truth by declaration — no post-loop
+  // verification runs on this round — but it enters as a (soft-yaw) prior,
+  // not a hard reset, so the graph still negotiates the exact pose.
+  void manual_correction_callback(
+    geometry_msgs::msg::PoseWithCovarianceStamped msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slam_.keyframes.empty()) {
+      RCLCPP_WARN(get_logger(),
+                  "manual correction ignored: no keyframes in the graph yet");
+      return;
+    }
+    // RViz publishes in the DISPLAYED map frame; in ENU mode the graph runs
+    // z-down, so flip back into the graph frame (flip_pose_enu is involutive)
+    if (enu_world_) flip_pose_enu(msg.pose.pose);
+    const gtsam::Pose3 p = r2g(msg.pose.pose);
+    const gtsam::Pose2 fix(p.x(), p.y(), p.rotation().yaw());
+    const int key = slam_.current_key() - 1;
+    const gtsam::Pose2 before = slam_.current_keyframe()->pose;
+
+    if (!slam_.add_manual_correction(fix)) {
+      RCLCPP_ERROR(get_logger(),
+                   "manual correction failed (%s); estimator rebuilt from "
+                   "last good state",
+                   slam_.last_error().c_str());
+      return;
+    }
+
+    const gtsam::Pose2 after = slam_.current_keyframe()->pose;
+    RCLCPP_INFO(get_logger(),
+                "manual correction: keyframe %d (%.2f, %.2f, %.1f deg) -> "
+                "(%.2f, %.2f, %.1f deg); operator fix was "
+                "(%.2f, %.2f, %.1f deg)",
+                key, before.x(), before.y(), before.theta() * 180.0 / M_PI,
+                after.x(), after.y(), after.theta() * 180.0 / M_PI,
+                fix.x(), fix.y(), fix.theta() * 180.0 / M_PI);
+
+    // Immediate feedback without waiting for the next sonar frame: re-anchor
+    // the between-keyframe extrapolation on the corrected keyframe (skip when
+    // the current frame IS that keyframe — the graph update already refreshed
+    // it, and re-running the Pose2 overload would clobber its estimated z),
+    // republish pose + map->odom TF, the latched trajectory (mapping
+    // re-renders its tiles from it), and rebuild the viz products.
+    if (slam_.current_frame) {
+      if (slam_.current_frame != slam_.current_keyframe()) {
+        const gtsam::Pose2 dr_odom = slam_.current_keyframe()->dr_pose.between(
+          slam_.current_frame->dr_pose);
+        slam_.current_frame->update(
+          slam_.current_keyframe()->pose.compose(dr_odom));
+      }
+      publish_pose();
+    }
+    publish_trajectory();
+    if (schedule_viz_rebuild()) last_viz_publish_ = now();
+  }
+
   Slam slam_;
   std::mutex mutex_;
   // background viz rebuild (see schedule_viz_rebuild); viz_mutex_ guards the
@@ -682,6 +765,8 @@ private:
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr feature_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    manual_correction_sub_;
   std::unique_ptr<ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>
     sync_;
 

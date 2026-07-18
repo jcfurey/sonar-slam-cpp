@@ -76,6 +76,13 @@ public:
   // verification: one Gauss-Newton pass under-converges a large correction,
   // and judging that transient state reverts (and quarantines) genuine loops
   int loop_extra_iterations = 3;
+  // Operator hand-correction trust (x m, y m, yaw rad). Yaw is deliberately
+  // SOFT by default: DR yaw is compass-anchored and the whole post-loop
+  // verification stack assumes it — a hard manual yaw contradicting the
+  // compass would make every later loop round's yaw-RMS check trip
+  // spuriously. Position is where the operator's knowledge is; tighten yaw
+  // only if the compass itself is what is being corrected.
+  Eigen::Vector3d manual_correction_sigmas = Eigen::Vector3d(0.2, 0.2, 0.5);
   // ABSOLUTE yaw gate against the compass (kills discrete rotational
   // aliasing — e.g. a near-square pool aliases at 90°, which ICP matches
   // confidently and symmetric pairs pass PCM): the closure's relative yaw
@@ -142,6 +149,14 @@ public:
   void add_sequential_scan_matching(const KeyframePtr& keyframe);
   // returns true when a loop closure was accepted into the graph
   bool add_nonsequential_scan_matching();
+  // Operator-supplied absolute planar fix (graph/map chart) applied as a
+  // prior on the NEWEST keyframe and fully converged immediately. The elastic
+  // DR chain distributes the correction backwards through the trajectory
+  // (and the mapping node re-renders its tiles from the republished
+  // trajectory). Operator input is ground truth by declaration: no post-loop
+  // verification runs. Returns false when there is no keyframe yet or the
+  // solve failed (last_error()).
+  bool add_manual_correction(const gtsam::Pose2& map_pose);
   // Incorporate the buffered factors/values into ISAM2. Returns false when the
   // solve failed: the offending frame's factors (and any loop closures marked
   // this round) are rolled back, the estimator is rebuilt from the previously
@@ -214,6 +229,9 @@ private:
   // indices into nssm_queue_ of loops marked inserted since the last
   // successful update (rolled back if that update fails)
   std::vector<int> pending_loops_;
+  // next update carries a manual correction: converge hard (like a loop
+  // round) even though pending_loops_ is empty
+  bool force_converge_ = false;
   std::string last_error_;
 
   // 6D models over the Pose3 tangent (rx, ry, rz, tx, ty, tz); see configure()

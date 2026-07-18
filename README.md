@@ -163,6 +163,16 @@ SONAR_SLAM_FORCE_CPU=1 ros2 launch sonar_slam_cpp slam.launch.xml
 ros2 run sonar_slam_cpp parity_check
 ```
 
+### Hand correction
+
+The operator can correct the SLAM estimate live: use RViz's **2D Pose
+Estimate** button (publishes `/initialpose` in the `map` frame) to place the
+vehicle where it actually is. The fix is applied as a position-tight,
+yaw-soft prior on the newest keyframe; the trajectory re-optimizes, the
+`map->odom` TF jumps, and the mapping node re-renders its tiles from the
+republished trajectory. Topic and trust sigmas are `manual_correction_topic`
+/ `manual_correction_sigmas` in `config/slam.yaml`.
+
 ## Parity verification against the Python stack
 
 `test/parity_driver.py` (dev-only; requires the Python bruce_slam workspace)

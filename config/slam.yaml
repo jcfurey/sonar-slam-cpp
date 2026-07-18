@@ -105,3 +105,14 @@
     # above judge the graph (one Gauss-Newton pass under-converges a large
     # correction and the transient would read as a fold)
     loop_extra_iterations: 3
+
+    # Operator hand-correction: a map-frame planar pose published here
+    # (RViz "2D Pose Estimate" publishes /initialpose) becomes a prior on the
+    # NEWEST keyframe; the elastic DR chain distributes the correction
+    # backwards and the mapping node re-renders from the republished
+    # trajectory. Empty string disables the subscription.
+    manual_correction_topic: /initialpose
+    # operator trust [x m, y m, yaw rad]. Yaw is deliberately SOFT: DR yaw is
+    # compass-anchored and the post-loop verification assumes it — tighten
+    # yaw only if the compass itself is what is being corrected.
+    manual_correction_sigmas: [0.2, 0.2, 0.5]
