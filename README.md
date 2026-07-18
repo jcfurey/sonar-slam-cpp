@@ -24,6 +24,7 @@ against the Python SLAM node or vice versa.
 | `enu_odom_relay_node` | ENU→z-down odometry relay | `scripts/enu_odom_relay.py` |
 | `mapping_node` | keyframe-anchored, loop-closure-correctable occupancy grid + intensity/backscatter mosaic | `mapping.py` |
 | `parity_check` | CPU/GPU parity + perf self-test | — |
+| `map_metrics` | map-quality metrics (wall thickness, doubled-wall fraction) over the slam cloud | — |
 
 `mapping_node` consumes the latched `/bruce/slam/slam/traj` (whole optimized
 trajectory) plus the ping + feature cloud, and re-renders its 2D map products
@@ -172,6 +173,32 @@ yaw-soft prior on the newest keyframe; the trajectory re-optimizes, the
 `map->odom` TF jumps, and the mapping node re-renders its tiles from the
 republished trajectory. Topic and trust sigmas are `manual_correction_topic`
 / `manual_correction_sigmas` in `config/slam.yaml`.
+
+A mis-click is not permanent — corrections form an undo stack:
+
+```bash
+ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+```
+
+removes the most recent manual prior and relaxes the trajectory back; call
+repeatedly to peel earlier corrections.
+
+### Field diagnostics
+
+`slam_node` and `dead_reckoning_node` publish `/diagnostics`
+(`diagnostic_msgs/DiagnosticArray`, 1 Hz): sync pairing health (the
+stamp-offset starvation signature raises ERROR), the NSSM
+accept/reject/revert funnel, and the manual-correction counters — watch with
+`rqt_runtime_monitor` instead of grepping logs mid-deployment.
+
+### Map-quality metrics
+
+`ros2 run sonar_slam_cpp map_metrics` subscribes to the aggregated SLAM
+cloud (latched — works live or against `ros2 bag play` of a recorded run)
+and prints one line per map update: total wall length, local wall thickness
+(median / p95), and the doubled-wall fraction at the 0.3–3 m probe scale —
+the `docs/MAP_DOUBLING_FIX_PLAN.md` §5 numbers, so before/after replays
+compare as numbers instead of screenshots.
 
 ## Parity verification against the Python stack
 

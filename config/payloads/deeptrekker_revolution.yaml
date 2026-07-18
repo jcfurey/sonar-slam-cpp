@@ -73,3 +73,16 @@
       driver: projected_sonar
       topic: /oculus/sonar_image
     compressed_images: false
+
+    # SLAM back-end — estimate the sequential scan-match covariance instead of
+    # shipping a fixed confidence. The base slam.yaml keeps ssm/cov_samples: 0
+    # for bruce_slam parity, which stamps every SSM factor with the constant
+    # icp_odom_sigmas (10 cm / 0.01 rad) no matter how well the registration
+    # actually locked — the last cleared-with-an-asterisk suspect in
+    # docs/SLAM_EFFECTIVENESS_AUDIT.md section 4. The Censi closed form prices
+    # each factor from the actual ICP correspondence geometry for the cost of
+    # the one registration already being run (docs/RESEARCH.md). Parameter
+    # overlays merge per key, so only these two SSM keys change.
+    ssm:
+      cov_samples: 1      # any value above 0 enables covariance estimation
+      cov_method: censi   # one ICP + closed-form covariance (no sample loop)

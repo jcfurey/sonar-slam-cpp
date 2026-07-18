@@ -953,11 +953,45 @@ bool Slam::add_manual_correction(const gtsam::Pose2& map_pose)
     gtsam::Rot3::Yaw(map_pose.theta()),
     gtsam::Point3(map_pose.x(), map_pose.y(),
                   keyframes[key]->horizon_pose3().z()));
+  // where this prior will land inside committed_graph_ once
+  // update_factor_graph mirrors the buffer (push_back preserves append
+  // order) — recorded so undo_manual_correction can remove exactly this
+  // factor later
+  const std::size_t committed_idx = committed_graph_.size() + graph_.size();
   graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
     X(key), target,
     lift_sigmas(manual_correction_sigmas, kSigmaWide, kSigmaWide)));
   force_converge_ = true;
-  return update_factor_graph();
+  if (!update_factor_graph()) return false;
+  manual_prior_indices_.push_back(committed_idx);
+  ++manual_corrections_applied;
+  return true;
+}
+
+bool Slam::undo_manual_correction()
+{
+  if (manual_prior_indices_.empty()) {
+    last_error_ = "no manual correction to undo";
+    return false;
+  }
+  const std::size_t idx = manual_prior_indices_.back();
+  manual_prior_indices_.pop_back();
+  // Null-hole removal (FactorGraph::remove) keeps every other recorded index
+  // valid; rebuild_isam skips the holes when feeding the fresh estimator.
+  // The index is always live: verification/failure truncations only drop
+  // factors of rounds that were never recorded here.
+  if (idx < committed_graph_.size() && committed_graph_[idx])
+    committed_graph_.remove(idx);
+  rebuild_isam();
+  // The rebuild relinearizes AT the corrected poses, which are no longer the
+  // optimum without the prior — relax the trajectory back and sweep the new
+  // estimate into the keyframes through the ordinary update path (the factor
+  // buffer is empty; converge hard, mirroring the correction round this
+  // undoes; pending_loops_ is empty so no verification runs).
+  force_converge_ = true;
+  if (!update_factor_graph()) return false;
+  ++manual_corrections_undone;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1081,12 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   if (converge_hard)
     for (int i = 0; i < loop_extra_iterations; ++i) isam_.update();
   const gtsam::Values values = isam_.calculateEstimate();
+  // A healthy estimator always carries at least the anchor state; an empty
+  // estimate means a preceding rebuild failed and the sweep below would
+  // write identity into the newest keyframe — unwind through the post-solve
+  // catch instead.
+  if (values.empty() && !keyframes.empty())
+    throw std::runtime_error("solver returned an empty estimate");
   // Extract the optimized poses sequentially (gtsam map lookups; throws
   // loudly on a missing key, and a throw must not originate inside an OpenMP
   // region), then re-transform every keyframe's cloud in PARALLEL — on a
@@ -1140,6 +1180,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
            "keyframe link to " + std::to_string(worst_tear) +
            " m from DR > " + std::to_string(post_loop_max_translation_err));
       last_nssm_status = "REVERTED (" + last_error_ + ")";
+      ++nssm_reverted;
       // un-mirror this round's factors so the rebuild excludes them, and
       // QUARANTINE the loops: the clique demonstrably bent the graph, so it
       // must not re-form and re-fail (accept/revert/rebuild churn) on the
@@ -1270,7 +1311,12 @@ void Slam::rebuild_isam()
   for (std::size_t i = 0; i < keyframes.size(); ++i)
     estimates.insert(X(static_cast<int>(i)), keyframes[i]->horizon_pose3());
   try {
-    gtsam::NonlinearFactorGraph graph = committed_graph_;
+    // skip null holes (undo_manual_correction removes factors in place to
+    // keep recorded indices stable)
+    gtsam::NonlinearFactorGraph graph;
+    graph.reserve(committed_graph_.size());
+    for (const auto& f : committed_graph_)
+      if (f) graph.push_back(f);
     isam_.update(graph, estimates);
   } catch (const std::exception& e) {
     last_error_ += std::string("; estimator rebuild also failed: ") + e.what();

@@ -136,6 +136,11 @@ public:
   // 11.34 = chi2.ppf(0.99, 3)) and how many consistency edges formed
   double last_pcm_min_md = -1.0;
   int last_pcm_edges = 0;
+  // loop rounds reverted by the post-loop verification (diagnostics)
+  int nssm_reverted = 0;
+  // operator hand-corrections applied / undone over the run (diagnostics)
+  int manual_corrections_applied = 0;
+  int manual_corrections_undone = 0;
 
   const KeyframePtr& current_keyframe() const { return keyframes.back(); }
   int current_key() const { return static_cast<int>(keyframes.size()); }
@@ -157,6 +162,16 @@ public:
   // verification runs. Returns false when there is no keyframe yet or the
   // solve failed (last_error()).
   bool add_manual_correction(const gtsam::Pose2& map_pose);
+  // Remove the MOST RECENT manual-correction prior from the committed graph
+  // and re-solve, relaxing the trajectory back. Stack semantics: call again
+  // to peel earlier corrections. Returns false (last_error()) when there is
+  // nothing to undo or the re-solve failed.
+  bool undo_manual_correction();
+  // manual priors currently in the graph (undo stack depth)
+  int manual_corrections_pending() const
+  {
+    return static_cast<int>(manual_prior_indices_.size());
+  }
   // Incorporate the buffered factors/values into ISAM2. Returns false when the
   // solve failed: the offending frame's factors (and any loop closures marked
   // this round) are rolled back, the estimator is rebuilt from the previously
@@ -232,6 +247,11 @@ private:
   // next update carries a manual correction: converge hard (like a loop
   // round) even though pending_loops_ is empty
   bool force_converge_ = false;
+  // committed_graph_ indices of the applied manual-correction priors (an
+  // undo stack). Truncations never invalidate these: they only drop factors
+  // of FAILED rounds, which are never recorded here, and undo removal
+  // null-holes the graph in place instead of shifting indices.
+  std::vector<std::size_t> manual_prior_indices_;
   std::string last_error_;
 
   // 6D models over the Pose3 tangent (rx, ry, rz, tx, ty, tz); see configure()

@@ -2,10 +2,12 @@
 // sonar feature clouds with dead-reckoning odometry, runs the SSM/NSSM/ISAM2
 // back-end, and publishes pose, odometry, trajectory, constraints, the
 // registered map cloud and the map->odom TF.
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -13,6 +15,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -203,13 +206,15 @@ public:
     // an odom outage silently drops feature frames from the sync queue —
     // surface it instead of losing keyframes with no log line
     sync_->set_overflow_callback([this](std::size_t dropped) {
+      sync_dropped_total_ += dropped;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 10000,
         "feature<->odom sync dropped %zu unmatched feature frame(s) — "
         "odometry stalled or lagging beyond feature_odom_sync_max_delay",
         dropped);
     });
-    sync_->set_nomatch_callback([this](std::size_t) {
+    sync_->set_nomatch_callback([this](std::size_t n) {
+      sync_nomatch_total_ += n;
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 10000,
         "feature frames are being passed by the odometry stream with no "
@@ -233,13 +238,22 @@ public:
     // newest keyframe (see manual_correction_callback). Empty topic disables.
     const std::string mc_topic =
       get_string("manual_correction_topic", "/initialpose");
-    if (!mc_topic.empty())
+    if (!mc_topic.empty()) {
       manual_correction_sub_ =
         create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
           mc_topic, 1,
           [this](const geometry_msgs::msg::PoseWithCovarianceStamped& msg) {
             manual_correction_callback(msg);
           });
+      // paired undo (stack semantics — call repeatedly to peel corrections):
+      //   ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+      undo_srv_ = create_service<std_srvs::srv::Trigger>(
+        "~/undo_manual_correction",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+          undo_manual_correction(*res);
+        });
+    }
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
       SLAM_POSE_TOPIC, 10);
@@ -278,6 +292,15 @@ public:
           last_cloud_pub_ = now();
         });
     }
+
+    // Field diagnostics: the SLAM status line and sync-health ERRORs exist
+    // only as logs — mirror the funnel counters on /diagnostics so pairing
+    // starvation and the NSSM accept/reject balance are visible in rqt
+    // during a deployment.
+    diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", 10);
+    diag_timer_ = create_wall_timer(std::chrono::seconds(1),
+                                    [this]() { publish_diagnostics(); });
 
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -724,12 +747,120 @@ private:
                 after.x(), after.y(), after.theta() * 180.0 / M_PI,
                 fix.x(), fix.y(), fix.theta() * 180.0 / M_PI);
 
-    // Immediate feedback without waiting for the next sonar frame: re-anchor
-    // the between-keyframe extrapolation on the corrected keyframe (skip when
-    // the current frame IS that keyframe — the graph update already refreshed
-    // it, and re-running the Pose2 overload would clobber its estimated z),
-    // republish pose + map->odom TF, the latched trajectory (mapping
-    // re-renders its tiles from it), and rebuild the viz products.
+    republish_corrected_state();
+  }
+
+  // Service twin of the manual correction: pop the most recent manual prior
+  // off the graph and re-solve (the trajectory relaxes back toward the
+  // uncorrected optimum). Same immediate-feedback republish as applying one.
+  void undo_manual_correction(std_srvs::srv::Trigger::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slam_.manual_corrections_pending() == 0) {
+      res.success = false;
+      res.message = "no manual correction to undo";
+      return;
+    }
+    const gtsam::Pose2 before = slam_.current_keyframe()->pose;
+    if (!slam_.undo_manual_correction()) {
+      res.success = false;
+      res.message = "undo failed: " + slam_.last_error();
+      RCLCPP_ERROR(get_logger(), "manual-correction undo failed (%s)",
+                   slam_.last_error().c_str());
+      return;
+    }
+    const gtsam::Pose2 after = slam_.current_keyframe()->pose;
+    char buf[192];
+    std::snprintf(buf, sizeof buf,
+                  "removed last manual prior: newest keyframe "
+                  "(%.2f, %.2f, %.1f deg) -> (%.2f, %.2f, %.1f deg); "
+                  "%d manual correction(s) remain",
+                  before.x(), before.y(), before.theta() * 180.0 / M_PI,
+                  after.x(), after.y(), after.theta() * 180.0 / M_PI,
+                  slam_.manual_corrections_pending());
+    res.success = true;
+    res.message = buf;
+    RCLCPP_INFO(get_logger(), "%s", buf);
+    republish_corrected_state();
+  }
+
+  // 1 Hz /diagnostics snapshot of the SLAM funnel + sync health. Level
+  // logic: pairing starvation since the last tick is ERROR (keyframes stop
+  // silently while streams look alive — the stamp-offset signature);
+  // sync drops or a verification revert since the last tick are WARN.
+  void publish_diagnostics()
+  {
+    diagnostic_msgs::msg::DiagnosticStatus st;
+    st.name = "sonar_slam/slam";
+    st.hardware_id = "sonar_slam_cpp";
+    auto add = [&st](const char* k, const std::string& v) {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = k;
+      kv.value = v;
+      st.values.push_back(kv);
+    };
+
+    const std::uint64_t nomatch = sync_nomatch_total_;
+    const std::uint64_t dropped = sync_dropped_total_;
+    int reverted = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      reverted = slam_.nssm_reverted;
+      add("keyframes", std::to_string(slam_.current_key()));
+      add("ssm_factors", std::to_string(slam_.ssm_accepted));
+      add("nssm_accepted", std::to_string(slam_.nssm_accepted));
+      add("nssm_attempts", std::to_string(slam_.nssm_attempts));
+      add("nssm_queued", std::to_string(slam_.nssm_queued));
+      add("nssm_queue_depth", std::to_string(slam_.nssm_queue_depth()));
+      add("nssm_best_clique", std::to_string(slam_.nssm_best_clique));
+      add("nssm_reverted", std::to_string(reverted));
+      add("nssm_rejects", slam_.nssm_reject_summary());
+      add("last_ssm", slam_.last_ssm_status);
+      add("last_nssm", slam_.last_nssm_status);
+      add("manual_corrections_applied",
+          std::to_string(slam_.manual_corrections_applied));
+      add("manual_corrections_undone",
+          std::to_string(slam_.manual_corrections_undone));
+      add("manual_priors_active",
+          std::to_string(slam_.manual_corrections_pending()));
+    }
+    add("sync_nomatch_total", std::to_string(nomatch));
+    add("sync_dropped_total", std::to_string(dropped));
+    add("gpu", gpu::available() ? "on" : "off");
+
+    if (nomatch > diag_prev_nomatch_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      st.message = "feature<->odom no-match starvation: no keyframes are "
+                   "forming — measure and set sonar/dvl stamp_offset";
+    } else if (dropped > diag_prev_dropped_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "odometry stalling: unmatched feature frames dropped";
+    } else if (reverted > diag_prev_reverted_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "loop-closure round reverted by post-loop verification";
+    } else {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      st.message = "running";
+    }
+    diag_prev_nomatch_ = nomatch;
+    diag_prev_dropped_ = dropped;
+    diag_prev_reverted_ = reverted;
+
+    diagnostic_msgs::msg::DiagnosticArray arr;
+    arr.header.stamp = now();
+    arr.status.push_back(std::move(st));
+    diag_pub_->publish(arr);
+  }
+
+  // Immediate feedback after a manual correction / undo, without waiting for
+  // the next sonar frame (called under mutex_): re-anchor the between-keyframe
+  // extrapolation on the corrected keyframe (skip when the current frame IS
+  // that keyframe — the graph update already refreshed it, and re-running the
+  // Pose2 overload would clobber its estimated z), republish pose + map->odom
+  // TF, the latched trajectory (mapping re-renders its tiles from it), and
+  // rebuild the viz products.
+  void republish_corrected_state()
+  {
     if (slam_.current_frame) {
       if (slam_.current_frame != slam_.current_keyframe()) {
         const gtsam::Pose2 dr_odom = slam_.current_keyframe()->dr_pose.between(
@@ -767,6 +898,15 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     manual_correction_sub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undo_srv_;
+  // diagnostics: sync counters bump on the subscription path while the 1 Hz
+  // timer reads them — atomics keep this executor-agnostic (slam_ state is
+  // snapshotted under mutex_ instead)
+  std::atomic<std::uint64_t> sync_nomatch_total_{0}, sync_dropped_total_{0};
+  std::uint64_t diag_prev_nomatch_ = 0, diag_prev_dropped_ = 0;
+  int diag_prev_reverted_ = 0;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
+  rclcpp::TimerBase::SharedPtr diag_timer_;
   std::unique_ptr<ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>
     sync_;
 

@@ -77,6 +77,8 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -210,9 +212,9 @@ function(sonar_slam_node name src)
   # nodes select drivers by parameter string and never include a vendor header;
   # the vendor message runtime comes transitively through sonar_slam_ros
   ament_target_dependencies(${name}
-    rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
-    builtin_interfaces tf2_ros cv_bridge marine_acoustic_msgs
-    ${SONAR_SLAM_VENDOR_MSG_DEPS} ament_index_cpp)
+    rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
+    nav_msgs visualization_msgs builtin_interfaces tf2_ros cv_bridge
+    marine_acoustic_msgs ${SONAR_SLAM_VENDOR_MSG_DEPS} ament_index_cpp)
   install(TARGETS ${name} DESTINATION lib/${PROJECT_NAME})
 endfunction()
 
@@ -229,11 +231,40 @@ add_executable(parity_check src/tools/parity_check.cpp)
 target_link_libraries(parity_check sonar_slam_core)
 install(TARGETS parity_check DESTINATION lib/${PROJECT_NAME})
 
+# map-quality metrics over the aggregated SLAM cloud (wall thickness +
+# doubled-wall fraction; the MAP_DOUBLING_FIX_PLAN §5 replay numbers)
+sonar_slam_node(map_metrics src/tools/map_metrics.cpp)
+
 # function-level parity harness against the Python bruce_slam originals
 add_executable(parity_vs_python src/tools/parity_vs_python.cpp)
 target_link_libraries(parity_vs_python sonar_slam_core)
 ament_target_dependencies(parity_vs_python builtin_interfaces geometry_msgs)
 install(TARGETS parity_vs_python DESTINATION lib/${PROJECT_NAME})
+
+# --------------------------------------------------------------------------- tests
+# Plain-executable tests (exit code is the verdict) registered through
+# ament_add_test — no gtest dependency, runs under `colcon test`. They lock in
+# the empirically-validated GTSAM behaviors the back-end's recovery and
+# hand-correction machinery depend on; if a GTSAM upgrade changes them, these
+# fail before the field does.
+if(BUILD_TESTING)
+  find_package(ament_cmake_test REQUIRED)
+
+  add_executable(test_isam_recovery test/test_isam_recovery.cpp)
+  target_include_directories(test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(test_isam_recovery gtsam)
+  ament_add_test(test_isam_recovery
+    COMMAND $<TARGET_FILE:test_isam_recovery>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_manual_correction test/test_manual_correction.cpp)
+  target_link_libraries(test_manual_correction sonar_slam_core)
+  ament_target_dependencies(test_manual_correction
+    builtin_interfaces geometry_msgs)
+  ament_add_test(test_manual_correction
+    COMMAND $<TARGET_FILE:test_manual_correction>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+endif()
 
 # ------------------------------------------------------------------------- install
 install(TARGETS sonar_slam_core sonar_slam_ros

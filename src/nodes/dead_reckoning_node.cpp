@@ -1,6 +1,7 @@
 // Dead reckoning node: port of bruce_slam dead_reckoning.py. Fuses DVL
 // velocities with an orientation source (IMU, FOG, both, or the SLAM heading
 // feedback) plus depth into an odometry estimate.
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -11,6 +12,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -199,6 +201,15 @@ public:
       if (all_seen) watchdog_->cancel();
     });
 
+    // Field diagnostics: the sync-health and gap counters otherwise exist
+    // only as throttled log lines — publish them on /diagnostics so pairing
+    // starvation is visible in rqt during a deployment (rqt_runtime_monitor /
+    // diagnostics viewer), not just in a scrolled-away terminal.
+    diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", 10);
+    diag_timer_ = create_wall_timer(std::chrono::seconds(1),
+                                    [this]() { publish_diagnostics(); });
+
     RCLCPP_INFO(get_logger(), "Localization node is initialized");
   }
 
@@ -207,6 +218,7 @@ private:
   // secondary stream is stalled) so the outage is observable
   void warn_dropped(std::size_t n)
   {
+    dropped_total_ += n;
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 5000,
       "Localization dropped %zu DVL reading(s): an IMU/gyro stream is stalling; "
@@ -220,7 +232,7 @@ private:
   // on every stream, yet zero pairs ever emit and localization stays mute.
   void warn_nomatch(std::size_t n)
   {
-    (void)n;
+    nomatch_total_ += n;
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 5000,
       "Localization DVL readings are being passed by the IMU/gyro streams "
@@ -283,6 +295,7 @@ private:
   void send_odometry(Eigen::Vector3d vel, const gtsam::Rot3& rot,
                      const builtin_interfaces::msg::Time& dvl_time, double depth)
   {
+    ++pairs_total_;
     // DVL velocity spike handling (dead_reckoning.py send_odometry)
     if (vel.cwiseAbs().maxCoeff() > dvl_max_velocity_) {
       if (pose_) {
@@ -310,6 +323,7 @@ private:
       // depth (they don't depend on dt), so even a persistently-triggering
       // gate degrades gracefully instead of freezing the whole pose.
       if (dt < 0.0 || dt > dvl_max_gap_) {
+        ++gap_events_;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 5000,
           "DVL dt %.2fs outside (0, %.2f]s (dvl_max_gap); holding position, "
@@ -389,6 +403,68 @@ private:
     }
   }
 
+  // 1 Hz /diagnostics snapshot. Level logic: pairing starvation since the
+  // last tick (the stamp-offset signature) is ERROR — every downstream
+  // consumer is silently frozen while it lasts; overflow drops / gap events
+  // since the last tick and still-missing startup streams are WARN.
+  void publish_diagnostics()
+  {
+    diagnostic_msgs::msg::DiagnosticStatus st;
+    st.name = "sonar_slam/dead_reckoning";
+    st.hardware_id = "sonar_slam_cpp";
+    auto add = [&st](const char* k, const std::string& v) {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = k;
+      kv.value = v;
+      st.values.push_back(kv);
+    };
+
+    std::uint64_t pairs, nomatch, dropped, gaps;
+    bool started, missing_stream;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pairs = pairs_total_;
+      nomatch = nomatch_total_;
+      dropped = dropped_total_;
+      gaps = gap_events_;
+      started = pose_.has_value();
+      missing_stream = !dvl_seen_ || (use_imu_ && !imu_seen_) ||
+                       (use_gyro_ && !gyro_seen_) || !last_depth_;
+      add("pairs_emitted", std::to_string(pairs));
+      add("sync_nomatch_total", std::to_string(nomatch));
+      add("sync_dropped_total", std::to_string(dropped));
+      add("dvl_gap_events", std::to_string(gaps));
+      add("dvl_seen", dvl_seen_ ? "true" : "false");
+      add("imu_seen", imu_seen_ ? "true" : "false");
+      add("gyro_seen", gyro_seen_ ? "true" : "false");
+      add("depth_seen", last_depth_ ? "true" : "false");
+      add("publishing", started ? "true" : "false");
+    }
+
+    if (nomatch > diag_prev_nomatch_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      st.message = "sync no-match starvation: streams alive but zero pairs "
+                   "emitted — measure and set <sensor>.stamp_offset";
+    } else if (missing_stream && !started) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "waiting for a required sensor stream (see *_seen)";
+    } else if (dropped > diag_prev_dropped_ || gaps > diag_prev_gaps_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "secondary stream stalling (drops/gap events increasing)";
+    } else {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      st.message = started ? "publishing" : "waiting for first pair";
+    }
+    diag_prev_nomatch_ = nomatch;
+    diag_prev_dropped_ = dropped;
+    diag_prev_gaps_ = gaps;
+
+    diagnostic_msgs::msg::DiagnosticArray arr;
+    arr.header.stamp = now();
+    arr.status.push_back(std::move(st));
+    diag_pub_->publish(arr);
+  }
+
   gtsam::Rot3 imu_rot_;
   bool imu_legacy_ = true;
   double dvl_max_velocity_ = 0.3;
@@ -410,6 +486,13 @@ private:
   bool dvl_seen_ = false, imu_seen_ = false, gyro_seen_ = false;
   std::vector<std::pair<double, gtsam::Pose3>> keyframes_;
   rclcpp::TimerBase::SharedPtr watchdog_;
+  // diagnostics counters (mutated under mutex_ by the sync/odometry paths)
+  std::uint64_t pairs_total_ = 0, nomatch_total_ = 0, dropped_total_ = 0,
+                gap_events_ = 0;
+  std::uint64_t diag_prev_nomatch_ = 0, diag_prev_dropped_ = 0,
+                diag_prev_gaps_ = 0;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
+  rclcpp::TimerBase::SharedPtr diag_timer_;
 
   rclcpp::SubscriptionBase::SharedPtr dvl_sub_, depth_sub_, imu_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gyro_sub_, slam_sub_;

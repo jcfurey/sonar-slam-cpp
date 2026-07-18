@@ -107,6 +107,11 @@ acceptance gate. All existing guards remain:
 
 ### Metrics (before → target)
 
+> The doubled-wall fraction and wall-thickness numbers are now produced
+> in-tree: `ros2 run sonar_slam_cpp map_metrics` (subscribes to the latched
+> slam cloud; works live or against a `ros2 bag play` of the recording — no
+> `/tmp` helper scripts needed).
+
 | Metric | Before | Target |
 |---|---|---|
 | doubled-wall fraction (slam cloud, `analyze_double.py`) | 23% | well below 23% |

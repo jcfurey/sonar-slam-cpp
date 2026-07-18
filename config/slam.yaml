@@ -110,7 +110,9 @@
     # (RViz "2D Pose Estimate" publishes /initialpose) becomes a prior on the
     # NEWEST keyframe; the elastic DR chain distributes the correction
     # backwards and the mapping node re-renders from the republished
-    # trajectory. Empty string disables the subscription.
+    # trajectory. Empty string disables the subscription (and the paired
+    # undo service /slam/undo_manual_correction, which pops the most recent
+    # manual prior and relaxes the trajectory back).
     manual_correction_topic: /initialpose
     # operator trust [x m, y m, yaw rad]. Yaw is deliberately SOFT: DR yaw is
     # compass-anchored and the post-loop verification assumes it — tighten
