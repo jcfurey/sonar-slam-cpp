@@ -247,7 +247,7 @@ public:
             manual_correction_callback(msg);
           });
       // paired undo (stack semantics — call repeatedly to peel corrections):
-      //   ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+      //   ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger
       undo_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/undo_manual_correction",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,

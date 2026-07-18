@@ -86,7 +86,7 @@ public:
     threshold_ = get_int("filter/threshold");
 
     // Live tuning at sea: the CFAR/filter knobs are dynamic —
-    //   ros2 param set /feature_extraction CFAR.Pfa 0.005
+    //   ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005
     // rebuilds the detector for the next ping, no relaunch. Safe under the
     // default single-threaded executor (the swap and detect() serialize).
     param_cb_ = add_on_set_parameters_callback(

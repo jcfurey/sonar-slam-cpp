@@ -10,7 +10,7 @@
     # Survey datum [latitude deg, longitude deg, bearing deg]: bearing is the
     # compass bearing (deg clockwise from true north) of the map +x axis —
     # the vehicle's initial heading, since dead reckoning zeroes yaw on the
-    # first attitude sample. With a datum set, the /mapping/export_map
+    # first attitude sample. With a datum set, the /bruce/slam/mapping/export_map
     # service (std_srvs/Trigger) writes <export_prefix>_occupancy.png /
     # _intensity.png with UTM world files (.pgw + .prj; QGIS/ArcGIS load
     # them as georeferenced rasters) and _trajectory.geojson (WGS84).

@@ -18,7 +18,7 @@ A synthetic pool simulator (`sim_payload`) drives the full standard pipeline
 mapping — with RViz up. The simulated DVL carries a small bias, so dead
 reckoning drifts visibly and loop closures pull the trajectory back. Use the
 RViz **2D Pose Estimate** button for a live hand correction;
-`ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger` takes
+`ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger` takes
 it back. The same synthetic world backs the end-to-end pipeline test that CI
 runs on every commit (`test/test_pipeline_e2e.cpp`).
 
@@ -204,7 +204,7 @@ republished trajectory. Topic and trust sigmas are `manual_correction_topic`
 A mis-click is not permanent — corrections form an undo stack:
 
 ```bash
-ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger
 ```
 
 removes the most recent manual prior and relaxes the trajectory back; call
@@ -230,7 +230,7 @@ Revolution preset arms 3 s.
 ### Map persistence & relocalization (multi-session)
 
 ```bash
-ros2 service call /slam/save_map std_srvs/srv/Trigger   # end of mission 1
+ros2 service call /bruce/slam/slam/save_map std_srvs/srv/Trigger   # end of mission 1
 # mission 2:
 ros2 launch sonar_slam_cpp slam.launch.xml ... # with slam/map_load_path set
 ```
@@ -253,7 +253,7 @@ SLAM into globally-anchored SLAM. Heading is never taken from USBL.
 ### Georeferenced deliverables
 
 Give the mapping node a survey `datum` (`[lat, lon, bearing-of-map-x]`,
-mapping.yaml) and call `/mapping/export_map` (Trigger): the occupancy and
+mapping.yaml) and call `/bruce/slam/mapping/export_map` (Trigger): the occupancy and
 intensity grids are written as PNG + UTM world files (`.pgw` + `.prj` —
 QGIS/ArcGIS open them as georeferenced rasters) and the trajectory as a
 WGS84 GeoJSON LineString.
@@ -261,7 +261,7 @@ WGS84 GeoJSON LineString.
 ### Live CFAR tuning
 
 The feature node's `CFAR.*` and `filter.threshold` parameters are dynamic:
-`ros2 param set /feature_extraction CFAR.Pfa 0.005` rebuilds the detector on
+`ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005` rebuilds the detector on
 the next ping — tune at sea without relaunching.
 
 ### Map-quality metrics

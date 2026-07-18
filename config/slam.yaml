@@ -111,7 +111,7 @@
     # NEWEST keyframe; the elastic DR chain distributes the correction
     # backwards and the mapping node re-renders from the republished
     # trajectory. Empty string disables the subscription (and the paired
-    # undo service /slam/undo_manual_correction, which pops the most recent
+    # undo service /bruce/slam/slam/undo_manual_correction, which pops the most recent
     # manual prior and relaxes the trajectory back).
     manual_correction_topic: /initialpose
     # operator trust [x m, y m, yaw rad]. Yaw is deliberately SOFT: DR yaw is
@@ -120,7 +120,7 @@
     manual_correction_sigmas: [0.2, 0.2, 0.5]
 
     # ---- map persistence (multi-session) ----
-    # /slam/save_map (std_srvs/Trigger) serializes the whole keyframe map
+    # /bruce/slam/slam/save_map (std_srvs/Trigger) serializes the whole keyframe map
     # (poses + clouds) here; set map_load_path to that file on a later
     # mission to restore it. A loaded map arms RELOCALIZATION: nothing is
     # published and no factor enters until the first dense feature frame

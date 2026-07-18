@@ -114,19 +114,22 @@ int main(int argc, char** argv)
   // discover each topic's type, then attach a generic subscription
   auto try_subscribe = [&]() {
     const auto types = node->get_topic_names_and_types();
-    for (auto& s : streams) {
-      if (s.sub) continue;
-      const auto it = types.find(s.topic);
+    for (auto& stream : streams) {
+      if (stream.sub) continue;
+      const auto it = types.find(stream.topic);
       if (it == types.end() || it->second.empty()) continue;
-      s.sub = node->create_generic_subscription(
-        s.topic, it->second.front(), rclcpp::SensorDataQoS(),
-        [&s](std::shared_ptr<rclcpp::SerializedMessage> msg) {
+      // capture the element by pointer: `streams` is sized once and never
+      // reallocated, so the pointer is stable for the subscription's life
+      Stream* sp = &stream;
+      stream.sub = node->create_generic_subscription(
+        stream.topic, it->second.front(), rclcpp::SensorDataQoS(),
+        [sp](std::shared_ptr<rclcpp::SerializedMessage> msg) {
           const double stamp =
             parse_header_stamp(msg->get_rcl_serialized_message());
           if (std::isnan(stamp)) return;
-          s.samples.emplace_back(steady_now(), stamp);
+          sp->samples.emplace_back(steady_now(), stamp);
         });
-      std::fprintf(stderr, "[stamp_probe] %s (%s)\n", s.topic.c_str(),
+      std::fprintf(stderr, "[stamp_probe] %s (%s)\n", stream.topic.c_str(),
                    it->second.front().c_str());
     }
   };

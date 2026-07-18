@@ -4,7 +4,7 @@
      Watch the map build as the vehicle laps the pool; DR carries a small
      DVL bias, so loop closures visibly pull the trajectory back. Try the
      RViz "2D Pose Estimate" button for a hand correction, and
-       ros2 service call /slam/undo_manual_correction std_srvs/srv/Trigger
+       ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger
      to take it back. -->
 <launch>
   <arg name="rviz" default="true"/>
