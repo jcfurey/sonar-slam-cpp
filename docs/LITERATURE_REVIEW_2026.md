@@ -316,11 +316,15 @@ specifically prescribed by any paper.
 
 ## What the literature suggests we change or test next (prioritized)
 
-1. **Fix the Censi option or re-document it (Part 2.6).** Highest-value,
-   lowest-effort. Either point the Censi path at a point-to-plane minimizer
-   (makes the closed form rigorous per Bonnabel), or annotate it as optimistic
-   for point-to-point and keep the degeneracy gate tight. Sampled stays the
-   default — the literature backs that.
+1. **Censi covariance (Part 2.6) — DONE this review.** The Deep Trekker
+   Revolution preset was shipping `ssm/cov_method: censi` with our
+   point-to-point ICP, which Bonnabel proves is unsound; it was switched to
+   `sampled` (cov_samples 20), which fixes the original fixed-confidence
+   concern *and* stays rigorous. The opt-in `censi` path in the base config is
+   now annotated as optimistic for point-to-point (icp_covariance.cpp,
+   slam.yaml). Remaining option if censi is ever wanted: point it at a
+   point-to-plane minimizer, or adopt a Brossard-style rematching-aware
+   estimator.
 2. **On any radar port, replace compass anchoring with gyro yaw-rate (Part
    1.4).** The single assumption most certain to break on land. The verify
    layer should compare optimized yaw against integrated gyro, not a

@@ -83,10 +83,17 @@
     # for bruce_slam parity, which stamps every SSM factor with the constant
     # icp_odom_sigmas (10 cm / 0.01 rad) no matter how well the registration
     # actually locked — the last cleared-with-an-asterisk suspect in
-    # docs/SLAM_EFFECTIVENESS_AUDIT.md section 4. The Censi closed form prices
-    # each factor from the actual ICP correspondence geometry for the cost of
-    # the one registration already being run (docs/RESEARCH.md). Parameter
-    # overlays merge per key, so only these two SSM keys change.
+    # docs/SLAM_EFFECTIVENESS_AUDIT.md section 4.
+    #
+    # Use the SAMPLED estimator (FAST-MCD over N registrations), NOT censi:
+    # Bonnabel/Barczyk/Goulette (ACC 2016) prove the Censi closed form is
+    # rigorous only for point-to-plane ICP and "completely erroneous" for
+    # point-to-point, which is our minimizer (config/icp.yaml) — see
+    # docs/LITERATURE_REVIEW_2026.md Part 2.6. Sampled fixes the fixed-
+    # confidence problem AND stays sound for point-to-point. It costs N
+    # registrations per keyframe (bounded by the OpenMP pool + the 2 s cap);
+    # if that is too heavy on the target compute, lower cov_samples rather
+    # than switching to censi. Parameter overlays merge per key.
     ssm:
-      cov_samples: 1      # any value above 0 enables covariance estimation
-      cov_method: censi   # one ICP + closed-form covariance (no sample loop)
+      cov_samples: 20     # FAST-MCD sample count for SSM covariance
+      cov_method: sampled
