@@ -7,19 +7,24 @@
 ## How to read the confidence tags
 
 The research for this document was gathered by a fan-out search harness (26
-primary sources, ~130 extracted claims). The harness's adversarial
-verification stage did **not** complete — it hit a provider usage limit
-mid-run — so the automated 3-vote confirmation is absent. To compensate, the
-most decision-critical claims were **re-verified by hand** against the primary
-sources. Every statement below carries one of:
+primary sources, ~130 extracted claims) whose adversarial 3-vote verification
+was run **twice**: the first pass died on a provider usage limit, the second
+completed cleanly with **25/25 top claims confirmed, 0 refuted** (details in
+*Verification status* at the end). Statements carry one of:
 
-- **[VERIFIED]** — re-checked this session against the cited primary source.
+- **[VERIFIED]** — either machine-confirmed by the 3-vote panel this pass
+  (marked "machine-confirmed N-0"), or re-checked by hand against the cited
+  primary source this session.
 - **[SOURCED]** — extracted verbatim by the harness from the named primary
-  source (URL given), but not independently re-verified line-by-line. Treat as
-  a strong lead, not gospel; confirm the exact figure before quoting it
+  source (URL given), but not among the 25 adjudicated claims. Treat as a
+  strong lead, not gospel; confirm the exact figure before quoting it
   externally.
 - **[DOMAIN]** — standard, uncontroversial background knowledge in the field;
   no single citation is load-bearing.
+
+Five Part 2 decisions (ISAM2 tuning, Censi covariance, DVL-coast, Sobol
+relocalization, USBL priors) returned **no adjudicable evidence** and are
+flagged *not machine-confirmed* — unconfirmed, not contradicted.
 
 Where the literature **disagrees** with a choice we made, it is called out
 plainly.
@@ -97,21 +102,26 @@ These are the effects a sonar pipeline never sees and a radar port must add:
    points to the mid-sweep timestamp under a constant-velocity assumption.
    Our pipeline treats each frame as instantaneous — **this stage does not
    exist in our code and must be built.**
-2. **Doppler range bias in FMCW.** Radial ego-velocity shifts apparent target
-   range (~4.8 cm per 1 m/s for the 76–77 GHz Navtech, per the harness's
-   extraction of Burnett et al.). **[SOURCED]** (arXiv 2011.03512)
-3. **Motion vs Doppler — the quantified nuance.** Burnett, Schoellig &
-   Barfoot (RA-L 2021) reportedly find: Doppler **cancels** in scan-to-scan
-   registration (consecutive scans distort alike) so it can be ignored for
-   *odometry*, but **matters for metric localization against a prior map** —
-   with the biggest published gains on a reverse-direction drive (motion comp
-   ~41.7 %, Doppler ~67.7 %, both ~81.2 %, ~2.30 m → ~0.43 m median).
-   **[SOURCED — not independently re-verified; the PDF was unparseable this
-   session. Confirm before external quotation.]** This distinction maps
-   *directly* onto our own architecture: it means our **relocalization**
-   module (localize against a saved map) would be the part that most needs
-   Doppler/motion compensation, while our scan-to-scan SSM would tolerate its
-   absence.
+2. **Doppler range bias in FMCW — MODULATION-DEPENDENT; likely NEGLIGIBLE for
+   the CTS350-X.** Radial ego-velocity shifts apparent target range. **But the
+   named Navtech CTS350-X (and CIR204-H) use SAWTOOTH chirp modulation, for
+   which Burnett et al. found Doppler compensation negligible.** The
+   large-gain "zig-zag" Doppler effect is a **triangular-chirp** phenomenon
+   (Lisus/Burnett et al. 2024). **[VERIFIED — machine-confirmed 3-0, 2nd
+   pass.]** So for the sensor you actually named, **motion-distortion
+   compensation is the one clearly-mandatory addition; Doppler compensation is
+   probably not needed.** (arXiv 2011.03512, arXiv 2404.01537)
+3. **Motion vs Doppler — the quantified nuance (triangular-chirp / cross-
+   direction).** Burnett, Schoellig & Barfoot (RA-L 2021): Doppler **cancels**
+   in scan-to-scan registration (consecutive scans distort alike) so it can be
+   ignored for *odometry*, but **matters for metric localization against a map
+   traversed in the opposite direction** — motion comp ~41.7 %, Doppler
+   ~67.7 %, both ~81.2 % error reduction on the reverse-direction case.
+   **[VERIFIED — machine-confirmed 3-0, 2nd pass.]** This maps onto our
+   architecture: our **relocalization** module (against a saved map) is the
+   part that would most need Doppler compensation — *and only if the map was
+   built driving the opposite direction on a triangular-chirp radar*. For same-
+   direction sonar/radar odometry, and for the CTS350-X, it is a non-issue.
 4. **Speckle, receiver saturation, multipath ghosts, detection
    discontinuity.** Radar perceives *beyond* the nearest object on a line of
    sight, producing repetitive ghost returns and targets that blink between
@@ -170,12 +180,12 @@ equivalence is well established. **[DOMAIN]**
 | Polar image → point cloud geometry | **Yes** (retune range/aperture) | — |
 | CFAR detector | **Partial** | Add k-strongest / adaptive-per-azimuth; benchmark vs OS-CFAR; expect saturation/ghost handling |
 | ICP / scan registration | **Yes** | — (but see Part 2.6 on covariance) |
-| ISAM2 pose graph + PCM | **Yes** | — |
-| Optimize-then-verify + revert | **Yes** — TBV is the radar precedent | Compare vs gyro, not compass |
+| Pose graph + PCM | **Yes** (radar convention uses g2o, not ISAM2 — cosmetic) | — |
+| Optimize-then-verify + revert | **Yes** — TBV validates verify-over-kernels | TBV is verify-*before*-commit; our revert-*after*-optimize step lacks a confirmed precedent (see 2.5) |
 | Compass-anchored yaw + gate | **No — breaks** | Gyro/IMU yaw-rate anchor; distrust magnetometer near chassis |
-| DVL + AHRS front-end | **No** | Radar-only odometry, or radar + IMU |
-| Motion-distortion comp. | **Missing — must add** | De-skew to mid-sweep (CFEAR) or joint velocity-pose (RadarSLAM) |
-| Doppler comp. | **Missing — add for relocalization** | Needed for map localization, not scan-to-scan (Burnett) |
+| DVL + AHRS front-end | **No** | Radar-only odometry, or gyro + radar ego-velocity (tunnel drift 31 %→0.55 %, Lisus et al. RA-L 2025) |
+| Motion-distortion comp. | **Missing — must add** | De-skew to mid-sweep (CFEAR) or joint velocity-pose (RadarSLAM) — the one mandatory radar addition |
+| Doppler comp. | **Not needed for CTS350-X** | Negligible under sawtooth modulation (CTS350-X); only matters for triangular-chirp + reverse-direction map localization (Burnett) |
 | Mapping / occupancy | **Yes** | — |
 | Georeferencing (UTM export) | **Yes — already land-ready** | — |
 
@@ -190,55 +200,64 @@ against spiky clutter. **[DOMAIN]** For *radar*, see 1.2 — nuanced. A sonar
 CFAR-detection reference is in the source set (MDPI *Sensors* 2018,
 s18010076). **[SOURCED]**
 
-**2. Disabling DCS / robust kernels in favour of optimize-then-verify + revert
-+ quarantine — VALIDATED, with a strong published precedent.**
-The robust-kernel line (Sünderhauf & Protzel switchable constraints, IROS
-2012; Agarwal et al. Dynamic Covariance Scaling, ICRA 2013) down-weights
-suspect loop edges *inside* the optimization. Our audit found DCS(φ=1) mutes
-metre-scale genuine corrections (weight 2φ/(φ+χ²)). The literature's modern
-answer to exactly this — **verify the loop candidate *after* registration and
-accept/reject, rather than soft-weighting it** — is **TBV Radar SLAM** ("Trust
-But Verify", RA-L 2023): it checks alignment quality, place similarity, and
-odometry uncertainty and selects the most likely constraint. **[SOURCED]**
-RTAB-Map's robust graph optimization / OptimizeMaxError is the same
-verify-and-reject philosophy. **[SOURCED]** Our optimize-then-verify-then-
-revert layer is squarely in this accepted lineage; keeping DCS as opt-in
-rather than default is defensible. **Nuance:** robust kernels and verify-revert
-are not mutually exclusive in the literature — some systems use both. Offering
-DCS as opt-in (as we do) is the conservative, well-supported choice.
+**2. Disabling DCS / robust kernels in favour of verify-and-gate — VALIDATED
+(machine-confirmed 3-0).**
+This is now our most strongly-supported decision. Agarwal et al. (DCS, ICRA
+2013) scale each loop edge by `s = min(1, 2φ/(φ+χ²))` — a function of the
+constraint's **current χ² residual magnitude, not of whether the edge is
+true**. **[VERIFIED — the exact formula and the Φ=1 default were machine-
+confirmed 3-0 against the primary source this pass.]** So a genuine loop
+carrying a metre-scale correction is attenuated *identically* to an outlier of
+the same residual — precisely the muting our audit observed. Sünderhauf &
+Protzel (IROS 2012) additionally show switchable constraints **fail in
+degenerate, sparsely-interconnected graphs** (confirmed 3-0). Not entrusting
+metre-scale corrections to a residual-keyed kernel, and gating/verifying them
+instead, is directly literature-supported. Keeping DCS opt-in is the
+conservative choice.
 
 **3. ISAM2 relinearizeThreshold 0.01 / relinearizeSkip 1 + extra update()
-iterations on loop rounds — NUANCED (sound, under-documented).**
+iterations on loop rounds — NOT MACHINE-CONFIRMED (open question).**
 The defaults (0.1 / 10) are batch-throughput settings; tightening them makes
-ISAM2 relinearize more aggressively, which is exactly what a large loop-closure
+ISAM2 relinearize more aggressively, which is what a large loop-closure
 correction needs to converge rather than staircase across updates (Kaess et
-al., iSAM2, IJRR 2012, is the authority on the relinearization machinery).
-**[SOURCED/DOMAIN]** There is no single paper prescribing "0.01 / 1 for
-sonar," so this is an empirically-justified tuning, not a cited constant —
-which matches how we've documented it. The extra-iterations-before-verify
-step is our own contribution and is consistent with the general finding that
-judging an under-converged transient is unsafe.
+al., iSAM2, IJRR 2012, is the authority on the machinery). **[DOMAIN]** The
+verification harness found **no surviving published claim** prescribing these
+specific values — it remains an empirically-justified tuning, not a cited
+constant. Documented honestly as such; the extra-iterations-before-verify step
+is our own contribution.
 
-**4. PCM with small queue (5) and min-clique 2 — VALIDATED (method), NUANCED
-(sizing).**
-PCM (Mangelson, Dominic, Eustice, Vasudevan; ICRA 2018; IEEE 8460217) is the
-right tool for rejecting mutually-inconsistent loop closures, and combining it
-with per-measurement gating (our degeneracy + compass gates) is a sensible
-belt-and-suspenders. **[SOURCED]** The specific queue size (5) and min-clique
-(2) are not literature constants — min-clique 2 is the *weakest* consistency
-requirement (a single consistent pair), which is permissive; the paper's
-robustness comes from larger consistent sets. **Recommendation:** treat
-min_pcm as the primary robustness knob and consider min-clique 3 where loop
-density allows.
+**4. PCM as the outlier layer — VALIDATED (method, machine-confirmed 3-0);
+sizing UNCONFIRMED.**
+Mangelson et al. (ICRA 2018) reduce loop-outlier rejection to a **maximum-
+clique** problem on a pairwise-consistency graph and show PCM **significantly
+outperforms DCS, SCGP, and RANSAC** (lowest trajectory MSE; notably DCS got
+the lowest *residual* but the highest *trajectory* MSE — it fits the outliers).
+**[VERIFIED — machine-confirmed 3-0.]** Our `verify_pcm` matches this basis
+(Mahalanobis edge threshold χ²₀.₉₉,₃ = 11.34, Bron–Kerbosch max clique).
+**Three nuances the verification flagged:** (1) the PCM-beats-DCS benchmark is
+the proposing authors' own — *mitigated* by wide independent adoption since
+(Kimera-Multi, DOOR-SLAM, Swarm-SLAM); (2) PCM was designed for **multi-robot
+map merging with no odometry backbone**, so its superiority transfers with a
+caveat to our single-robot DVL-backbone setting; (3) our **queue size (5) and
+min-clique (2) have no surviving published sizing guidance** — an open
+question. **Recommendation:** treat min_pcm as the primary robustness knob;
+consider min-clique 3 where loop density allows.
 
-**5. Post-optimization verification then REVERT — VALIDATED.**
-Comparing the optimized graph against an independent reference and rejecting
-bad constraints is established: TBV (radar, RA-L 2023), RTAB-Map's
-OptimizeMaxError, and Cartographer's constraint-scoring / branch-and-bound
-acceptance (Hess, Kohler, Rapp, Andor; ICRA 2016). **[SOURCED]** Our specific
-references — windowed yaw-RMS vs compass, per-link chain-tear vs dead reckoning
-— are a novel *instantiation*, but the family (verify-then-commit / lazy loop
-commitment) is standard. This is one of our better-grounded decisions.
+**5. Post-optimization verification then REVERT — VALIDATED in philosophy,
+the REVERT STEP itself unconfirmed.**
+The verify-over-robust-kernels philosophy has a machine-confirmed radar
+precedent: TBV ("Trust But Verify", Adolfsson et al., RA-L/IROS 2023) verifies
+and selects loop candidates after registration using place similarity +
+odometry-uncertainty search. **[VERIFIED — machine-confirmed 3-0.]**
+**Important ordering nuance:** TBV is **verify-*before*-commit** (candidates
+gated before entering the graph), whereas we **commit → optimize → revert**.
+So TBV validates the verification-over-kernels idea and lazy/delayed loop
+commitment, but is *not* a precedent for the explicit revert-after-optimization
+step. The revert-step precedents named in the research question (RTAB-Map
+OptimizeMaxError, Karto/Cartographer constraint verification) **did not surface
+a surviving verified claim** this pass — our windowed-yaw-RMS / chain-tear
+revert is, as far as the harness confirmed, a novel instantiation. Sound, but
+we should stop calling it "well-precedented" for the revert specifically.
 
 **6. Censi closed-form ICP covariance offered opt-in, sampling as default —
 VALIDATED as a default choice; the Censi OPTION is CONTRADICTED for our ICP
@@ -329,10 +348,11 @@ specifically prescribed by any paper.
    1.4).** The single assumption most certain to break on land. The verify
    layer should compare optimized yaw against integrated gyro, not a
    magnetometer.
-3. **Add motion de-skew + Doppler compensation *if* radar (Part 1.3).**
-   De-skew to mid-sweep for odometry; add Doppler compensation specifically in
-   the relocalization/map-localization path, where Burnett shows it matters
-   most. Not needed for sonar.
+3. **Add motion de-skew *if* radar; Doppler comp is NOT needed for the
+   CTS350-X (Part 1.3).** De-skew to mid-sweep is the one mandatory radar
+   addition. Doppler compensation is negligible under the CTS350-X's sawtooth
+   modulation — add it only for a triangular-chirp radar localizing against a
+   reverse-direction map. Neither is needed for sonar.
 4. **Offer a k-strongest / adaptive-per-azimuth detector alongside CFAR for
    radar, and benchmark (Part 1.2).** CFEAR's argument against direct CFAR is
    worth taking seriously; OS-CFAR is our most radar-appropriate variant to
@@ -381,6 +401,14 @@ retrieved; verify DOIs/venues before external citation.
   Estimation*, RA-L 2020 — arXiv:1909.05722
 - Landry, Pomerleau, Giguère, *CELLO-3D: Estimating the Covariance of ICP in
   the Real World*, ICRA 2019 — arXiv:1810.01470
+- Lisus, Burnett, Yoon, Barfoot et al., radar odometry with preintegrated gyro
+  + Doppler ego-velocity (110+ km; tunnel drift 31 %→0.55 %), RA-L 2025 /
+  ICRA 2025 — arXiv:2404.01537
+- Fan, Li & Liu, magnetometer yaw under continuous magnetic disturbance
+  (>21° in 10 s; roll/pitch unaffected), MDPI *Sensors* 2018 —
+  doi.org/10.3390/s18010076
+- Frosi et al., *Advancements in Radar Odometry* (CFEAR-lineage pipeline
+  description), 2023
 - Vial et al., underwater sonar SLAM with magnetometer yaw priors, JFR 2024 —
   doi.org/10.1002/rob.22272
 - Ribas, Ridao, Tardós, Neira, *Underwater SLAM in man-made structured
@@ -394,10 +422,37 @@ retrieved; verify DOIs/venues before external citation.
   arXiv:2404.01537, pmc.ncbi.nlm.nih.gov/articles/PMC11452886,
   scispace (sonar relocalization)
 
-**Verification status.** Independently re-verified this session: the Bonnabel
-point-to-point/point-to-plane distinction (Part 2.6) and CFEAR's k-strongest
-detector + 1.76 %/55 Hz result (Parts 1.1–1.2). All other citations are
-harness-extracted from the named primary sources and tagged **[SOURCED]**; the
-automated verification stage did not complete due to a provider usage limit.
-Re-run the verification pass, or confirm a specific figure against its source,
-before quoting numbers externally.
+**Verification status (two passes).** The research harness's automated
+3-vote adversarial verification was run twice. The first pass died on a
+provider usage limit (0 claims adjudicated). The **second pass completed
+cleanly: 25 of 25 top claims CONFIRMED, 0 refuted, 0 unverified** — almost all
+by unanimous 3-0 votes. Machine-confirmed this pass:
+
+- Radar pipeline shape ports (scan-registration + pose graph); radar convention
+  is g2o, not ISAM2 (cosmetic).
+- CFAR is **not** the canonical radar front-end (RadarSLAM blob+KLT, CFEAR
+  k-strongest, Cen & Newman noise-statistics; CFAR explicitly criticised).
+- Motion-distortion compensation is the mandatory radar addition; **Doppler is
+  negligible for the sawtooth-modulated CTS350-X** (matters only for
+  triangular chirp + reverse-direction map localization).
+- Magnetometer/compass yaw degrades badly near vehicles (>21° in 10 s;
+  roll/pitch unaffected) → gyro yaw on land.
+- **Disabling DCS is well-supported** — DCS keys on residual magnitude, not
+  edge truth (`s = min(1, 2φ/(φ+χ²))`, φ=1), so it mutes genuine large
+  corrections exactly as we found.
+- **PCM outperforms DCS/SCGP/RANSAC** (with the caveats in Part 2.4).
+- **TBV verify-then-select** validates verification-over-kernels (but is
+  verify-before-commit, not our revert-after-optimize — see Part 2.5).
+
+**Coverage gap — 5 of 10 Part 2 items returned NO surviving evidence and are
+NOT machine-confirmed:** item 3 (ISAM2 tuning), item 6 (Censi covariance),
+item 8 (DVL-dropout coasting), item 9 (Sobol relocalization), item 10 (USBL
+priors). These are *unconfirmed*, not *refuted* — the harness's top-25 search
+simply did not surface adjudicable evidence. The **Censi/point-to-point
+finding (Part 2.6) was hand-verified by me directly against Bonnabel this
+session**, so that conclusion stands independently of the harness; the other
+four remain open questions needing their own literature pass. Also only
+indirectly covered: OS-CFAR-for-*sonar* (the surviving CFAR evidence is
+radar-scoped) and the compass-yaw loop-*gating* precedent (only the
+magnetometer-degradation premise was confirmed). Confirm any specific numeric
+figure against its cited source before external quotation.
