@@ -104,6 +104,11 @@ public:
         int ntc = ntc_, ngc = ngc_, rank = rank_, threshold = threshold_;
         double pfa = pfa_;
         CFAR::Alg alg = alg_;
+        // stage the filter.* knobs too — same rule: a rejected set (any
+        // parameter in the same request) must not leave a member mutated
+        // while rclcpp keeps the old value
+        double resolution = resolution_, radius = outlier_filter_radius_;
+        int min_points = outlier_filter_min_points_, skip = skip_;
         bool rebuild = false;
         try {
           for (const auto& p : params) {
@@ -125,13 +130,13 @@ public:
             } else if (n == "filter.threshold") {
               threshold = static_cast<int>(as_num(p));
             } else if (n == "filter.resolution") {
-              resolution_ = as_num(p);
+              resolution = as_num(p);
             } else if (n == "filter.radius") {
-              outlier_filter_radius_ = as_num(p);
+              radius = as_num(p);
             } else if (n == "filter.min_points") {
-              outlier_filter_min_points_ = static_cast<int>(as_num(p));
+              min_points = static_cast<int>(as_num(p));
             } else if (n == "filter.skip") {
-              skip_ = static_cast<int>(as_num(p));
+              skip = static_cast<int>(as_num(p));
             }
           }
           if (rebuild)
@@ -142,6 +147,10 @@ public:
           rank_ = rank;
           alg_ = alg;
           threshold_ = threshold;
+          resolution_ = resolution;
+          outlier_filter_radius_ = radius;
+          outlier_filter_min_points_ = min_points;
+          skip_ = skip;
           if (rebuild)
             RCLCPP_INFO(get_logger(),
                         "CFAR rebuilt: Ntc %d, Ngc %d, Pfa %g, rank %d",
