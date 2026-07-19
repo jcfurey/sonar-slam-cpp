@@ -235,6 +235,31 @@ int main()
   CHECK(reloc_err < 0.8, "relocalization landed %.2f m from truth", reloc_err);
   std::remove(map_path.c_str());
 
+  // ---- [3b] session-2 rounds after the load: the boundary link joins two
+  // DR epochs, and its meaningless "tear" must not leak into the post-loop
+  // verification (it used to revert + quarantine genuine closures)
+  {
+    const int reverted_before = s2.nssm_reverted;
+    int ok2 = 0;
+    double d2x = 0.0, d2y = 0.0;
+    for (int k = 1; k <= 12; ++k) {
+      d2x += 0.01;
+      d2y += 0.01;
+      const gtsam::Pose2 t2(6.0 + 0.75 * k, 2.0, 0.0);
+      // session-2 DR epoch: origin at the relocalization point, plus drift
+      const gtsam::Pose2 d2(t2.x() - 6.0 + d2x, t2.y() - 2.0 + d2y, 0.0);
+      if (feed(s2, 1000 + k, t2, d2, world, rng)) ++ok2;
+    }
+    std::printf("[3b] session-2: %d/12 rounds ok, nssm accepted %d, "
+                "reverted %d (was %d)\n",
+                ok2, s2.nssm_accepted, s2.nssm_reverted, reverted_before);
+    CHECK(ok2 >= 10, "session-2 rounds failing (%d/12)", ok2);
+    CHECK(s2.nssm_reverted == reverted_before,
+          "post-load rounds reverted (%d -> %d): session-boundary tear is "
+          "leaking into the verify layer",
+          reverted_before, s2.nssm_reverted);
+  }
+
   // ---- [4] USBL-style absolute position prior ------------------------------
   const double before =
     std::hypot(slam.keyframes[last]->pose.x() - truth_last.x(),

@@ -48,8 +48,9 @@ against the Python SLAM node or vice versa.
 `mapping_node` consumes the latched `/bruce/slam/slam/traj` (whole optimized
 trajectory) plus the ping + feature cloud, and re-renders its 2D map products
 when a loop closure moves keyframes (`dec`/`inc` per moved tile) — the map
-correction the live accumulator lacks. See `SONAR_MAPPING_ARCHITECTURE.md` §5.
-Its `mapping/enu_world` MUST match `slam/enu_world`.
+correction the live accumulator lacks.
+Its `mapping/enu_world` MUST match `slam/enu_world` (both ship `true`; the
+`bluerov_legacy` payload flips both to the legacy z-down convention).
 
 Not ported: the offline bag-pump mode (use `ros2 bag play` instead).
 
@@ -73,8 +74,7 @@ Not a kernel but related: `parallel_cov_samples` (default true) runs the
 per-thread pool of identically-configured libpointmatcher engines instead of
 one core sequentially — per-guess results unchanged (deterministic chain);
 see `docs/DIVERGENCES.md` #8. The registrations themselves stay on the CPU by
-decision (GPU ICP would rewrite deployed registration math — repo-root
-`GPU_ACCELERATION.md` §4).
+decision — GPU ICP would rewrite deployed registration math.
 
 Runtime dispatch: `gpu::available()` = built with CUDA ∧ device present ∧
 `SONAR_SLAM_FORCE_CPU` unset. CPU twins are OpenMP-parallel and are the same
@@ -129,8 +129,7 @@ colcon build --packages-select sonar_slam_cpp --merge-install
 The CUDA architecture defaults to `86-real;86-virtual`; a stale cached
 `CMAKE_CUDA_ARCHITECTURES` below sm_75 (the observed case: 52, which nvcc 12.8
 still accepts and ships as PTX the sm_86 device must JIT) self-heals to 86 on
-reconfigure — see the repo-root `GPU_ACCELERATION.md` for the full audit and
-the sonar_proc GPU/OpenMP work.
+reconfigure.
 
 Requires standard ROS 2 messages (`marine_acoustic_msgs`, `sensor_msgs`,
 `geometry_msgs`, `nav_msgs`, `std_msgs`) plus system
@@ -262,7 +261,9 @@ WGS84 GeoJSON LineString.
 
 The feature node's `CFAR.*` and `filter.threshold` parameters are dynamic:
 `ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005` rebuilds the detector on
-the next ping — tune at sea without relaunching.
+the next ping — tune at sea without relaunching. Match the declared types:
+`Pfa` takes a double literal (`0.005`), `Ntc`/`Ngc`/`rank`/`filter.threshold`
+take integers.
 
 ### Map-quality metrics
 

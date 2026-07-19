@@ -369,7 +369,10 @@ private:
       << F << "\n";
     std::ofstream prj(base + ".prj", std::ios::trunc);
     prj << utm_wkt(datum_.origin.zone, datum_.origin.north);
-    if (!w || !prj) {
+    // buffered streams surface ENOSPC only at flush — close before judging
+    w.close();
+    prj.close();
+    if (w.fail() || prj.fail()) {
       out_err = "failed writing world/prj sidecars for " + base;
       return false;
     }
@@ -421,7 +424,14 @@ private:
         gj << (k ? "," : "") << "[" << lon << "," << lat << "]";
       }
       gj << "]}}]}\n";
-      if (gj) written += export_prefix_ + "_trajectory.geojson";
+      gj.close();
+      if (!gj.fail()) {
+        written += export_prefix_ + "_trajectory.geojson";
+      } else {
+        res.success = false;
+        res.message = "failed writing " + export_prefix_ + "_trajectory.geojson";
+        return;
+      }
     }
     if (written.empty()) {
       res.success = false;

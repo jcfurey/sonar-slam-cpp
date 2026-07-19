@@ -98,34 +98,46 @@ public:
                    ? static_cast<double>(p.as_int())
                    : p.as_double();
         };
+        // stage into locals and commit ONLY after the CFAR constructor
+        // accepts them — a rejected set must not poison the cached values
+        // (rclcpp keeps the old parameter, so the members must match it)
+        int ntc = ntc_, ngc = ngc_, rank = rank_, threshold = threshold_;
+        double pfa = pfa_;
+        CFAR::Alg alg = alg_;
         bool rebuild = false;
         try {
           for (const auto& p : params) {
             const std::string& n = p.get_name();
             if (n == "CFAR.Ntc") {
-              ntc_ = static_cast<int>(as_num(p));
+              ntc = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.Ngc") {
-              ngc_ = static_cast<int>(as_num(p));
+              ngc = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.Pfa") {
-              pfa_ = as_num(p);
+              pfa = as_num(p);
               rebuild = true;
             } else if (n == "CFAR.rank") {
-              rank_ = static_cast<int>(as_num(p));
+              rank = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.alg") {
-              alg_ = CFAR::alg_from_string(p.as_string());
+              alg = CFAR::alg_from_string(p.as_string());
             } else if (n == "filter.threshold") {
-              threshold_ = static_cast<int>(as_num(p));
+              threshold = static_cast<int>(as_num(p));
             }
           }
-          if (rebuild) {
-            detector_ = std::make_unique<CFAR>(ntc_, ngc_, pfa_, rank_);
+          if (rebuild)
+            detector_ = std::make_unique<CFAR>(ntc, ngc, pfa, rank);
+          ntc_ = ntc;
+          ngc_ = ngc;
+          pfa_ = pfa;
+          rank_ = rank;
+          alg_ = alg;
+          threshold_ = threshold;
+          if (rebuild)
             RCLCPP_INFO(get_logger(),
                         "CFAR rebuilt: Ntc %d, Ngc %d, Pfa %g, rank %d",
                         ntc_, ngc_, pfa_, rank_);
-          }
         } catch (const std::exception& e) {
           result.successful = false;
           result.reason = e.what();

@@ -344,7 +344,7 @@ public:
       if (usbl_driver == "pose_cov") {
         usbl_sub_ = create_subscription<
           geometry_msgs::msg::PoseWithCovarianceStamped>(
-          usbl_topic, 10,
+          usbl_topic, rclcpp::SensorDataQoS(),
           [this](const geometry_msgs::msg::PoseWithCovarianceStamped& m) {
             usbl_callback(m.header.stamp, m.pose.pose.position.x,
                           m.pose.pose.position.y, m.pose.covariance[0],
@@ -352,7 +352,8 @@ public:
           });
       } else if (usbl_driver == "odom") {
         usbl_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-          usbl_topic, 10, [this](const nav_msgs::msg::Odometry& m) {
+          usbl_topic, rclcpp::SensorDataQoS(),
+          [this](const nav_msgs::msg::Odometry& m) {
             usbl_callback(m.header.stamp, m.pose.pose.position.x,
                           m.pose.pose.position.y, m.pose.covariance[0],
                           m.pose.covariance[7]);
@@ -420,7 +421,8 @@ private:
     // factor may enter and nothing may publish until the global scan match
     // places the vehicle.
     if (slam_.awaiting_relocalization()) {
-      if (points.rows() >= slam_.nssm_params.min_points &&
+      if (points.rows() > 0 &&
+          points.rows() >= slam_.nssm_params.min_points &&
           !std::isnan(points(0, 0))) {
         frame->status = true;
         frame->points = points;
@@ -817,11 +819,30 @@ private:
                   "manual correction ignored: no keyframes in the graph yet");
       return;
     }
+    // with a loaded map the keyframes are the PREVIOUS session's — a fix
+    // here would drag the saved map toward the click instead of placing the
+    // vehicle; relocalization must land first
+    if (slam_.awaiting_relocalization()) {
+      RCLCPP_WARN(get_logger(),
+                  "manual correction ignored while relocalizing against the "
+                  "loaded map — wait for relocalization to land");
+      return;
+    }
     // RViz publishes in the DISPLAYED map frame; in ENU mode the graph runs
     // z-down, so flip back into the graph frame (flip_pose_enu is involutive)
     if (enu_world_) flip_pose_enu(msg.pose.pose);
     const gtsam::Pose3 p = r2g(msg.pose.pose);
-    const gtsam::Pose2 fix(p.x(), p.y(), p.rotation().yaw());
+    gtsam::Pose2 fix(p.x(), p.y(), p.rotation().yaw());
+    // The click marks the vehicle's CURRENT pose, which can be up to a full
+    // keyframe interval past the newest keyframe on a moving vehicle —
+    // back-compose the DR delta so the prior targets where the KEYFRAME is,
+    // not where the vehicle is now.
+    if (slam_.current_frame &&
+        slam_.current_frame != slam_.current_keyframe()) {
+      const gtsam::Pose2 dr_delta = slam_.current_keyframe()->dr_pose.between(
+        slam_.current_frame->dr_pose);
+      fix = fix.compose(dr_delta.inverse());
+    }
     const int key = slam_.current_key() - 1;
     const gtsam::Pose2 before = slam_.current_keyframe()->pose;
 
@@ -851,6 +872,11 @@ private:
   void undo_manual_correction(std_srvs::srv::Trigger::Response& res)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (slam_.awaiting_relocalization()) {
+      res.success = false;
+      res.message = "relocalization pending — nothing to undo yet";
+      return;
+    }
     if (slam_.manual_corrections_pending() == 0) {
       res.success = false;
       res.message = "no manual correction to undo";
@@ -917,7 +943,10 @@ private:
     for (int k = slam_.current_key() - 1; k >= 0; --k) {
       const double kt = to_sec(slam_.keyframes[k]->time);
       const double dt = std::fabs(kt - t);
-      if (dt <= best_dt) {
+      // STRICT compare: under a looped bag a previous pass can carry the
+      // identical replayed stamp — scanning newest-first, the current-pass
+      // keyframe must keep the match
+      if (dt < best_dt) {
         best_dt = dt;
         best = k;
       }

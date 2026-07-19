@@ -450,8 +450,8 @@ OccGrid Mapping::get_occupancy_grid() const
   g.width = W;
   g.height = H;
   g.resolution = resolution;
-  g.origin_x = x0 + cmin_ * resolution;
-  g.origin_y = y0 + rmin_ * resolution;
+  g.origin_x = x0 + (cmin_ - 0.5) * resolution;
+  g.origin_y = y0 + (rmin_ - 0.5) * resolution;
   g.data.resize(static_cast<size_t>(H) * W);
   for (int rr = rmin_; rr <= rmax_; ++rr) {
     for (int cc = cmin_; cc <= cmax_; ++cc) {
@@ -473,8 +473,8 @@ OccGrid Mapping::get_intensity_grid() const
   g.width = W;
   g.height = H;
   g.resolution = resolution;
-  g.origin_x = x0 + cmin_ * resolution;
-  g.origin_y = y0 + rmin_ * resolution;
+  g.origin_x = x0 + (cmin_ - 0.5) * resolution;
+  g.origin_y = y0 + (rmin_ - 0.5) * resolution;
   g.data.resize(static_cast<size_t>(H) * W);
   for (int rr = rmin_; rr <= rmax_; ++rr) {
     for (int cc = cmin_; cc <= cmax_; ++cc) {

@@ -978,13 +978,15 @@ bool Slam::undo_manual_correction()
     return false;
   }
   const std::size_t idx = manual_prior_indices_.back();
-  manual_prior_indices_.pop_back();
   // Null-hole removal (FactorGraph::remove) keeps every other recorded index
   // valid; rebuild_isam skips the holes when feeding the fresh estimator.
   // The index is always live: verification/failure truncations only drop
   // factors of rounds that were never recorded here.
-  if (idx < committed_graph_.size() && committed_graph_[idx])
+  gtsam::NonlinearFactor::shared_ptr removed;
+  if (idx < committed_graph_.size() && committed_graph_[idx]) {
+    removed = committed_graph_[idx];
     committed_graph_.remove(idx);
+  }
   rebuild_isam();
   // The rebuild relinearizes AT the corrected poses, which are no longer the
   // optimum without the prior — relax the trajectory back and sweep the new
@@ -992,7 +994,16 @@ bool Slam::undo_manual_correction()
   // buffer is empty; converge hard, mirroring the correction round this
   // undoes; pending_loops_ is empty so no verification runs).
   force_converge_ = true;
-  if (!update_factor_graph()) return false;
+  if (!update_factor_graph()) {
+    // the undo did NOT apply — restore the factor and the estimator, or a
+    // retried "undo failed" would peel the PREVIOUS correction instead
+    if (removed) {
+      committed_graph_.replace(idx, removed);
+      rebuild_isam();
+    }
+    return false;
+  }
+  manual_prior_indices_.pop_back();
   ++manual_corrections_undone;
   return true;
 }
@@ -1054,7 +1065,10 @@ bool Slam::save_map(const std::string& path)
               static_cast<std::streamsize>(buf.size() * sizeof(float)));
     }
   }
-  if (!f) {
+  // the buffered stream only surfaces ENOSPC at flush — close BEFORE the
+  // verdict or a truncated save reports success
+  f.close();
+  if (f.fail()) {
     last_error_ = "short write to '" + path + "'";
     return false;
   }
@@ -1113,6 +1127,13 @@ bool Slam::load_map(const std::string& path)
       std::vector<float> buf(static_cast<std::size_t>(rows) * 3);
       f.read(reinterpret_cast<char*>(buf.data()),
              static_cast<std::streamsize>(buf.size() * sizeof(float)));
+      // a truncation INSIDE the last keyframe's payload would otherwise load
+      // "successfully" with the missing tail as (0,0,0) phantom points
+      if (!f) {
+        last_error_ = "truncated point payload at keyframe " + std::to_string(k);
+        keyframes.clear();
+        return false;
+      }
       for (long r = 0; r < rows; ++r)
         for (int c = 0; c < 3; ++c)
           kf->points(r, c) = buf[static_cast<std::size_t>(r) * 3 + c];
@@ -1142,6 +1163,12 @@ bool Slam::load_map(const std::string& path)
     g.add(gtsam::PriorFactor<gtsam::Pose3>(X(key), kf->horizon_dr_pose3(),
                                            unary_model_));
     v.insert(X(key), kf->horizon_pose3());
+  }
+
+  if (f.peek() != std::ifstream::traits_type::eof()) {
+    last_error_ = "trailing data after the last keyframe — corrupt map file";
+    keyframes.clear();
+    return false;
   }
 
   try {
@@ -1186,12 +1213,17 @@ bool Slam::relocalize(const KeyframePtr& frame)
     min_y = std::min(min_y, target(r, 1));
     max_y = std::max(max_y, target(r, 1));
   }
-  const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y),
-                            frame->dr_pose.theta());
+  // yaw-0 center: global_scan_match_init composes delta in the CENTER's
+  // body frame, so a heading-carrying center would rotate the translation
+  // search box with the vehicle and miss parts of an elongated map. With
+  // theta = 0 the delta x/y live in world axes and the delta yaw IS the
+  // absolute yaw, bounded around the compass-anchored DR heading.
+  const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.0);
+  const double dr_yaw = frame->dr_pose.theta();
   Eigen::Matrix<double, 3, 2> bounds;
   bounds << -(0.5 * (max_x - min_x) + 5.0), 0.5 * (max_x - min_x) + 5.0,
             -(0.5 * (max_y - min_y) + 5.0), 0.5 * (max_y - min_y) + 5.0,
-            -0.35, 0.35;
+            dr_yaw - 0.35, dr_yaw + 0.35;
 
   const GlobalInitResult init = global_scan_match_init(
     frame->points, center, target, gtsam::Pose2(), point_noise, bounds,
@@ -1408,14 +1440,29 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     bool tear_bad = false;
     if (post_loop_max_translation_err > 0.0) {
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
+        // The link joining a LOADED map to the new session compares dr_pose
+        // values from two different DR epochs — its "tear" is meaningless
+        // and (with a tens-of-meters lever arm) wiggles by centimeters on
+        // every relinearization, so it would veto genuine loop rounds.
+        if (loaded_key_count_ > 0 &&
+            k + 1 == static_cast<std::size_t>(loaded_key_count_))
+          continue;
         const double tear = link_tear(k);
         const double before = k < pre_tear.size() ? pre_tear[k] : 0.0;
         // covers re-solve jitter on a link this round never touched (~5 mm
         // observed), and sits orders below any real fold — a numerical guard,
         // not a tuning lever, so it stays out of the config
         constexpr double tear_jitter_eps = 0.01;  // m
-        if (tear > post_loop_max_translation_err &&
-            tear > before + tear_jitter_eps) {
+        // A link legitimately stretched past the bound by an ACCEPTED
+        // absolute fix (USBL / manual) absorbs every later loop correction
+        // too — it moves well beyond the numeric epsilon on genuine rounds.
+        // Judged against the epsilon it would coin-flip vetoes forever, so
+        // an already-over-bound link must grow by a material fraction of
+        // the bound to convict a new round.
+        const double growth_gate = before > post_loop_max_translation_err
+                                     ? 0.25 * post_loop_max_translation_err
+                                     : tear_jitter_eps;
+        if (tear > post_loop_max_translation_err && tear > before + growth_gate) {
           tear_bad = true;
           worst_tear = std::max(worst_tear, tear);
         }

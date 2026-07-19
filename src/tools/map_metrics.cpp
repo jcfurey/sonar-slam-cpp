@@ -253,7 +253,22 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
   std::sort(th.begin(), th.end());
   m.thick_med = th[th.size() / 2];
   m.thick_p95 = th[static_cast<std::size_t>(th.size() * 0.95)];
-  m.wall_len = static_cast<double>(px.size()) * g;
+  // sum actual 8-connected step lengths — counting every pixel as g reads a
+  // 45-degree wall 29% short
+  double len = 0.0;
+  for (const auto& s : px) {
+    auto sk = [&](int r, int c) {
+      return r >= 0 && r < rows && c >= 0 && c < cols &&
+             skel.at<std::uint8_t>(r, c) != 0;
+    };
+    if (sk(s.r, s.c + 1)) len += g;
+    if (sk(s.r + 1, s.c)) len += g;
+    if (sk(s.r + 1, s.c + 1) && !sk(s.r, s.c + 1) && !sk(s.r + 1, s.c))
+      len += g * M_SQRT2;
+    if (sk(s.r + 1, s.c - 1) && !sk(s.r, s.c - 1) && !sk(s.r + 1, s.c))
+      len += g * M_SQRT2;
+  }
+  m.wall_len = len;
 
   // doubling probe: march the wall normal in [band_min, band_max]; doubled if
   // a near-parallel skeleton cell sits in the band on EITHER side
@@ -261,8 +276,18 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
   for (const auto& s : px) theta_map.at<float>(s.r, s.c) = s.theta;
   const float ang_tol = static_cast<float>(20.0 * M_PI / 180.0);
   long doubled = 0;
-  const int t0 = std::max(1, static_cast<int>(std::lround(band_min / g)));
+  // the probe dilates its target by one cell, so the inner band edge must
+  // clear the source's own 3x3 neighborhood or a coarsened grid (or small
+  // --band min) makes every wall "doubled" by matching itself
+  const int t0 = std::max(3, static_cast<int>(std::lround(band_min / g)));
   const int t1 = static_cast<int>(std::lround(band_max / g));
+  if (t1 < t0) {
+    std::fprintf(stderr,
+                 "[map_metrics] probe band [%g, %g] m collapses at grid %g m "
+                 "— doubled fraction not meaningful\n",
+                 band_min, band_max, g);
+    return m;
+  }
   for (const auto& s : px) {
     const float nx = -std::sin(s.theta), ny = std::cos(s.theta);
     bool hit = false;
@@ -273,6 +298,9 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
         if (r < 1 || r >= rows - 1 || c < 1 || c >= cols - 1) break;
         for (int dr = -1; dr <= 1 && !hit; ++dr)
           for (int dc = -1; dc <= 1 && !hit; ++dc) {
+            // never let the source wall match itself through the dilation
+            if (std::abs(r + dr - s.r) <= 1 && std::abs(c + dc - s.c) <= 1)
+              continue;
             const float th2 = theta_map.at<float>(r + dr, c + dc);
             if (th2 > 1e8f) continue;
             // orientation distance on the pi-periodic line direction

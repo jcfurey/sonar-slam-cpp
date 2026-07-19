@@ -15,6 +15,18 @@
     # is the SLAM back-end enabled (vs. pure dead reckoning); overridden from launch
     enable_slam: true
 
+    # World convention of the published pose/TF/trajectory: true = ENU
+    # (REP-105), false = the legacy z-down graph convention. MUST match
+    # mapping.yaml's enu_world (mapping reconstructs the sonar fan in this
+    # chirality); the bluerov_legacy payload overlay flips BOTH to false.
+    enu_world: true
+    # false when an external node (e.g. a robot_localization map EKF fusing
+    # the SLAM pose) owns the map->odom transform
+    publish_tf: true
+    # min seconds between rebuilds of the O(history) viz outputs (constraint
+    # markers + aggregated map cloud); <= 0 rebuilds every keyframe
+    viz_min_period: 2.0
+
     # define the noise models
     # x, y, theta in m, m, rad
     prior_sigmas: [0.1, 0.1, 0.01]

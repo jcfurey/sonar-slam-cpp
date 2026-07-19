@@ -415,9 +415,23 @@ std::string default_sonar_topic(const std::string& driver)
 }
 
 rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
-  rclcpp::Node* node, const std::string& driver, const std::string& topic,
+  rclcpp::Node* node, const std::string& driver_in, const std::string& topic_in,
   const rclcpp::QoS& qos, std::function<void(const SonarPing&)> cb)
 {
+  // Blank driver = auto-select the Oculus adapter from compressed_images, for
+  // EVERY consumer — slam/mapping subscribe to the same ping as the feature
+  // node, and previously only feature_extraction implemented this fallback,
+  // so a blank driver killed the other nodes at startup. A topic left blank
+  // alongside a blank driver resolves to the selected driver's default
+  // (callers that resolved it against the unresolved "" got "" back).
+  const std::string driver =
+    !driver_in.empty()
+      ? driver_in
+      : (get_bool_param(node, "compressed_images", false)
+           ? std::string("oculus_compressed")
+           : std::string("oculus_uncompressed"));
+  const std::string topic =
+    !topic_in.empty() ? topic_in : default_sonar_topic(driver);
   cb = with_stamp_offset(node, "sonar", std::move(cb));
   if (driver == "oculus_compressed") {
 #ifdef HAVE_SONAR_OCULUS
