@@ -15,7 +15,7 @@ namespace sonar_slam {
 struct CensiCovResult
 {
   bool success = false;
-  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();  // (x, y, theta), local frame
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();  // (x, y, theta) in the TARGET frame - the consumer must conjugate the translation block into the body frame (slam_core.cpp does)
   int n_correspondences = 0;
 };
 

@@ -71,15 +71,24 @@ protected:
              : static_cast<int>(p.as_int());
   }
 
+  // INTEGER-tolerant like get_double/get_int: ROS1-ported YAMLs commonly say
+  // `use_gyro: 0`, which auto-declares as INTEGER and would throw from
+  // as_bool() at startup
+  static bool coerce_bool(const rclcpp::Parameter& p)
+  {
+    return p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+             ? p.as_int() != 0
+             : p.as_bool();
+  }
   bool get_bool(const std::string& raw_name)
   {
-    return require_param(raw_name).as_bool();
+    return coerce_bool(require_param(raw_name));
   }
   bool get_bool(const std::string& raw_name, bool default_value)
   {
     const std::string name = normalize(raw_name);
     if (!has_parameter(name)) declare_parameter(name, default_value);
-    return get_parameter(name).as_bool();
+    return coerce_bool(get_parameter(name));
   }
 
   std::string get_string(const std::string& raw_name)

@@ -95,12 +95,25 @@ struct GeoDatum
     const double dlat_per_m = (1.0 / meridional_radius(phi)) * 180.0 / M_PI;
     const double dlon_per_m =
       (1.0 / (normal_radius(phi) * std::cos(phi))) * 180.0 / M_PI;
-    const UtmPoint north = wgs84_to_utm(lat0 + dlat_per_m, lon0);
-    const UtmPoint east = wgs84_to_utm(lat0, lon0 + dlon_per_m);
-    const double eE = east.easting - origin.easting;    // dUTM / d(true east)
-    const double eN = east.northing - origin.northing;
-    const double nE = north.easting - origin.easting;   // dUTM / d(true north)
-    const double nN = north.northing - origin.northing;
+    // a probe that crosses a zone or hemisphere boundary lands in a
+    // different projection (easting jumps ~666 km) — step the other way and
+    // negate the difference instead
+    UtmPoint north = wgs84_to_utm(lat0 + dlat_per_m, lon0);
+    double sn = 1.0;
+    if (north.zone != origin.zone || north.north != origin.north) {
+      north = wgs84_to_utm(lat0 - dlat_per_m, lon0);
+      sn = -1.0;
+    }
+    UtmPoint east = wgs84_to_utm(lat0, lon0 + dlon_per_m);
+    double se = 1.0;
+    if (east.zone != origin.zone || east.north != origin.north) {
+      east = wgs84_to_utm(lat0, lon0 - dlon_per_m);
+      se = -1.0;
+    }
+    const double eE = se * (east.easting - origin.easting);
+    const double eN = se * (east.northing - origin.northing);
+    const double nE = sn * (north.easting - origin.easting);
+    const double nN = sn * (north.northing - origin.northing);
 
     // map +x points along the TRUE bearing; +y is +x rotated 90 deg CCW
     const double b = bearing * M_PI / 180.0;

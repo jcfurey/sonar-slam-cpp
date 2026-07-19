@@ -130,7 +130,7 @@ struct Keyframe
 
   static Matrix transform_points(const Matrix& pts, const gtsam::Pose2& pose)
   {
-    if (pts.rows() == 0) return Matrix::Zero(0, pts.cols());
+    if (pts.rows() == 0) return Matrix::Zero(0, 2);
     const float c = static_cast<float>(std::cos(pose.theta()));
     const float s = static_cast<float>(std::sin(pose.theta()));
     Eigen::Matrix2f R;

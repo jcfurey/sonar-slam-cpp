@@ -273,6 +273,10 @@ private:
   // of FAILED rounds, which are never recorded here, and undo removal
   // null-holes the graph in place instead of shifting indices.
   std::vector<std::size_t> manual_prior_indices_;
+  // per-link tear recorded when the link first exceeded the chain-tear
+  // bound after an accepted correction round (-1 = under bound); the growth
+  // gate judges against this persistent baseline (see update_factor_graph)
+  std::vector<double> tear_baseline_;
   // map persistence / relocalization state (see load_map)
   int loaded_key_count_ = 0;
   bool awaiting_relocalization_ = false;

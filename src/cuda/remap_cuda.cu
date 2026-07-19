@@ -65,6 +65,10 @@ bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
   static detail::DeviceBuffer src_buf, dst_buf, mx_buf, my_buf;
   static int cached_version = -1;
   static int cached_rows = 0, cached_cols = 0;
+  // caller identity: the version counter alone is ambiguous the moment two
+  // consumers share this process (composed nodes); the host map pointer
+  // disambiguates
+  static const float* cached_mx = nullptr;
   std::lock_guard<std::mutex> lock(mutex);
 
   const std::size_t n_src = static_cast<std::size_t>(src_rows) * src_cols;
@@ -77,7 +81,8 @@ bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
     return false;
 
   const bool maps_cached = map_version >= 0 && map_version == cached_version &&
-                           dst_rows == cached_rows && dst_cols == cached_cols;
+                           dst_rows == cached_rows && dst_cols == cached_cols &&
+                           map_x == cached_mx;
   if (!maps_cached) {
     cached_version = -1;  // stays invalid if either upload fails
     if (!detail::check(cudaMemcpy(mx_buf.as<float>(), map_x,
@@ -90,6 +95,7 @@ bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
     cached_version = map_version;
     cached_rows = dst_rows;
     cached_cols = dst_cols;
+    cached_mx = map_x;
   }
 
   if (!detail::check(cudaMemcpy(src_buf.as<std::uint8_t>(), src, n_src,

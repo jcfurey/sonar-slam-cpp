@@ -181,6 +181,17 @@ private:
     if (!imu_yaw0_) imu_yaw0_ = yaw_z;
     euler_angle[2] -= *imu_yaw0_;
 
+    // Wrap the ANGLE innovations: when the vehicle's yaw (or a legacy-frame
+    // roll) crosses +-pi the raw measurement jumps by 2*pi against the
+    // continuous filtered state, and the unwrapped residual would slew every
+    // state through the gain for the whole convergence window (inherited
+    // from kalman.py; fixed by decision — correctness over parity).
+    const Eigen::Vector3d predicted_euler = H_imu_ * predicted_x;
+    for (int i : {0, 2})
+      euler_angle[i] = predicted_euler[i] +
+                       std::remainder(euler_angle[i] - predicted_euler[i],
+                                      2.0 * M_PI);
+
     kalman_correct(predicted_x, predicted_P, euler_angle, H_imu_, R_imu_,
                    state_vector_, cov_matrix_);
 

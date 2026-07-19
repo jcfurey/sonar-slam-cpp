@@ -124,6 +124,14 @@ public:
               alg = CFAR::alg_from_string(p.as_string());
             } else if (n == "filter.threshold") {
               threshold = static_cast<int>(as_num(p));
+            } else if (n == "filter.resolution") {
+              resolution_ = as_num(p);
+            } else if (n == "filter.radius") {
+              outlier_filter_radius_ = as_num(p);
+            } else if (n == "filter.min_points") {
+              outlier_filter_min_points_ = static_cast<int>(as_num(p));
+            } else if (n == "filter.skip") {
+              skip_ = static_cast<int>(as_num(p));
             }
           }
           if (rebuild)

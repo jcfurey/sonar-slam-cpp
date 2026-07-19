@@ -92,8 +92,10 @@ int main()
 #ifdef SONAR_SLAM_WITH_CUDA
   // ----------------------------------------------------------------- remap
   if (gpu) {
+    // grayscale, NOT binary: on a {0,1} image `diff > 1` can never fire and
+    // the check was vacuous — a broken GPU remap stayed "parity OK"
     cv::Mat mask(rows, cols, CV_8UC1);
-    cv::randu(mask, 0, 2);
+    cv::randu(mask, 0, 256);
     cv::Mat map_x(rows, cols, CV_32FC1), map_y(rows, cols, CV_32FC1);
     for (int r = 0; r < rows; ++r)
       for (int c = 0; c < cols; ++c) {
@@ -117,6 +119,24 @@ int main()
       const int bad = cv::countNonZero(diff > 1);
       std::printf("remap linear: pixels differing by >1: %d\n", bad);
       if (bad > rows * cols / 1000) ++failures;
+    }
+
+    // the production detection-mask path uses NEAREST (bit-identical
+    // contract) — exercise it against cv::INTER_NEAREST exactly
+    cv::Mat cpu_nn, gpu_nn(rows, cols, CV_8UC1);
+    cv::remap(mask, cpu_nn, map_x, map_y, cv::INTER_NEAREST);
+    if (!sonar_slam::gpu::remap_u8_cuda(
+          mask.ptr<std::uint8_t>(), rows, cols, map_x.ptr<float>(),
+          map_y.ptr<float>(), rows, cols, 0, /*map_version=*/-1,
+          gpu_nn.ptr<std::uint8_t>())) {
+      std::printf("remap nearest: GPU path failed\n");
+      ++failures;
+    } else {
+      cv::Mat diff_nn;
+      cv::absdiff(cpu_nn, gpu_nn, diff_nn);
+      const int bad_nn = cv::countNonZero(diff_nn);
+      std::printf("remap nearest: differing pixels: %d\n", bad_nn);
+      if (bad_nn != 0) ++failures;
     }
   }
 #endif

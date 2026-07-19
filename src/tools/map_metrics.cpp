@@ -279,7 +279,14 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
   // the probe dilates its target by one cell, so the inner band edge must
   // clear the source's own 3x3 neighborhood or a coarsened grid (or small
   // --band min) makes every wall "doubled" by matching itself
-  const int t0 = std::max(3, static_cast<int>(std::lround(band_min / g)));
+  const int t0_req = static_cast<int>(std::lround(band_min / g));
+  const int t0 = std::max(3, t0_req);
+  if (t0 > t0_req)
+    std::fprintf(stderr,
+                 "[map_metrics] grid %g m coarser than the probe band: inner "
+                 "edge raised %g -> %g m; doubling closer than that is not "
+                 "counted\n",
+                 g, band_min, t0 * g);
   const int t1 = static_cast<int>(std::lround(band_max / g));
   if (t1 < t0) {
     std::fprintf(stderr,

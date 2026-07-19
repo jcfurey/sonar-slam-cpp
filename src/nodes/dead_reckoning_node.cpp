@@ -325,29 +325,31 @@ private:
   {
     ++pairs_total_;
     // coast bookkeeping: a real pair re-anchors everything
-    const bool was_coasting = coasting_;
     last_pair_arrival_ = now();
     if (prev_time_) {
-      const double dt = to_sec(dvl_time) - to_sec(*prev_time_);
-      if (dt > 0.0 && dt < 5.0)
-        dvl_period_ema_ = 0.9 * dvl_period_ema_ + 0.1 * dt;
+      const double dt0 = to_sec(dvl_time) - to_sec(*prev_time_);
+      if (dt0 > 0.0 && dt0 < 5.0)
+        dvl_period_ema_ = 0.9 * dvl_period_ema_ + 0.1 * dt0;
+      // ABSORB any pair at/behind the integrated-to time (small negative dt):
+      // the coast runs ahead on the attitude stream and sync delay can
+      // deliver SEVERAL such pairs after an outage; rewinding prev_time_
+      // would double-integrate the window, count fake gap events, and
+      // publish backwards stamps. Refresh velocity/attitude/depth and keep
+      // the clock. The reacquisition ping is exactly the one the spike gate
+      // exists for, so never absorb a garbage velocity. Large negative
+      // jumps (a bag rewind) still take the gap-gate reset below.
+      if (dt0 <= 0.0 && dt0 > -5.0) {
+        if (vel.cwiseAbs().maxCoeff() <= dvl_max_velocity_) prev_vel_ = vel;
+        if (pose_)
+          pose_ =
+            gtsam::Pose3(rot, gtsam::Point3(pose_->x(), pose_->y(), depth));
+        coast_elapsed_ = 0.0;
+        coasting_ = false;
+        return;
+      }
     }
     coast_elapsed_ = 0.0;
     coasting_ = false;
-    // The coast integrates up to the newest ATTITUDE stamp, which is ahead
-    // of this returning pair's DVL stamp by construction (the sync emits a
-    // primary only once secondaries pass it). Rewinding prev_time_ to the
-    // older DVL stamp would re-integrate the already-coasted window (double
-    // count) and publish a backwards stamp. Absorb the fix: refresh
-    // velocity/attitude/depth, keep the coast clock.
-    if (was_coasting && prev_time_ &&
-        to_sec(dvl_time) <= to_sec(*prev_time_)) {
-      prev_vel_ = vel;
-      if (pose_)
-        pose_ = gtsam::Pose3(rot,
-                             gtsam::Point3(pose_->x(), pose_->y(), depth));
-      return;
-    }
     // DVL velocity spike handling (dead_reckoning.py send_odometry)
     if (vel.cwiseAbs().maxCoeff() > dvl_max_velocity_) {
       if (pose_) {

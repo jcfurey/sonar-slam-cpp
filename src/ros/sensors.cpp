@@ -281,6 +281,12 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_depth(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const DepthReading&)> cb)
 {
+  // same non-finite choke as the DVL adapter: one NaN depth permanently
+  // corrupts the Kalman state through the gain
+  cb = [inner = std::move(cb)](const DepthReading& r) {
+    if (!std::isfinite(r.depth)) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "depth", std::move(cb));
   if (driver == "bar30") {
 #ifdef HAVE_BAR30_DEPTH
@@ -344,6 +350,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_gyro(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const GyroReading&)> cb)
 {
+  // one non-finite delta angle would NaN the cumulative FOG integration
+  cb = [inner = std::move(cb)](const GyroReading& r) {
+    if (!r.delta.allFinite()) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "gyro", std::move(cb));
   if (driver == "kvh_gyro") {
 #ifdef HAVE_KVH_GYRO
@@ -377,6 +388,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_imu(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const ImuReading&)> cb)
 {
+  // a non-finite quaternion would NaN every attitude consumer
+  cb = [inner = std::move(cb)](const ImuReading& r) {
+    if (!r.orientation.coeffs().allFinite()) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "imu", std::move(cb));
   const bool enu =
     driver == "enu" || driver == "3dm_gx5" || driver == "microstrain";

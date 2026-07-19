@@ -88,6 +88,12 @@ private:
             "gyro sample gap %.1f ms (nominal %.1f ms): delta angles were "
             "dropped and their rotation is lost",
             measured * 1e3, 1e3 / sensor_rate_);
+      } else if (measured >= 1.0) {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "gyro stream gap %.2f s (nominal %.1f ms): every delta angle in "
+          "the gap is lost — heading is now biased by any rotation during it",
+          measured, 1e3 / sensor_rate_);
       }
     }
     last_stamp_ = t_now;

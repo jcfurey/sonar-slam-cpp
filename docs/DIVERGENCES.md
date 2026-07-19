@@ -133,3 +133,13 @@ global-init-cost parity fixtures are unaffected.
 and the not-a-knot CUBIC both match scipy to ~1e-15 (incl. a uniform grid, the
 zero-pivot case). `test/censi_covariance_test.cpp` Monte-Carlo-validates the
 opt-in Censi ICP covariance.
+
+## Angle-innovation wrapping in the Kalman node (deliberate, correctness over parity)
+
+kalman.py feeds the raw `yaw - yaw0` (and roll) measurement into the update
+step with no wrapping, so every +-pi crossing of the vehicle's heading drives
+a ~2*pi residual through the gain and slews all coupled states for the
+convergence window. The C++ port wraps the roll/yaw innovations into
+(-pi, pi] against the predicted measurement (`H_imu * x_pred`) before
+correcting. Behavior is identical away from the wrap; at the wrap the C++
+filter is continuous where the Python one glitches.

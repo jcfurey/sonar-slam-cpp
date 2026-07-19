@@ -1459,10 +1459,17 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
         // Judged against the epsilon it would coin-flip vetoes forever, so
         // an already-over-bound link must grow by a material fraction of
         // the bound to convict a new round.
-        const double growth_gate = before > post_loop_max_translation_err
+        // Judge growth against the PERSISTENT baseline recorded when the
+        // link first exceeded the bound (an accepted absolute fix), not the
+        // previous round's snapshot — per-round references let repeated
+        // sub-gate aliases ratchet meters of fold 0.24 m at a time.
+        double ref = before;
+        if (k < tear_baseline_.size() && tear_baseline_[k] >= 0.0)
+          ref = tear_baseline_[k];
+        const double growth_gate = ref > post_loop_max_translation_err
                                      ? 0.25 * post_loop_max_translation_err
                                      : tear_jitter_eps;
-        if (tear > post_loop_max_translation_err && tear > before + growth_gate) {
+        if (tear > post_loop_max_translation_err && tear > ref + growth_gate) {
           tear_bad = true;
           worst_tear = std::max(worst_tear, tear);
         }
@@ -1505,6 +1512,26 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // verified (or no loops this round): the mirrored factors stand, and this
   // round's loop-closure marks become permanent
   pending_loops_.clear();
+
+  // Maintain the per-link over-bound baseline the chain-tear growth gate
+  // compares against: record the tear when a link FIRST ends a correction
+  // round beyond the bound (typically stretched by an accepted USBL/manual
+  // fix), clear it when the link heals back under the bound.
+  if (converge_hard && post_loop_max_translation_err > 0.0 &&
+      keyframes.size() > 1) {
+    tear_baseline_.resize(keyframes.size() - 1, -1.0);
+    for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
+      if (loaded_key_count_ > 0 &&
+          k + 1 == static_cast<std::size_t>(loaded_key_count_))
+        continue;
+      const double t = link_tear(k);
+      if (t > post_loop_max_translation_err) {
+        if (tear_baseline_[k] < 0.0) tear_baseline_[k] = t;
+      } else {
+        tear_baseline_[k] = -1.0;
+      }
+    }
+  }
 
   // Only the latest keyframe's covariance is refreshed — a known limitation
   // carried from slam.py (its own "TODO propagate cov from previous keyframe"),
