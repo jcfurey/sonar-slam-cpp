@@ -4,6 +4,17 @@
 
 #include <vector>
 
+// CAVEAT (docs/LITERATURE_REVIEW_2026.md Part 2.6): Bonnabel, Barczyk &
+// Goulette (ACC 2016, arXiv:1410.7632) prove the Censi (2007) closed form is
+// rigorous for POINT-TO-PLANE ICP but gives "completely erroneous
+// covariances" for POINT-TO-POINT ICP, because it does not account for the
+// rematching step. Our shipped ICP uses PointToPointErrorMinimizer
+// (config/icp.yaml), so this estimate is OPTIMISTIC (under-estimates) in
+// degenerate/wall-sliding geometry — exactly where the NSSM degeneracy gate
+// must stay tight. This is why the DEFAULT covariance method is `sampled`
+// (FAST-MCD over cov_samples registrations), not censi; censi is opt-in only.
+// To make censi rigorous, switch the minimizer to point-to-plane, or adopt a
+// rematching-aware estimator (Brossard/Bonnabel/Barrau RA-L 2020).
 namespace sonar_slam {
 
 CensiCovResult censi_icp_covariance(const Matrix& source, const Matrix& target,
