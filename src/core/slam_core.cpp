@@ -162,15 +162,16 @@ Matrix Slam::get_points(const std::vector<int>& frames, int ref_key) const
 
   long at = 0;
   for (int key : frames) {
-    Matrix transf;
     if (use_ref) {
       const gtsam::Pose2 transf_pose = ref_pose.between(keyframes[key]->pose);
-      transf = Keyframe::transform_points(keyframes[key]->points, transf_pose);
+      const Matrix transf = Keyframe::transform_points(keyframes[key]->points, transf_pose);
+      all_points.middleRows(at, transf.rows()) = transf;
+      at += transf.rows();
     } else {
-      transf = keyframes[key]->transf_points;
+      const Matrix& transf = keyframes[key]->transf_points;  // reference, no copy
+      all_points.middleRows(at, transf.rows()) = transf;
+      at += transf.rows();
     }
-    all_points.middleRows(at, transf.rows()) = transf;
-    at += transf.rows();
   }
 
   return downsample(all_points, static_cast<float>(point_resolution));
@@ -285,6 +286,9 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   // variance up to the default's floors keeps the collapsed axis honest while
   // preserving the elongation (sigma_max survives for the gates). Raising a
   // diagonal block's eigenvalues adds a PSD term, so the matrix stays PSD.
+  // Capture the pre-floor covariance for the degeneracy gate (it needs the
+  // elongation the floor below erases — see nssm_degeneracy_prefloor).
+  const Eigen::Matrix3d cov_raw = cov;
   const Eigen::Vector3d floor_var = icp_odom_sigmas.array().square().matrix();
   {
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
@@ -298,6 +302,7 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   result.message = "success";
   result.odom = m;
   result.cov = cov;
+  result.cov_raw = cov_raw;
   result.n_samples = static_cast<int>(sample_transforms.size());
   return result;
 }
@@ -306,8 +311,15 @@ int Slam::get_overlap(const Matrix& source_points, const Matrix& target_points,
                       const gtsam::Pose2* source_pose,
                       std::vector<int>* indices_out) const
 {
-  Matrix src = source_points;
-  if (source_pose) src = Keyframe::transform_points(src, *source_pose);
+  // Avoid copying the full source cloud when no pose transform is needed
+  // (the loop-refine overlap call passes source_pose == nullptr).
+  Matrix src_storage;
+  const Matrix* src_ptr = &source_points;
+  if (source_pose) {
+    src_storage = Keyframe::transform_points(source_points, *source_pose);
+    src_ptr = &src_storage;
+  }
+  const Matrix& src = *src_ptr;
 
   auto [ids, dists] = match(target_points.leftCols(2), src.leftCols(2), 1,
                             static_cast<float>(point_noise));
@@ -459,6 +471,7 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
       ret2.estimated_transform = icp_ret.odom;
       ret2.has_estimated_transform = true;
       ret2.cov = icp_ret.cov;
+      ret2.cov_raw = icp_ret.cov_raw;
       ret2.has_cov = true;
       ret2.n_sample_transforms = icp_ret.n_samples;
       ret2.status.description = std::to_string(icp_ret.n_samples) + " samples";
@@ -499,6 +512,10 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
         icp_odom_sigmas.array().square().matrix().asDiagonal();
       if (cov.determinant() < default_cov.determinant()) cov = default_cov;
       ret2.cov = cov;
+      // Censi path keeps the whole-matrix det swap (separate known issue), so
+      // there is no distinct pre-floor cov here — mirror cov (the prefloor gate
+      // is a no-op on the Censi path).
+      ret2.cov_raw = cov;
       ret2.has_cov = true;
       ret2.n_sample_transforms = c.n_correspondences;
       ret2.status.description = "censi " + std::to_string(c.n_correspondences);
@@ -855,8 +872,13 @@ bool Slam::add_nonsequential_scan_matching()
   // or too anisotropic. The yaw half of the gate is nssm/max_rotation,
   // tightened in slam.yaml to the compass-anchored bound.
   if (ret2.status && ret2.has_cov) {
+    // Gate on the pre-floor covariance when enabled: the per-eigenvalue floor in
+    // compute_icp_with_cov otherwise caps the observable anisotropy and lets
+    // elongated wall-slide covariances pass this gate.
+    const Eigen::Matrix3d& gate_cov =
+      nssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
-      ret2.cov.topLeftCorner<2, 2>());
+      gate_cov.topLeftCorner<2, 2>());
     const double ev_lo = es.eigenvalues()[0];
     const double ev_hi = es.eigenvalues()[1];
     const double sig_max = std::sqrt(std::max(0.0, ev_hi));
@@ -1475,7 +1497,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     Eigen::Matrix3d cov;
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) cov(i, j) = cov6(map[i], map[j]);
-    keyframes.back()->update(pose, cov);
+    keyframes.back()->set_cov(cov);
   } catch (const std::exception&) {
     keyframes.back()->update(pose);
   }
@@ -1494,7 +1516,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
         Eigen::Matrix3d c;
         for (int i = 0; i < 3; ++i)
           for (int j = 0; j < 3; ++j) c(i, j) = c6(map[i], map[j]);
-        keyframes[k]->update(keyframes[k]->horizon_pose3(), c);
+        keyframes[k]->set_cov(c);
       } catch (const std::exception&) {
         // weakly constrained variable: keep the stale marginal
       }

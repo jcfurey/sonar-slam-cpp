@@ -63,6 +63,12 @@ public:
   // beyond compass noise are bogus by construction in this anchored frame.
   double nssm_max_sigma = 0.5;       // max sqrt(largest translation eigenvalue), m
   double nssm_max_anisotropy = 8.0;  // max sigma_max / sigma_min
+  // Evaluate the degeneracy gate on the PRE-floor covariance (opt-in). The
+  // per-eigenvalue floor in compute_icp_with_cov raises the collapsed axis up to
+  // the ICP-model sigma before this gate reads it, capping observable anisotropy
+  // and letting elongated wall-slide covariances pass. True => gate on the raw
+  // (pre-floor) covariance so the elongation the gate exists to catch survives.
+  bool nssm_degeneracy_prefloor = false;
   // Robust kernel on loop factors. Default OFF: DCS scales a factor's weight
   // by 2*phi/(phi+chi2), and a GENUINE closure correcting drift D with ICP
   // sigma s starts at chi2=(D/s)^2 — for D=1 m, s=5 cm that is 400, i.e. 0.5%
@@ -218,6 +224,7 @@ public:
     std::string message;
     gtsam::Pose2 odom;
     Eigen::Matrix3d cov;
+    Eigen::Matrix3d cov_raw = Eigen::Matrix3d::Zero();  // pre-floor (degeneracy gate)
     int n_samples = 0;
   };
   IcpCovResult compute_icp_with_cov(const Matrix& source_points,
