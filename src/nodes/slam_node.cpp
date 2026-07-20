@@ -125,6 +125,7 @@ public:
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
+    slam_.nssm_params.min_revisit_sep = get_int("nssm/min_revisit_sep", 10);
     slam_.nssm_params.min_points = get_int("nssm/min_points");
     slam_.nssm_params.max_translation = get_double("nssm/max_translation");
     slam_.nssm_params.max_rotation = get_double("nssm/max_rotation");
@@ -148,6 +149,8 @@ public:
     slam_.nssm_max_anisotropy = get_double("nssm/max_anisotropy", 8.0);
     slam_.nssm_degeneracy_prefloor = get_bool("nssm/degeneracy_prefloor", false);
     slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.15);
+    slam_.nssm_max_translation_vs_dr =
+      get_double("nssm/max_translation_vs_dr", 0.0);
     slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
     slam_.post_loop_max_translation_err =
       get_double("post_loop_max_translation_err", 1.0);
@@ -506,6 +509,10 @@ private:
                        slam_.last_error().c_str());
         } else if (enable_slam_ && slam_.nssm_params.enable &&
                    slam_.add_nonsequential_scan_matching()) {
+          // per-closure geometry, logged before the update so it precedes any
+          // post-loop revert message (diagnoses legit-fix vs parallel-wall alias)
+          for (const auto& g : slam_.last_nssm_inserted_geom)
+            RCLCPP_INFO(get_logger(), "NSSM %s", g.c_str());
           if (!slam_.update_factor_graph())
             RCLCPP_ERROR(get_logger(),
                          "SLAM loop-closure update failed (%s); loop factors "

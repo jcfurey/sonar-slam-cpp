@@ -291,6 +291,13 @@ struct SMParams
   double max_translation = 2.0;
   double max_rotation = M_PI / 6.0;
   int min_st_sep = 1;
+  // Safety floor on the source->target keyframe index gap for a loop closure:
+  // frames closer in index than this can never become the target. NOT the main
+  // trail/revisit separator — that is the contiguity clustering in
+  // initialize_nonsequential_scan_matching (the in-fan trail spans
+  // ~max_range/keyframe_translation keyframes, far more than any usable floor).
+  // This just guards the degenerate case where a revisit run abuts the trail.
+  int min_revisit_sep = 10;
   int source_frames = 5;
   int target_frames = 3;
   // Bounded-drift rates used to inflate the anchor keyframe's fresh covariance

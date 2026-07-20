@@ -96,6 +96,14 @@ public:
   // Neither max_rotation (ICP-vs-Sobol refinement only) nor the covariance
   // gate (catches sliding, not confident-but-wrong locks) covers this mode.
   double nssm_max_yaw_vs_compass = 0.15;  // rad (~8.6°, > compass noise)
+  // OPTIONAL init-search TRANSLATION clamp — the x/y analog of the yaw clamp
+  // above, for parallel-wall TRANSLATIONAL aliasing on symmetric venues. When
+  // >0, the Sobol init translation search is bounded to ±min(5*std, this) so it
+  // cannot jump to a parallel-wall basin many metres off the DR-predicted
+  // overlap. Set just above the real revisit-drift scale (e.g. ~1.5-2 m for the
+  // ~1 m pool doubling). 0 = disabled (full ±5*std freedom) — the default, so
+  // this lever stays inert until a replay confirms aliasing.
+  double nssm_max_translation_vs_dr = 0.0;  // m; 0 disables
   // optimize-then-verify (rtabmap RGBD/OptimizeMaxError analog): after a
   // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
   // under this bound or the loops are rolled back (see update_factor_graph)
@@ -144,6 +152,12 @@ public:
   int last_pcm_edges = 0;
   // loop rounds reverted by the post-loop verification (diagnostics)
   int nssm_reverted = 0;
+  // per-callback diagnostic: for each loop-closure factor inserted this round,
+  // its ICP-vs-DR correction geometry (keys + trans m / yaw rad). Distinguishes
+  // a legit drift fix (small trans, ~0 yaw) from a parallel-wall alias (large
+  // trans and/or non-zero yaw) when the round is later reverted. Cleared at the
+  // top of every add_nonsequential_scan_matching call; the node logs it.
+  std::vector<std::string> last_nssm_inserted_geom;
   // operator hand-corrections applied / undone over the run (diagnostics)
   int manual_corrections_applied = 0;
   int manual_corrections_undone = 0;

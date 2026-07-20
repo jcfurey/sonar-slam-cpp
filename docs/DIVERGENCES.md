@@ -109,6 +109,25 @@ at the time of comparison.
   the overlap/correspondence 1-NN (`cloud_ops match()`) is GPU-dispatched
   (exact brute force, same -1/inf contract as the KDTree).
 
+### 9. NSSM target = clustered revisit, not raw argmax overlap
+- **Upstream:** `slam.py` selects the loop-closure target keyframe as the single
+  frame with the maximum in-fan overlap (`argmax(counts)`), among all keyframes
+  outside the `min_st_sep` exclusion.
+- **Here:** `slam_core.cpp` `initialize_nonsequential_scan_matching` requires the
+  target to be a genuine revisit: (1) a `min_revisit_sep` **floor** — the target
+  must be at least that many keyframes older than the source, which excludes the
+  current pass's recent trail; then (2) a contiguous-run **cluster** refinement
+  that drops any remaining trailing tail *only when* the survivors still split
+  into multiple index runs (a single run is kept — never over-drop). The target
+  and its submap are then built from these revisit frames only. The floor is
+  primary so the fix is robust when the sonar range covers the whole environment
+  and candidates form one unbroken run with no gap to cluster on (e.g. a small
+  pool). Upstream's argmax anchors every closure to a near-sequential trailing
+  frame ("same area, same time") because those carry the most overlap, so
+  out-and-back passes are never tied together and walls render doubled. This
+  change only narrows *which* frame becomes the target; all acceptance gates
+  (compass, degeneracy, PCM, DCS, post-loop revert) are unchanged.
+
 ## Carried-over limitations left in place (with rationale)
 
 ### A. Only the newest keyframe's covariance is refreshed

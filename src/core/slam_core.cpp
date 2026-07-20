@@ -692,28 +692,99 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // find candidate frames with enough nearby points
   std::map<int, int> counts;
   for (int k : target_keys) counts[k]++;
-  int best_frame = -1, best_count = 0;
-  bool any = false;
   // the keyframes that survive the fan/covariance gate (>10 nearby points):
   // this is the LOCAL overlapping submap, not the whole map. Used below to
   // build the final target cloud, matching slam.py's reassignment of
   // target_frames = target_frames[counts > 10] (std::map keeps ascending order,
   // matching np.unique). Without this the loop-closure ICP/overlap/covariance
   // would register against the entire explored trajectory.
-  std::vector<int> candidate_frames;
-  for (const auto& [frame, count] : counts) {
-    if (count > 10) {
-      any = true;
-      candidate_frames.push_back(frame);
-      if (count > best_count) { best_count = count; best_frame = frame; }
-    }
-  }
+  std::vector<int> candidate_frames;  // ascending (std::map order)
+  for (const auto& [frame, count] : counts)
+    if (count > 10) candidate_frames.push_back(frame);
 
-  if (!any || target_points.rows() < nssm_params.min_points) {
+  if (candidate_frames.empty() ||
+      target_points.rows() < nssm_params.min_points) {
     ret.status = Status(Status::NOT_ENOUGH_POINTS);
     ret.status.description =
       "target points " + std::to_string(target_points.rows());
     return ret;
+  }
+
+  // Revisit selection (intentional divergence from bruce_slam, which took the
+  // raw argmax-overlap frame as the target — see docs/DIVERGENCES.md). The
+  // in-fan candidates include the current pass's own recent trail (the
+  // keyframes just outside the min_st_sep exclusion), which carry the most
+  // overlap. argmax therefore anchors the loop factor to a near-sequential
+  // trailing frame ("same area, same time") and never to a genuine revisit, so
+  // out-and-back passes are never tied together and walls render doubled.
+  //
+  // Two-stage fix, floor-primary so it is robust when the sonar range covers
+  // the whole environment (candidates then form one unbroken index run with no
+  // gap to cluster on — e.g. a small pool):
+  //   (1) FLOOR: a revisit target must be at least min_revisit_sep keyframes
+  //       older than the source. This alone excludes the recent trail.
+  //   (2) CLUSTER (refinement): if the survivors still split into multiple
+  //       contiguous index runs, the highest-index run is the far tail of the
+  //       current pass's trail; drop it so the target is a distinct episode.
+  //       A single run means the floor already isolated the revisit — keep it
+  //       (never over-drop to empty).
+  std::vector<int> revisit_frames;  // stays ascending (candidate_frames is)
+  for (int f : candidate_frames)
+    if (ret.source_key - f >= nssm_params.min_revisit_sep)
+      revisit_frames.push_back(f);
+
+  if (revisit_frames.empty()) {
+    ret.status = Status(Status::NOT_ENOUGH_OVERLAP);
+    ret.status.description =
+      "no-revisit (candidates " + std::to_string(candidate_frames.size()) +
+      ", none older than min_revisit_sep " +
+      std::to_string(nssm_params.min_revisit_sep) + ")";
+    return ret;
+  }
+
+  const int kRevisitGap = 3;  // index gap that splits one episode from the next
+  std::size_t last_run_begin = 0;
+  for (std::size_t i = 1; i < revisit_frames.size(); ++i)
+    if (revisit_frames[i] - revisit_frames[i - 1] > kRevisitGap)
+      last_run_begin = i;
+  if (last_run_begin > 0)  // >1 run: drop the trailing (highest-index) run
+    revisit_frames.resize(last_run_begin);
+
+  candidate_frames = std::move(revisit_frames);
+
+  // Restrict the target cloud to the revisit frames so the Sobol init, the
+  // post-init refine (which recomputes counts from target_keys), and the final
+  // submap all register against the OLD pass, not the trail.
+  const std::set<int> revisit_set(candidate_frames.begin(),
+                                  candidate_frames.end());
+  {
+    long n_keep = 0;
+    for (int k : target_keys) n_keep += revisit_set.count(k);
+    Matrix kept_points(n_keep, 2);
+    std::vector<int> kept_keys(n_keep);
+    long at = 0;
+    for (int i = 0; i < target_points.rows(); ++i) {
+      if (!revisit_set.count(target_keys[i])) continue;
+      kept_points.row(at) = target_points.row(i);
+      kept_keys[at] = target_keys[i];
+      ++at;
+    }
+    target_points = std::move(kept_points);
+    target_keys = std::move(kept_keys);
+  }
+
+  if (target_points.rows() < nssm_params.min_points) {
+    ret.status = Status(Status::NOT_ENOUGH_POINTS);
+    ret.status.description =
+      "target points " + std::to_string(target_points.rows());
+    return ret;
+  }
+
+  // best target = max overlap among revisit frames only
+  int best_frame = candidate_frames.front(), best_count = -1;
+  for (int frame : candidate_frames) {
+    const int count = counts[frame];
+    if (count > best_count) { best_count = count; best_frame = frame; }
   }
 
   ret.target_key = best_frame;
@@ -746,9 +817,16 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
     nssm_max_yaw_vs_compass > 0.0
       ? std::min(5.0 * rotation_std, nssm_max_yaw_vs_compass)
       : 5.0 * rotation_std;
+  // Optional TRANSLATION clamp (parallel-wall aliasing lever, default off): cap
+  // the Sobol init x/y search so it cannot reach a parallel-wall basin many
+  // metres off the DR-predicted overlap. 0 keeps the full ±5σ freedom.
+  const double trans_bound =
+    nssm_max_translation_vs_dr > 0.0
+      ? std::min(5.0 * translation_std, nssm_max_translation_vs_dr)
+      : 5.0 * translation_std;
   Eigen::Matrix<double, 3, 2> bounds;
-  bounds << -5.0 * translation_std, 5.0 * translation_std,
-            -5.0 * translation_std, 5.0 * translation_std,
+  bounds << -trans_bound, trans_bound,
+            -trans_bound, trans_bound,
             -yaw_bound, yaw_bound;
 
   const GlobalInitResult init = global_scan_match_init(
@@ -807,12 +885,14 @@ std::string nssm_hist_key(const Status& s)
   const std::string& d = s.description;
   if (d.rfind("compass-inconsistent", 0) == 0) key += " (compass)";
   else if (d.rfind("degenerate", 0) == 0) key += " (degenerate)";
+  else if (d.rfind("no-revisit", 0) == 0) key += " (no-revisit)";
   return key;
 }
 }  // namespace
 
 bool Slam::add_nonsequential_scan_matching()
 {
+  last_nssm_inserted_geom.clear();
   // current_frame is assigned at the END of the SLAM callback, so it is null
   // until the second callback
   if (!current_frame || current_key() < nssm_params.min_st_sep) return false;
@@ -952,6 +1032,28 @@ bool Slam::add_nonsequential_scan_matching()
       keyframes[loop.source_key]->constraints.emplace_back(
         loop.target_key, loop.estimated_transform);
       loop.inserted = true;
+      // Diagnostic: the correction this closure demands, ICP relative pose vs
+      // the DR-predicted relative pose (same target->source convention as the
+      // factor above). Legit ~1 m drift fix => trans ~drift, yaw ~0; a
+      // parallel-wall alias => large trans and/or non-zero yaw. Logged by the
+      // node so it lands right before any post-loop revert message.
+      {
+        const gtsam::Pose2 dr_rel = keyframes[loop.target_key]->dr_pose.between(
+          keyframes[loop.source_key]->dr_pose);
+        const gtsam::Pose2 corr = dr_rel.between(loop.estimated_transform);
+        last_nssm_inserted_geom.push_back(
+          "closure src=" + std::to_string(loop.source_key) + " tgt=" +
+          std::to_string(loop.target_key) + " gap=" +
+          std::to_string(loop.source_key - loop.target_key) +
+          " | ICP-vs-DR corr trans=" +
+          std::to_string(std::hypot(corr.x(), corr.y())) + "m yaw=" +
+          std::to_string(corr.theta()) + "rad | DR rel=(" +
+          std::to_string(dr_rel.x()) + "," + std::to_string(dr_rel.y()) + "," +
+          std::to_string(dr_rel.theta()) + ") ICP rel=(" +
+          std::to_string(loop.estimated_transform.x()) + "," +
+          std::to_string(loop.estimated_transform.y()) + "," +
+          std::to_string(loop.estimated_transform.theta()) + ")");
+      }
       // tentative until the next update_factor_graph succeeds; rolled back
       // (inserted flag, constraints entry, counter) if the solve throws
       pending_loops_.push_back(m);
