@@ -89,6 +89,12 @@
       max_translation: 10.0   # max translation allowed
       max_rotation: 1.0471975511965976   # deg(60)
       source_frames: 5        # the number of frames to aggregate when trying a loop closure
+      # Candidate-fan padding inflates the anchor keyframe's fresh covariance by
+      # (rate * frame_age_s)^2, since older source frames' stored covariances are
+      # stale/over-confident. Only affects pre-selection padding; larger = wider
+      # fan (safer, slightly more ICP work).
+      fan_drift_trans: 0.01   # m/s  translational drift assumed per second of age
+      fan_drift_rot: 0.0017   # rad/s (~0.1 deg/s) rotational drift per second of age
       initialization: true    # global scan-match init before ICP
       initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30

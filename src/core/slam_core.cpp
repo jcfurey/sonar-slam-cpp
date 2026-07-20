@@ -105,6 +105,8 @@ Slam::Slam() : isam_(make_isam2_params())
   nssm_params.max_rotation = M_PI / 2.0;
   nssm_params.source_frames = 5;
   nssm_params.cov_samples = 30;
+  nssm_params.fan_drift_trans = 0.01;
+  nssm_params.fan_drift_rot = 0.0017;
 }
 
 void Slam::configure()
@@ -637,15 +639,27 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // padded by the pose uncertainty.
   // NOTE: update_factor_graph only refreshes the newest keyframe's covariance
   // (carried from slam.py; see docs/DIVERGENCES.md), so the older source
-  // frames' covariances here are stale. This only widens/narrows the fan
-  // PADDING for candidate pre-selection, a second-order effect, so it is left
-  // as-is; the high-impact consumer (the global-init search bounds below) now
-  // uses the freshly refreshed anchor-keyframe covariance.
+  // frames' stored covariances are stale — and typically over-confident, which
+  // would UNDER-pad the fan and drop overlapping target points (missed
+  // closures). Instead of the stale per-frame cov we take the freshly
+  // refreshed anchor covariance and inflate it by the source frame's age at
+  // bounded drift rates (fan_drift_trans/rot). This only sets the candidate
+  // pre-selection PADDING, and inflation can only widen the fan, so it errs
+  // toward over-selection (a bit more ICP work, never a missed overlap).
+  // Intentional divergence from bruce_slam — see docs/DIVERGENCES.md.
   std::vector<char> sel(target_points_all.rows(), 0);
-  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d cov;
+  const Eigen::Matrix3d fresh_cov = keyframes[ret.source_key]->cov;
+  const double anchor_time = to_sec(keyframes[ret.source_key]->time);
   for (int source_frame : source_frames) {
     const gtsam::Pose2& pose = keyframes[source_frame]->pose;
-    cov = keyframes[source_frame]->cov;
+
+    // age >= 0: source_frames descend from the anchor (newest) keyframe.
+    const double age_s = anchor_time - to_sec(keyframes[source_frame]->time);
+    cov = fresh_cov;
+    cov(0, 0) += std::pow(nssm_params.fan_drift_trans * age_s, 2);
+    cov(1, 1) += std::pow(nssm_params.fan_drift_trans * age_s, 2);
+    cov(2, 2) += std::pow(nssm_params.fan_drift_rot * age_s, 2);
 
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
     const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());

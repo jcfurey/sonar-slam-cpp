@@ -129,6 +129,9 @@ public:
     slam_.nssm_params.max_translation = get_double("nssm/max_translation");
     slam_.nssm_params.max_rotation = get_double("nssm/max_rotation");
     slam_.nssm_params.source_frames = get_int("nssm/source_frames");
+    slam_.nssm_params.fan_drift_trans =
+      get_double("nssm/fan_drift_trans", 0.01);
+    slam_.nssm_params.fan_drift_rot = get_double("nssm/fan_drift_rot", 0.0017);
     slam_.nssm_params.initialization = get_bool("nssm/initialization", true);
     const auto nssm_init =
       init_params("nssm/initialization_params", {100.0, 5.0, 0.01});

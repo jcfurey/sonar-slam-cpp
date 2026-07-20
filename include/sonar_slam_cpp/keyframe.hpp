@@ -293,6 +293,12 @@ struct SMParams
   int min_st_sep = 1;
   int source_frames = 5;
   int target_frames = 3;
+  // Bounded-drift rates used to inflate the anchor keyframe's fresh covariance
+  // when padding the candidate fan for older source frames (whose stored
+  // covariances are stale — only the newest keyframe's is refreshed by
+  // update_factor_graph). Added as (rate * age_seconds)^2 to the diagonal.
+  double fan_drift_trans = 0.01;    // m / s
+  double fan_drift_rot = 0.0017;    // rad / s (~0.1 deg/s)
   int cov_samples = 0;
   CovMethod cov_method = SAMPLED;
 };
