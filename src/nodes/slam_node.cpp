@@ -114,7 +114,7 @@ public:
     // covariance-estimating ICP for SSM (core supported it but the config
     // never reached it — in the python original these fields were unwired,
     // which left SSM on plain point-to-point ICP with a fixed noise model;
-    // that poisoned the graph on pool geometry, see SONAR_SLAM_PLAN.md)
+    // that poisoned the graph on pool geometry)
     slam_.ssm_params.initialization = get_bool("ssm/initialization", true);
     const auto ssm_init = init_params("ssm/initialization_params", {50.0, 1.0, 0.01});
     slam_.ssm_params.init_n = static_cast<int>(ssm_init[0]);

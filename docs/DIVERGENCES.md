@@ -105,7 +105,7 @@ at the time of comparison.
   parallel it rarely fires, so FAST-MCD typically sees all 30 samples (a
   strictly better-populated covariance estimate). Set false to restore the
   historical one-core loop. GPU note: the registrations stay CPU
-  (libpointmatcher) by decision — see repo-root `GPU_ACCELERATION.md` §4;
+  (libpointmatcher) by decision;
   the overlap/correspondence 1-NN (`cloud_ops match()`) is GPU-dispatched
   (exact brute force, same -1/inf contract as the KDTree).
 

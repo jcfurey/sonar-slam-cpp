@@ -34,7 +34,7 @@ namespace {
 // Map-stream cloud: 6 float fields packed in the PointXYZI 32-byte stride
 // (x@0 y@4 z@8 intensity@16 range@20 incidence@24). MUST stay byte-identical
 // to sonar_proc's map_points layout — the Accumulator's field-validating
-// concatenate is the enforcement point (SURVEY_RADIOMETRICS_PLAN.md).
+// concatenate is the enforcement point.
 // Features carry no incidence estimate -> -1 (unknown).
 sensor_msgs::msg::PointCloud2 make_map_cloud(const Matrix& xyz,
                                              const Eigen::VectorXf& intens,
@@ -205,7 +205,7 @@ public:
         create_publisher<sensor_msgs::msg::PointCloud2>(map_topic, 10);
     // residual TVG for the map stream (identity at 0) — keep these equal to
     // sonar_proc's values so the union's two intensity sources stay on one
-    // radiometric scale (SURVEY_RADIOMETRICS_PLAN.md)
+    // radiometric scale
     tvg_spread_db_ = get_double("tvg_spread_db", 0.0);
     tvg_absorption_db_per_m_ = get_double("tvg_absorption_db_per_m", 0.0);
 
