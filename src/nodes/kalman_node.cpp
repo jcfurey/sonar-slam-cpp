@@ -164,6 +164,20 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // 1. Calculate measured dt FIRST
+    double dt = dt_imu_;
+    const double t_now = to_sec(imu.stamp);
+    if (last_imu_stamp_ > 0.0) {
+      const double measured = t_now - last_imu_stamp_;
+      if (measured >= 0.0 && measured < 10.0 * dt_imu_) dt = measured;
+    }
+    last_imu_stamp_ = t_now;
+
+    // 2. Update the transition matrix dynamically
+    A_imu_(0, 6) = dt; A_imu_(1, 7) = dt; A_imu_(2, 8) = dt; // Pos = Pos + Vel*dt
+    A_imu_(3, 9) = dt; A_imu_(4, 10) = dt; A_imu_(5, 11) = dt; // Ang = Ang + Rate*dt
+
+    // 3. Now run the prediction
     Vec12 predicted_x;
     Mat12 predicted_P;
     kalman_predict(state_vector_, cov_matrix_, A_imu_, predicted_x, predicted_P);
@@ -203,13 +217,8 @@ private:
     // second-order; the position integration here is where it accumulates
     // linearly. Clamped: a gap (dropout/bag jump) must not integrate stale
     // velocity into a jump; negative dt (bag loop) re-anchors the timebase.
-    double dt = dt_imu_;
-    const double t_now = to_sec(imu.stamp);
-    if (last_imu_stamp_ > 0.0) {
-      const double measured = t_now - last_imu_stamp_;
-      if (measured >= 0.0 && measured < 10.0 * dt_imu_) dt = measured;
-    }
-    last_imu_stamp_ = t_now;
+    // dt was measured at the top of the callback (shared with the A_imu_
+    // transition matrix) and last_imu_stamp_ already advanced there.
     const double trans_x = state_vector_[6] * dt;
     const double trans_y = state_vector_[7] * dt;
     const gtsam::Point2 local_point(trans_x, trans_y);
