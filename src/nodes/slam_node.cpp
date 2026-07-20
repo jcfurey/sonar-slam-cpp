@@ -143,6 +143,7 @@ public:
     // NSSM degeneracy gate (see slam_core.hpp)
     slam_.nssm_max_sigma = get_double("nssm/max_sigma", 0.5);
     slam_.nssm_max_anisotropy = get_double("nssm/max_anisotropy", 8.0);
+    slam_.nssm_degeneracy_prefloor = get_bool("nssm/degeneracy_prefloor", false);
     slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.15);
     slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
     slam_.post_loop_max_translation_err =

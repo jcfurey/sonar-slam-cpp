@@ -67,6 +67,7 @@ Matrix finite_rows(const Matrix& in)
   int n = 0;
   for (int i = 0; i < in.rows(); ++i)
     if (in.row(i).allFinite()) ++n;
+  if (n == in.rows()) return in;  // all finite: skip the second pass + copy
   Matrix out(n, in.cols());
   int at = 0;
   for (int i = 0; i < in.rows(); ++i)
@@ -117,7 +118,7 @@ public:
 
     // must match slam_node's enu_world so the reconstructed sonar fan lands in
     // the same frame chirality as the trajectory poses
-    const bool enu = get_bool("enu_world", true);
+    const bool enu = get_bool("enu_world", false);
     map_.frame_y_sign = enu ? 1.0 : -1.0;
 
     map_.configure();
@@ -216,6 +217,25 @@ private:
 
     const int n = static_cast<int>(msg.width * std::max<uint32_t>(msg.height, 1));
     if (n == 0) return;
+
+    // Validate all consumed fields exist before constructing iterators — a
+    // PointCloud2ConstIterator throws std::runtime_error on a missing field,
+    // which would escape this subscription callback and terminate the node
+    // (e.g. a replayed/foreign traj cloud missing the C++-added `t` field).
+    {
+      auto has_field = [&msg](const char* name) {
+        for (const auto& f : msg.fields)
+          if (f.name == name) return true;
+        return false;
+      };
+      if (!has_field("x") || !has_field("y") || !has_field("yaw") ||
+          !has_field("t")) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "Dropping trajectory: missing x/y/yaw/t field (slam node too old?)");
+        return;
+      }
+    }
+
     const int64_t msg_ns = stamp_ns(msg.header.stamp);
     last_stamp_ns_ = msg_ns;
 

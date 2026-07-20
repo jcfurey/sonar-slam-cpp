@@ -114,6 +114,17 @@ struct Keyframe
     update(est_h);
   }
 
+  // Covariance-only refresh: update cov and the global-frame transf_cov WITHOUT
+  // re-transforming the point cloud. transf_points depends only on pose+points,
+  // so when only the marginal covariance changed (pose unchanged) this avoids a
+  // redundant O(cloud) transform (used on the loop-closure marginal refresh).
+  void set_cov(const Eigen::Matrix3d& new_cov)
+  {
+    cov = new_cov;
+    has_cov = true;
+    update_transf_cov();
+  }
+
   // the keyframe's current estimate as a horizon pose (graph state chart)
   gtsam::Pose3 horizon_pose3() const
   {
@@ -249,6 +260,7 @@ struct ICPResult
 
   bool has_cov = false;
   Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d cov_raw = Eigen::Matrix3d::Zero();  // pre-floor cov (degeneracy gate)
   bool inserted = false;
   // quarantined by a post-loop verification revert: this closure (as part of
   // its clique) demonstrably bent the graph, so it must not be re-inserted or
