@@ -206,7 +206,11 @@ public:
         slam_.oculus.configure(ping);
       });
 
-    // feature cloud (primary) + dead-reckoning odometry, approx-time synced
+    // Pitch-gated feature cloud (primary) + dead-reckoning odometry,
+    // approx-time synced. The ungated SONAR_FEATURE_TOPIC is reserved for
+    // honest 3D visualization; swept/floor-dominated frames arrive as NaN
+    // sentinels only on SONAR_SLAM_FEATURE_TOPIC, so the synchronizer advances
+    // without admitting them to planar registration.
     sync_ = std::make_unique<
       ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>(
       20, feature_odom_sync_max_delay_,
@@ -234,7 +238,8 @@ public:
     });
 
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      SONAR_FEATURE_TOPIC, 20, [this](const sensor_msgs::msg::PointCloud2& msg) {
+      SONAR_SLAM_FEATURE_TOPIC, 20,
+      [this](const sensor_msgs::msg::PointCloud2& msg) {
         sync_->add_primary(to_sec(msg.header.stamp), msg);
       });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(

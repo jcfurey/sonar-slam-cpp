@@ -133,8 +133,11 @@ public:
       this, sonar_driver, sonar_topic, rclcpp::SensorDataQoS(),
       [this](const SonarPing& ping) { on_ping(ping); });
 
+    // The correctable occupancy product is planar, so consume the same
+    // head-pitch-gated stream as slam_node. The ungated feature topic is
+    // visualization-only and may contain floor-dominated swept frames.
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      SONAR_FEATURE_TOPIC, 20,
+      SONAR_SLAM_FEATURE_TOPIC, 20,
       [this](const sensor_msgs::msg::PointCloud2& msg) { on_feature(msg); });
 
     // latched, re-published every keyframe -> our correction trigger

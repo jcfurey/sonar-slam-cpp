@@ -26,10 +26,10 @@
     # into the published fan; 0-behavior when the topic never arrives
     apply_head_tilt: true
     # head_tilt_topic: /base/sensor_tilt_angle
-    # skip feature frames when |head pitch| exceeds this bound (rad; 0 = off).
-    # During the +/-54 deg sweep the fan is floor/surface-dominated and its
-    # planar projection corrupts registration — deployments with a pivoting
-    # head should set ~0.35-0.6; frames still reach the map via other streams.
+    # Gate /slam_feature and the CFAR map contribution when the sonar head
+    # exceeds this angle relative to base_link (rad; 0 = off). The always-real
+    # /feature and feature_img visualization streams remain live. Set this
+    # above the platform's normal operating tilt but below its extreme sweep.
     max_head_pitch: 0.0
 
     # optional union map stream (padded XYZI + range/incidence); "" = off

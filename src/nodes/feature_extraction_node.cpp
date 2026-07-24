@@ -191,6 +191,8 @@ public:
 
     feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       SONAR_FEATURE_TOPIC, 10);
+    slam_feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      SONAR_SLAM_FEATURE_TOPIC, 10);
     feature_img_pub_ = create_publisher<sensor_msgs::msg::Image>(
       SONAR_FEATURE_IMG_TOPIC, 10);
 
@@ -224,12 +226,13 @@ public:
     // bright curved band whose planar (x,y) projection registers against
     // real walls from other frames and pulls the graph (the observed "bad
     // SLAM corrections"), and whose features stamp curved bands into the
-    // mapping tiles. Skip feature frames when |head pitch| exceeds this
-    // bound (rad; 0 disables the gate). The NaN sentinel keeps the SLAM
-    // synchronizer advancing; dead-reckoning odometry factors carry the
-    // graph between level frames, and the sweep frames still feed the map
-    // through sonar_proc's candidates/dense streams (which place them with
-    // the floor/wall projections).
+    // mapping tiles. Evaluate the sonar head relative to base_link: vehicle
+    // attitude is already represented by the robot pose and must not turn a
+    // normal pitched operating pose into a rejected scan. The configured
+    // bound must sit above the platform's normal head tilt but below its
+    // extreme sweep. The real 3D cloud/image always publish for operators;
+    // only SONAR_SLAM_FEATURE_TOPIC and the CFAR map contribution are gated.
+    // The NaN sentinel keeps SLAM/mapping synchronizers advancing.
     max_head_pitch_ = get_double("max_head_pitch", 0.0);
 
     apply_head_tilt_ = get_bool("apply_head_tilt", true);
@@ -361,7 +364,7 @@ private:
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
-                        const Matrix& points, float phi)
+                        const Matrix& points, float phi, bool slam_eligible)
   {
     // Publish honest planar base_link coordinates: [x, y, 0]. The python
     // original packed the lateral coordinate into z ([x, 0, y] — a leftover
@@ -387,10 +390,22 @@ private:
     msg.header.frame_id = "base_link";
     feature_pub_->publish(msg);
 
+    if (slam_eligible) {
+      slam_feature_pub_->publish(msg);
+    } else {
+      Matrix sentinel_xyz(1, 3);
+      sentinel_xyz.setConstant(std::numeric_limits<float>::quiet_NaN());
+      auto sentinel = make_cloud_xyz(sentinel_xyz);
+      sentinel.header = msg.header;
+      slam_feature_pub_->publish(sentinel);
+    }
+
     // union map stream (see constructor): skip the NaN skip-frame sentinel
-    // (a sync signal for the slam node, poison for map consumers) and empty
-    // frames (they only flood the chain/assembler with no-data warnings)
-    if (map_points_pub_ && xyz.rows() > 0 && !std::isnan(xyz(0, 0))) {
+    // (a sync signal for the slam node, poison for map consumers), gated
+    // floor-dominated frames, and empty frames (they only flood the
+    // chain/assembler with no-data warnings)
+    if (map_points_pub_ && slam_eligible && xyz.rows() > 0 &&
+        !std::isnan(xyz(0, 0))) {
       // real echo intensity (0..1): invert the extraction pixel->meters
       // mapping back into this ping's remapped grayscale. points col0 =
       // forward (rows axis), col1 = lateral (cols axis), pre-tilt — their
@@ -456,26 +471,35 @@ private:
     // the SLAM node's time synchronizer keeps advancing
     ++frame_count_;
     const int ping_id = ping.ping_id != 0 ? ping.ping_id : frame_count_;
-    // head pitch AT THE PING STAMP (interpolated), used by both the frame
-    // gate and the published fan's z-fold
+    // Head pitch AT THE PING STAMP (interpolated) both places the real feature
+    // fan in base_link and determines admission to the planar consumers.
+    const int64_t ping_stamp_ns = rclcpp::Time(ping.stamp).nanoseconds();
     const float phi = apply_head_tilt_
-      ? tilt_at(rclcpp::Time(ping.stamp).nanoseconds()) : 0.0f;
+      ? tilt_at(ping_stamp_ns) : 0.0f;
     if (skip_ > 0 && ping_id % skip_ != 0) {
       Matrix nan(1, 2);
       nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan, phi);
+      publish_features(ping.stamp, nan, phi, false);
       return;
     }
 
-    // head-pitch frame gate (see constructor): swept frames are floor- or
-    // surface-dominated — poison for the planar registration and the tiles
-    if (max_head_pitch_ > 0.0 &&
-        std::fabs(phi) > static_cast<float>(max_head_pitch_)) {
-      Matrix nan(1, 2);
-      nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan, phi);
-      return;
+    const bool slam_eligible =
+      max_head_pitch_ <= 0.0 ||
+      std::fabs(phi) <= static_cast<float>(max_head_pitch_);
+    if (!slam_eligible && !gate_active_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Planar-SLAM feature gate active: head pitch %.1f deg exceeds "
+        "%.1f deg (3D feature visualization remains live)",
+        phi * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
+    } else if (slam_eligible && gate_active_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Planar-SLAM feature gate cleared: head pitch %.1f deg is within "
+        "%.1f deg",
+        phi * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
     }
+    gate_active_ = !slam_eligible;
 
     // a malformed adapter frame (empty / zero-range image) must not throw out
     // of the callback and terminate the node
@@ -553,7 +577,7 @@ private:
         points = remove_outlier(points, outlier_filter_radius_,
                                 outlier_filter_min_points_);
 
-      publish_features(ping.stamp, points, phi);
+      publish_features(ping.stamp, points, phi, slam_eligible);
     } catch (const cv::Exception& e) {
       RCLCPP_WARN(get_logger(), "Dropping sonar ping: OpenCV error: %s", e.what());
     } catch (const std::exception& e) {
@@ -585,6 +609,7 @@ private:
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr feature_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr slam_feature_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feature_img_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_pub_;
   double tvg_spread_db_ = 0.0;
@@ -597,8 +622,10 @@ private:
   std::deque<std::pair<int64_t, float>> tilt_buf_;
   static constexpr std::size_t kTiltBufMax = 1024;
   bool apply_head_tilt_ = true;
-  // skip feature frames when |head pitch| exceeds this (rad); 0 = no gate
+  // Skip planar-consumer frames when |head pitch relative to base_link|
+  // exceeds this value (rad); 0 = no gate.
   double max_head_pitch_ = 0.0;
+  bool gate_active_ = false;
 };
 
 }  // namespace sonar_slam
