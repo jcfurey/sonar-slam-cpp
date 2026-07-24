@@ -91,8 +91,9 @@ public:
       return v;
     };
 
-    // ICP-covariance method when cov_samples > 0: "sampled" (many ICPs +
-    // FAST-MCD, the default/parity behavior) or "censi" (one ICP + closed-form)
+    // ICP-covariance method when cov_samples > 0. "censi" is still parsed for
+    // a useful configuration error from Slam::configure(), but is disabled
+    // while its point-to-point Hessian does not match the point-to-plane ICP.
     const auto cov_method = [this](const char* name) {
       const std::string s = get_string(name, "sampled");
       if (s == "sampled") return SMParams::SAMPLED;
@@ -113,8 +114,8 @@ public:
     slam_.ssm_params.target_frames = get_int("ssm/target_frames");
     // covariance-estimating ICP for SSM (core supported it but the config
     // never reached it — in the python original these fields were unwired,
-    // which left SSM on plain point-to-point ICP with a fixed noise model;
-    // that poisoned the graph on pool geometry)
+    // which left SSM on ICP with a fixed noise model; that poisoned the graph
+    // on pool geometry)
     slam_.ssm_params.initialization = get_bool("ssm/initialization", true);
     const auto ssm_init = init_params("ssm/initialization_params", {50.0, 1.0, 0.01});
     slam_.ssm_params.init_n = static_cast<int>(ssm_init[0]);

@@ -41,7 +41,7 @@ public:
 
   double point_resolution = 0.5;  // downsampling for ICP / publishing
   double point_noise = 0.5;       // noise radius in overlap estimation
-  // per-point sonar coordinate noise std (m) for the Censi covariance path
+  // Reserved by the disabled point-to-point Censi reference implementation.
   double censi_sensor_noise = 0.1;
   // run the sampled-covariance registrations (cov_samples per scan match)
   // across an OpenMP per-thread ICP engine pool instead of one core

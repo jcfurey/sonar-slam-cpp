@@ -257,6 +257,31 @@ install(TARGETS parity_vs_python DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_test REQUIRED)
 
+  add_executable(test_cfar_math test/cfar_math_test.cpp)
+  target_link_libraries(test_cfar_math sonar_slam_core)
+  ament_add_test(test_cfar_math
+    COMMAND $<TARGET_FILE:test_cfar_math>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 120)
+
+  add_executable(test_interp_spline test/interp_spline_test.cpp)
+  target_include_directories(test_interp_spline PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  ament_add_test(test_interp_spline
+    COMMAND $<TARGET_FILE:test_interp_spline>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_censi_covariance test/censi_covariance_test.cpp)
+  target_include_directories(test_censi_covariance PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  ament_add_test(test_censi_covariance
+    COMMAND $<TARGET_FILE:test_censi_covariance>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_sonar_geometry test/sonar_geometry_test.cpp)
+  target_link_libraries(test_sonar_geometry sonar_slam_core)
+  ament_add_test(test_sonar_geometry
+    COMMAND $<TARGET_FILE:test_sonar_geometry>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_isam_recovery test/test_isam_recovery.cpp)
   target_include_directories(test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
   target_link_libraries(test_isam_recovery gtsam)
@@ -283,6 +308,18 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_pipeline_e2e>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 300)
+
+  # In CPU-only CI this is a CPU smoke test; on a CUDA build with a visible
+  # device the same registered test exercises every GPU kernel against its CPU
+  # twin.
+  ament_add_test(test_runtime_parity
+    COMMAND $<TARGET_FILE:parity_check>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 120)
+
+  # test/parity_driver.py additionally needs the original bruce_slam package
+  # and generated reference fixtures, so it remains a manual cross-project
+  # compatibility harness rather than a hermetic package test.
 endif()
 
 # ------------------------------------------------------------------------- install

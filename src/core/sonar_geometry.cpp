@@ -21,7 +21,11 @@ bool OculusProperty::configure(const SonarPing& ping)
     num_bearings = static_cast<int>(ping.bearings.size());
     bearings = ping.bearings;
     horizontal_aperture = std::abs(bearings.back() - bearings.front());
-    angular_resolution = horizontal_aperture / num_bearings;
+    // bearings.front()/back() are beam centres and both endpoints are present,
+    // so N beams contain N-1 angular intervals. Using N compressed the spacing
+    // and biased mapping's angular subsampling/inflation.
+    angular_resolution =
+      num_bearings > 1 ? horizontal_aperture / (num_bearings - 1) : 0.0;
     // OCULUS_VERTICAL_APERTURE: mode 1 -> 20 deg, mode 2 -> 12 deg,
     // default to the low-frequency aperture for unknown modes
     vertical_aperture =

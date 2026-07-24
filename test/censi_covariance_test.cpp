@@ -1,6 +1,8 @@
-// Standalone validation of the Censi (2007) closed-form ICP covariance used by
-// the opt-in cov_method: censi scan-matching path (see docs/RESEARCH.md). The
-// estimator is
+// Standalone validation of the retained point-to-point Censi (2007)
+// covariance math. The runtime cov_method is deliberately disabled because
+// the shipped ICP is point-to-plane; this test protects the isolated helper
+// while a matching point-to-plane covariance implementation is pending. The
+// estimator tested here is
 //     cov = 2 * sensor_var * (Sum_i J_i^T J_i)^-1
 // for 2D point-to-point registration. This test Monte-Carlo checks it: it
 // draws known-correspondence rigid fits under per-point Gaussian noise and

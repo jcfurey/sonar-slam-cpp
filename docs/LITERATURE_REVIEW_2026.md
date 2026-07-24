@@ -259,29 +259,25 @@ a surviving verified claim** this pass — our windowed-yaw-RMS / chain-tear
 revert is, as far as the harness confirmed, a novel instantiation. Sound, but
 we should stop calling it "well-precedented" for the revert specifically.
 
-**6. Censi closed-form ICP covariance offered opt-in, sampling as default —
-VALIDATED as a default choice; the Censi OPTION is CONTRADICTED for our ICP
-type.** *This is the most important finding in this review.*
+**6. Censi closed-form ICP covariance — sampling remains the runtime choice;
+the legacy Censi implementation is DISABLED.** *This is the most important
+finding in this review.*
 Bonnabel, Barczyk & Goulette ("On the Covariance of ICP-based Scan-matching
 Techniques," ACC 2016; arXiv 1410.7632) prove the Censi (2007) closed form is
 valid for **point-to-plane** ICP but yields **"completely erroneous
 covariances" for point-to-point ICP**, because the closed form does not
-account for the rematching step. **[VERIFIED]** Our shipped ICP uses
-`PointToPointErrorMinimizer` (config/icp.yaml) and our
-`icp_covariance.cpp` builds the point-to-point Jacobian — so **the Bonnabel
-critique lands directly on our opt-in Censi path.** Two consequences:
+account for the rematching step. **[VERIFIED]** The shipped ICP has since moved
+to `PointToPlaneErrorMinimizer` (config/icp.yaml), but
+`icp_covariance.cpp` still builds the old point-to-point Jacobian and does not
+consume the minimizer's surface normals. Merely changing the optimizer does
+not make that mismatched Hessian valid. Two consequences:
   - Keeping **sampled + FAST-MCD as the default is the correct, safe choice** —
-    the literature validates it and warns against the closed form for our
-    minimizer.
-  - The **Censi option, as currently paired with point-to-point ICP, is on
-    unsound theoretical footing** and can under-estimate covariance in
-    degenerate (wall-sliding) geometry — the exact failure mode our degeneracy
-    gate exists to catch. Newer estimators (Brossard, Bonnabel & Barrau, RA-L
-    2020, arXiv 1909.05722; CELLO-3D, Landry et al., arXiv 1810.01470) address
-    this. **Action: either switch the Censi path to a point-to-plane minimizer
-    (which makes Censi rigorous), or document the Censi option as
-    "point-to-point → optimistic covariance, use with the degeneracy gate
-    tight," or adopt a Brossard-style estimator.**
+    and it measures the behavior of the configured registration pipeline.
+  - `Slam::configure` now **rejects `cov_method: censi`** rather than attaching
+    a point-to-point covariance to a point-to-plane transform. Re-enabling it
+    requires a Hessian built from the same normals/objective, or a
+    rematching-aware estimator such as Brossard, Bonnabel & Barrau (RA-L 2020,
+    arXiv 1909.05722).
 
 **7. Compass / absolute-yaw gating of loop closures — VALIDATED (underwater),
 BREAKS ON LAND.**
@@ -335,15 +331,13 @@ specifically prescribed by any paper.
 
 ## What the literature suggests we change or test next (prioritized)
 
-1. **Censi covariance (Part 2.6) — DONE this review.** The Deep Trekker
-   Revolution preset was shipping `ssm/cov_method: censi` with our
-   point-to-point ICP, which Bonnabel proves is unsound; it was switched to
-   `sampled` (cov_samples 20), which fixes the original fixed-confidence
-   concern *and* stays rigorous. The opt-in `censi` path in the base config is
-   now annotated as optimistic for point-to-point (icp_covariance.cpp,
-   slam.yaml). Remaining option if censi is ever wanted: point it at a
-   point-to-plane minimizer, or adopt a Brossard-style rematching-aware
-   estimator.
+1. **Censi covariance (Part 2.6) — safely disabled.** The Deep Trekker
+   Revolution preset uses `sampled` (cov_samples 20), which fixes the original
+   fixed-confidence concern. The later point-to-plane ICP switch did not
+   update the retained point-to-point covariance Hessian, so
+   `Slam::configure` now rejects `censi`. Re-enable it only with a
+   point-to-plane covariance implementation using the configured normals, or
+   adopt a Brossard-style rematching-aware estimator.
 2. **On any radar port, replace compass anchoring with gyro yaw-rate (Part
    1.4).** The single assumption most certain to break on land. The verify
    layer should compare optimized yaw against integrated gyro, not a
@@ -448,10 +442,11 @@ by unanimous 3-0 votes. Machine-confirmed this pass:
 NOT machine-confirmed:** item 3 (ISAM2 tuning), item 6 (Censi covariance),
 item 8 (DVL-dropout coasting), item 9 (Sobol relocalization), item 10 (USBL
 priors). These are *unconfirmed*, not *refuted* — the harness's top-25 search
-simply did not surface adjudicable evidence. The **Censi/point-to-point
-finding (Part 2.6) was hand-verified by me directly against Bonnabel this
-session**, so that conclusion stands independently of the harness; the other
-four remain open questions needing their own literature pass. Also only
+simply did not surface adjudicable evidence. The **Censi objective-matching
+requirement (Part 2.6) was hand-verified directly against Bonnabel**, so that
+conclusion stands independently of the harness; the legacy mismatched mode is
+now rejected. The other four remain open questions needing their own
+literature pass. Also only
 indirectly covered: OS-CFAR-for-*sonar* (the surviving CFAR evidence is
 radar-scoped) and the compass-yaw loop-*gating* precedent (only the
 magnetometer-degradation premise was confirmed). Confirm any specific numeric

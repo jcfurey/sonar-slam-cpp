@@ -2,10 +2,11 @@
 
 [![ci](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml)
 
-All-C++/CUDA port of the `bruce_slam` sonar SLAM stack — zero Python anywhere
-(nodes are `rclcpp`, the launch file is XML). Every GPU kernel has a CPU twin
-selected at runtime, so the same binary runs on the Jetson/desktop GPU or on a
-CPU-only machine with identical behavior.
+All-C++/CUDA runtime port of the `bruce_slam` sonar SLAM stack — nodes are
+`rclcpp` and the launch files are XML. Python is used only by the optional
+cross-project parity harness under `test/`, never at runtime. Every GPU kernel
+has a CPU twin selected at runtime, so the same binary runs on the
+Jetson/desktop GPU or on a CPU-only machine with identical behavior.
 
 ## Quick demo (no hardware, no bags)
 
@@ -60,8 +61,8 @@ CUDA kernels (compiled only when a CUDA toolchain exists; the build degrades
 to CPU-only silently otherwise):
 
 - **CFAR** (CA/SOCA/GOCA/OS) over the polar image — one thread per pixel.
-- **Polar→Cartesian remap** of the detection mask (bilinear, `cv::remap`
-  semantics).
+- **Polar→Cartesian remap** (`cv::remap` semantics): nearest-neighbour for the
+  binary detection mask and bilinear for grayscale visualization/intensity.
 - **Batched global scan-match cost** — all Sobol candidate poses of the
   SSM/NSSM initialization evaluated in one launch.
 - **Overlap/correspondence 1-NN** (`cloud_ops match()`) — exact brute force,
@@ -88,7 +89,8 @@ compare + bitwise-and pass), and the binary detection mask is remapped with
 nearest-neighbour so the GPU and CPU paths are bit-identical. On the CPU, the
 CA/SOCA/GOCA detectors use an exact integer prefix-sum fast path for uint8
 images — O(1) per pixel and provably bit-identical to the sliding-window
-reference (11× measured; proofs in `docs/MATH_NOTES.md`).
+reference (11× in the documented four-core reference measurement; benchmark
+results vary by host and OpenMP configuration; proofs in `docs/MATH_NOTES.md`).
 
 Deferred GPU work (needs on-hardware benchmarking to land safely): fusing the
 whole per-ping feature pipeline (CFAR → mask → remap) into one device
@@ -104,17 +106,17 @@ Python→C++ library replacements (no Python deps remain):
 | `scipy.optimize.shgo` (sobol) | 3-dim Sobol sequence + Nelder–Mead refine (`global_init.cpp`) |
 | `sklearn.covariance.MinCovDet` | compact FAST-MCD w/ consistency correction + reweighting (`mcd.cpp`) |
 | `scipy.optimize.root` (CFAR τ) | bracketed bisection (`cfar.cpp`) |
-| `scipy.interpolate.interp1d` | linear / natural-cubic spline (`interp.hpp`) |
+| `scipy.interpolate.interp1d` | linear / not-a-knot cubic spline (`interp.hpp`) |
 | `networkx`-style `find_cliques` | Bron–Kerbosch with pivoting (`slam_core.cpp`) |
 | `message_filters` (Python ATS) | slop-based `ApproxSync2/3` (`approx_sync.hpp`) |
 | gtsam (Python wheel) | libgtsam-dev 4.2 (system) |
 | `bruce_slam.pcl` pybind module | direct libpointmatcher/PCL calls (`cloud_ops.cpp`) |
 
-Beyond the straight port, one opt-in extension is available: the ICP factor
-covariance can be estimated by the Censi (2007) closed form
-(`ssm/cov_method` / `nssm/cov_method: censi`) — one ICP plus an analytic
-covariance instead of `cov_samples` registrations + FAST-MCD. The default
-(`sampled`) reproduces `bruce_slam` exactly; see `docs/RESEARCH.md`.
+ICP factor covariance is estimated with sampled registrations + FAST-MCD.
+The older point-to-point Censi helper remains as separately tested reference
+math, but `cov_method: censi` is rejected at configuration time because the
+runtime ICP now minimizes a point-to-plane objective. It can be re-enabled
+only after a covariance implementation uses the same normals and objective.
 
 ## Build
 

@@ -48,8 +48,9 @@
     point_resolution: 0.5
     # noise radius (m) used by the overlap tests and the global-init occupancy grid
     point_noise: 0.5
-    # per-point sonar coordinate noise std (m) for the Censi ICP-covariance path
-    # (only used when a scan matcher sets cov_method: censi)
+    # Reserved for the retained point-to-point Censi reference helper.
+    # cov_method: censi is currently rejected because runtime ICP is
+    # point-to-plane and the covariance objective must match.
     censi_sensor_noise: 0.1
     # run the "sampled" method's cov_samples registrations across an OpenMP
     # per-thread ICP engine pool instead of one core sequentially (per-guess
@@ -75,10 +76,9 @@
       initialization: true    # global scan-match init before ICP
       initialization_params: [50.0, 1.0, 0.01]   # [sobol n per iter, iters, refine ftol]
       cov_samples: 0          # >0 -> covariance-estimating ICP over the best init samples
-      # sampled (many ICPs + FAST-MCD, DEFAULT) | censi (1 ICP + closed-form).
-      # NOTE: our ICP is point-to-point, for which the Censi closed form is
-      # theoretically optimistic (docs/LITERATURE_REVIEW_2026.md Part 2.6) —
-      # keep the degeneracy gate tight if you enable censi.
+      # sampled = many ICPs + FAST-MCD. `censi` is reserved but rejected until
+      # its point-to-point Hessian is replaced with one matching point-to-plane
+      # ICP (docs/LITERATURE_REVIEW_2026.md Part 2.6).
       cov_method: sampled
 
     # Non-sequential scan matching
@@ -98,10 +98,9 @@
       initialization: true    # global scan-match init before ICP
       initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30
-      # sampled (many ICPs + FAST-MCD, DEFAULT) | censi (1 ICP + closed-form).
-      # NOTE: our ICP is point-to-point, for which the Censi closed form is
-      # theoretically optimistic (docs/LITERATURE_REVIEW_2026.md Part 2.6) —
-      # keep the degeneracy gate tight if you enable censi.
+      # sampled = many ICPs + FAST-MCD. `censi` is reserved but rejected until
+      # its point-to-point Hessian is replaced with one matching point-to-plane
+      # ICP (docs/LITERATURE_REVIEW_2026.md Part 2.6).
       cov_method: sampled
       # -- loop-closure defense gates (see MAP_DOUBLING_FIX_PLAN.md) --
       # covariance degeneracy gate: reject closures whose sampled/Censi

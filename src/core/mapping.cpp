@@ -96,7 +96,8 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
   // changed (mapping.py:152-168 — keyframes otherwise reuse the previous fan).
   if ((changed || !sonar_xy_ || sub_rows_ == 0 ||
        ping.range_min != fan_range_min_) &&
-      oculus_.range_resolution > 0.0 && num_ranges > 0 && num_bearings > 0) {
+      oculus_.range_resolution > 0.0 && oculus_.angular_resolution > 0.0 &&
+      num_ranges > 0 && num_bearings > 1) {
     r_skip_ = std::max(1, static_cast<int>(std::floor(resolution / oculus_.range_resolution)));
     const double bearing_arc_res = oculus_.angular_resolution * oculus_.max_range;
     c_skip_ = std::max(1, static_cast<int>(std::floor(resolution / bearing_arc_res)));

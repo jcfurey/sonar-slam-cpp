@@ -277,7 +277,8 @@ struct SMParams
   // how the ICP factor covariance is estimated when cov_samples > 0:
   //   SAMPLED - run cov_samples ICPs from the best init guesses and take a
   //             robust (FAST-MCD) covariance of the results (slam.py default)
-  //   CENSI   - one ICP plus the Censi (2007) closed-form covariance
+  //   CENSI   - reserved legacy value; Slam::configure rejects it because its
+  //             point-to-point Hessian does not match the point-to-plane ICP
   enum CovMethod { SAMPLED, CENSI };
 
   bool enable = true;

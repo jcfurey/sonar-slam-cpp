@@ -151,7 +151,8 @@ global-init-cost parity fixtures are unaffected.
 `test/interp_spline_test.cpp` checks `Interp1d` against `scipy.interp1d`: LINEAR
 and the not-a-knot CUBIC both match scipy to ~1e-15 (incl. a uniform grid, the
 zero-pivot case). `test/censi_covariance_test.cpp` Monte-Carlo-validates the
-opt-in Censi ICP covariance.
+retained point-to-point covariance math; runtime selection is disabled because
+the shipped ICP objective is now point-to-plane.
 
 ## Angle-innovation wrapping in the Kalman node (deliberate, correctness over parity)
 

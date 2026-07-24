@@ -1,7 +1,7 @@
-// Censi (2007) closed-form covariance for a point-to-point ICP registration —
-// "An accurate closed-form estimate of ICP's covariance", ICRA 2007. A cheap
-// analytic alternative to the sampled-ICP + FAST-MCD covariance path: one ICP
-// plus this call, instead of cov_samples registrations. See docs/RESEARCH.md.
+// Retained point-to-point Censi covariance math, separately unit-tested but
+// NOT selectable by the runtime SLAM pipeline. The shipped ICP is
+// point-to-plane, so Slam::configure rejects CENSI until this implementation
+// is replaced by a covariance Hessian for the same objective.
 #pragma once
 
 #include <Eigen/Dense>

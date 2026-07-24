@@ -113,6 +113,17 @@ void Slam::configure()
 {
   // config sanity (slam.py used asserts; these must also fire in NDEBUG
   // builds — the default build type disables assert())
+  // The shipped libpointmatcher chain is point-to-plane, but the retained
+  // Censi helper builds a point-to-point J'J Hessian and does not consume the
+  // surface normals used by that objective.  Treat selecting it as a hard
+  // configuration error rather than silently attaching mismatched confidence
+  // to graph factors.  The helper stays in-tree as separately-tested math
+  // until a point-to-plane covariance implementation replaces it.
+  if (ssm_params.cov_method == SMParams::CENSI ||
+      nssm_params.cov_method == SMParams::CENSI)
+    throw std::invalid_argument(
+      "cov_method 'censi' is disabled: the runtime ICP is point-to-plane "
+      "but the available covariance Hessian is point-to-point; use 'sampled'");
   if (nssm_params.cov_samples > 0 &&
       nssm_params.cov_samples >= nssm_params.init_n * nssm_params.init_iters)
     throw std::invalid_argument(

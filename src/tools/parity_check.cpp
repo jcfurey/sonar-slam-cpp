@@ -4,9 +4,11 @@
 // it degrades to a CPU smoke test.
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include <opencv2/imgproc.hpp>
@@ -113,12 +115,13 @@ int main()
       std::printf("remap linear: GPU path failed\n");
       ++failures;
     } else {
-      // cv::remap uses fixed-point bilinear (5-bit fractions); allow +-1 counts
+      // The CUDA path reproduces OpenCV's 5-bit coordinate quantization and
+      // fixed-point weights, so uint8 output must be bit-exact.
       cv::Mat diff;
       cv::absdiff(cpu_dst, gpu_dst, diff);
-      const int bad = cv::countNonZero(diff > 1);
-      std::printf("remap linear: pixels differing by >1: %d\n", bad);
-      if (bad > rows * cols / 1000) ++failures;
+      const int bad = cv::countNonZero(diff);
+      std::printf("remap linear: differing pixels: %d\n", bad);
+      if (bad != 0) ++failures;
     }
 
     // the production detection-mask path uses NEAREST (bit-identical
@@ -137,6 +140,90 @@ int main()
       const int bad_nn = cv::countNonZero(diff_nn);
       std::printf("remap nearest: differing pixels: %d\n", bad_nn);
       if (bad_nn != 0) ++failures;
+    }
+  }
+
+  // ------------------------------------------------------- global-init cost
+  if (gpu) {
+    constexpr int grid_rows = 8, grid_cols = 9;
+    constexpr float xmin = -1.f, ymin = -2.f, resolution = 0.5f;
+    std::vector<std::uint8_t> grid(grid_rows * grid_cols, 0);
+    for (const auto& rc : {std::pair<int, int>{2, 2}, {3, 4}, {5, 6}, {6, 1}})
+      grid[rc.first * grid_cols + rc.second] = 255;
+
+    const std::vector<float> points = {
+      0.f, 0.f, 1.f, 0.5f, 2.f, 1.f, -0.5f, 1.f, 4.f, 4.f,
+    };
+    const std::vector<float> transforms = {
+      1.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+      1.f, 0.f, 0.f, 1.f, 1.f, 0.5f,
+      0.f, -1.f, 1.f, 0.f, 0.f, 0.f,
+    };
+    const int n_points = static_cast<int>(points.size() / 2);
+    const int n_transforms = static_cast<int>(transforms.size() / 6);
+    std::vector<float> got(n_transforms), expected(n_transforms);
+    if (!sonar_slam::gpu::grid_cost_cuda(
+          points.data(), n_points, transforms.data(), n_transforms, grid.data(),
+          grid_rows, grid_cols, xmin, ymin, resolution, got.data())) {
+      std::printf("grid cost: GPU path failed\n");
+      ++failures;
+    } else {
+      for (int t = 0; t < n_transforms; ++t) {
+        const float* T = transforms.data() + 6 * t;
+        int hits = 0;
+        for (int p = 0; p < n_points; ++p) {
+          const float x = T[0] * points[2 * p] + T[1] * points[2 * p + 1] + T[4];
+          const float y = T[2] * points[2 * p] + T[3] * points[2 * p + 1] + T[5];
+          const int r = static_cast<int>(std::nearbyint((y - ymin) / resolution));
+          const int c = static_cast<int>(std::nearbyint((x - xmin) / resolution));
+          if (r >= 0 && r < grid_rows && c >= 0 && c < grid_cols &&
+              grid[r * grid_cols + c] != 0)
+            ++hits;
+        }
+        expected[t] = -static_cast<float>(hits);
+      }
+      int bad = 0;
+      for (int t = 0; t < n_transforms; ++t)
+        if (got[t] != expected[t]) ++bad;
+      std::printf("grid cost: mismatched transforms: %d\n", bad);
+      if (bad != 0) ++failures;
+    }
+  }
+
+  // --------------------------------------------------------------- exact 1-NN
+  if (gpu) {
+    const std::vector<float> ref = {
+      0.f, 0.f, 2.f, 0.f, 0.f, 3.f, 5.f, 5.f, 5.f, 5.f,
+    };
+    const std::vector<float> query = {
+      0.25f, 0.f, 1.8f, 0.1f, 0.f, 2.9f, 5.f, 5.f, 100.f, 100.f,
+    };
+    const int n_ref = static_cast<int>(ref.size() / 2);
+    const int n_query = static_cast<int>(query.size() / 2);
+    std::vector<int> ids(n_query);
+    std::vector<float> dists2(n_query);
+    if (!sonar_slam::gpu::nn1_cuda(ref.data(), n_ref, query.data(), n_query,
+                                    1.f, ids.data(), dists2.data())) {
+      std::printf("1-NN: GPU path failed\n");
+      ++failures;
+    } else {
+      const int expected_ids[] = {0, 1, 2, 3, -1};
+      int bad = 0;
+      for (int q = 0; q < n_query; ++q) {
+        if (ids[q] != expected_ids[q]) {
+          ++bad;
+          continue;
+        }
+        if (ids[q] < 0) {
+          if (!std::isinf(dists2[q])) ++bad;
+          continue;
+        }
+        const float dx = query[2 * q] - ref[2 * ids[q]];
+        const float dy = query[2 * q + 1] - ref[2 * ids[q] + 1];
+        if (std::abs(dists2[q] - (dx * dx + dy * dy)) > 1e-6f) ++bad;
+      }
+      std::printf("1-NN: mismatched queries: %d\n", bad);
+      if (bad != 0) ++failures;
     }
   }
 #endif

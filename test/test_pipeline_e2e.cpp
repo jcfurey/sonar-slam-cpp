@@ -113,6 +113,20 @@ bool feed(Slam& slam, int k, const gtsam::Pose2& truth, const gtsam::Pose2& dr,
 
 int main()
 {
+  // A point-to-point covariance Hessian must never be paired silently with
+  // the point-to-plane ICP configured for the runtime pipeline.
+  {
+    Slam invalid;
+    invalid.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
+    bool rejected = false;
+    try {
+      invalid.configure();
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    CHECK(rejected, "configure accepted the incompatible Censi covariance");
+  }
+
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);
   std::mt19937 rng(42);
 

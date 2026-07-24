@@ -37,22 +37,42 @@ __global__ void remap_kernel(const std::uint8_t* __restrict__ src, int src_rows,
   const float x = map_x[idx];
   const float y = map_y[idx];
 
-  float value = 0.f;
   if (interp == 0) {  // nearest
-    value = sample_or_zero(src, src_rows, src_cols,
-                           __float2int_rn(y), __float2int_rn(x));
+    const float value = sample_or_zero(src, src_rows, src_cols,
+                                       __float2int_rn(y), __float2int_rn(x));
+    dst[idx] = static_cast<std::uint8_t>(value);
   } else {  // bilinear
-    const int x0 = static_cast<int>(floorf(x));
-    const int y0 = static_cast<int>(floorf(y));
-    const float fx = x - x0, fy = y - y0;
-    const float v00 = sample_or_zero(src, src_rows, src_cols, y0, x0);
-    const float v01 = sample_or_zero(src, src_rows, src_cols, y0, x0 + 1);
-    const float v10 = sample_or_zero(src, src_rows, src_cols, y0 + 1, x0);
-    const float v11 = sample_or_zero(src, src_rows, src_cols, y0 + 1, x0 + 1);
-    value = (1.f - fy) * ((1.f - fx) * v00 + fx * v01) +
-            fy * ((1.f - fx) * v10 + fx * v11);
+    // OpenCV INTER_LINEAR first quantizes each coordinate to 5 fractional
+    // bits, then applies a fixed-point interpolation table. A mathematically
+    // exact float bilinear sample can differ by several uint8 counts on a
+    // high-contrast image, so reproduce that quantization here instead of
+    // merely approximating cv::remap.
+    constexpr int kBits = 5;
+    constexpr int kScale = 1 << kBits;
+    const int sx = __float2int_rn(x * static_cast<float>(kScale));
+    const int sy = __float2int_rn(y * static_cast<float>(kScale));
+    const int x0 = sx >> kBits;
+    const int y0 = sy >> kBits;
+    const int ax = sx & (kScale - 1);
+    const int ay = sy & (kScale - 1);
+
+    const int v00 = static_cast<int>(
+      sample_or_zero(src, src_rows, src_cols, y0, x0));
+    const int v01 = static_cast<int>(
+      sample_or_zero(src, src_rows, src_cols, y0, x0 + 1));
+    const int v10 = static_cast<int>(
+      sample_or_zero(src, src_rows, src_cols, y0 + 1, x0));
+    const int v11 = static_cast<int>(
+      sample_or_zero(src, src_rows, src_cols, y0 + 1, x0 + 1));
+
+    const int value =
+      (kScale - ax) * (kScale - ay) * v00 +
+      ax * (kScale - ay) * v01 +
+      (kScale - ax) * ay * v10 +
+      ax * ay * v11;
+    dst[idx] = static_cast<std::uint8_t>(
+      (value + (kScale * kScale) / 2) / (kScale * kScale));
   }
-  dst[idx] = static_cast<std::uint8_t>(fminf(fmaxf(value + 0.5f, 0.f), 255.f));
 }
 
 }  // namespace
