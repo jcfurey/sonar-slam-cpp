@@ -465,6 +465,23 @@ private:
       frame->status = false;
     else
       frame->status = slam_.is_keyframe(*frame);
+
+    // A head-swept/invalid feature frame can arrive before the first usable
+    // keyframe. SLAM still owns map->odom in this mode, so keep the map tree
+    // connected with its initial identity correction. This uses synchronized
+    // data stamps (not wall/ROS "now"), and stops as soon as the first valid
+    // keyframe publishes the estimated transform. Loaded-map relocalization
+    // returns above and must not use this identity bootstrap.
+    if (!frame->status && slam_.keyframes.empty() && publish_tf_) {
+      tf_->sendTransform(make_transform(
+        Eigen::Vector3d::Zero(), Eigen::Quaterniond::Identity(),
+        frame->time, "map", "odom"));
+      RCLCPP_INFO_ONCE(
+        get_logger(),
+        "Publishing identity map->odom while waiting for the first usable "
+        "SLAM feature frame.");
+    }
+
     // 3b: near-empty clouds don't carry enough structure to register — keep
     // them off the graph (DR odometry bridges the gap). NEVER gate the prior
     // (keyframes.empty()): is_keyframe() makes the first frame the graph anchor
