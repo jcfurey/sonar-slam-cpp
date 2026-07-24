@@ -17,12 +17,13 @@ if(SONAR_SLAM_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
       # RTX 3090 = sm_86. `-real` emits the cubin for this GPU; `-virtual` also
       # embeds PTX so a newer GPU can JIT. Override with -DCMAKE_CUDA_ARCHITECTURES.
-      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual)
+      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual CACHE STRING
+        "CUDA architectures (RTX 3090 default)")
     endif()
+    enable_language(CUDA)
     # A stale CACHED value (the observed case: 52, from an old configure) is
     # worse than it looks: under nvcc 12.x it still BUILDS (pre-75 archs are
     # merely deprecated), so the kernels ship as compute_52 PTX that the
@@ -117,8 +118,11 @@ endforeach()
 if(SONAR_SLAM_VENDOR_MSG_DEPS)
   message(STATUS "sonar_slam_cpp: vendor message packages found: ${SONAR_SLAM_VENDOR_MSG_DEPS}")
 else()
-  message(STATUS "sonar_slam_cpp: no legacy vendor message packages found — "
-                 "standard-message drivers only (Revolution-style build)")
+  message(
+    STATUS
+    "sonar_slam_cpp: no legacy vendor message packages found — "
+    "standard-message drivers only (Revolution-style build)"
+  )
 endif()
 
 find_package(Eigen3 REQUIRED)
