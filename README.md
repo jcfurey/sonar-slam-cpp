@@ -357,9 +357,32 @@ take integers.
 `ros2 run sonar_slam_cpp map_metrics` subscribes to the aggregated SLAM
 cloud (latched — works live or against `ros2 bag play` of a recorded run)
 and prints one line per map update: total wall length, local wall thickness
-(median / p95), and the doubled-wall fraction at the 0.3–3 m probe scale —
-the `docs/MAP_DOUBLING_FIX_PLAN.md` §5 numbers, so before/after replays
-compare as numbers instead of screenshots.
+(median / p95), the doubled-wall fraction at the 0.3–3 m probe scale, and the
+skeleton cell count — the `docs/MAP_DOUBLING_FIX_PLAN.md` §5 numbers, so
+before/after replays compare as numbers instead of screenshots.
+
+> **Check `skel=` before trusting a run.** Thinning can *collapse* walls
+> instead of thinning them, and every metric then reads ~0 — including
+> `doubled`, i.e. a perfect score for a doubled map. Measured on synthetic
+> clouds at `--grid 0.05`:
+>
+> | input | occupied | skeleton | wall_len | truth |
+> | --- | --- | --- | --- | --- |
+> | horizontal 10 m wall | 200 | 200 | 9.95 m | ok |
+> | single 45° 10 m wall | 142 | 142 | 9.97 m | ok |
+> | 30° 10 m wall | 261 | 259 | 13.15 m | **+32%** |
+> | two parallel 45° walls, 1 m apart | 566 | **2** | **0.00 m** | **20 m erased** |
+>
+> A collapse now prints a WARNING naming the ratio, so it cannot pass
+> silently — but the underlying thinning is **not fixed**. A single wall of
+> either orientation measures correctly, so the trigger is a
+> rasterisation/thinning interaction rather than orientation alone. The 30°
+> over-read is the staircase problem: the length sum corrects the pure-45°
+> case only, so intermediate angles over-count by up to 41%.
+>
+> Practically: run it on a known cloud first and confirm `skel` is a healthy
+> fraction of `cells`. If it warns, fix the thinning before using the numbers
+> to judge a tuning change.
 
 ## Parity verification against the Python stack
 
