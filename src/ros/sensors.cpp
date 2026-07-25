@@ -534,9 +534,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
   }
   if (driver == "projected_sonar") {
     auto count = std::make_shared<int>(0);
+    auto checked = std::make_shared<bool>(false);  // one-shot convention guard
     return node->create_subscription<marine_acoustic_msgs::msg::ProjectedSonarImage>(
       topic, qos,
-      [node, cb, count](const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
+      [node, cb, count, checked](
+        const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
         // 8-bit images only (this vehicle's config)
         if (msg.image.dtype != 0) {  // SonarImageData::DTYPE_UINT8
           RCLCPP_WARN(node->get_logger(),
@@ -595,10 +597,47 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
         ping.image.create(num_ranges, num_beams, CV_8UC1);
         std::memcpy(ping.image.ptr(), msg.image.data.data(),
                     static_cast<std::size_t>(num_ranges) * num_beams);
-        // bearing = atan2(-y, z), the driver's declared convention
+        // bearing = atan2(-y, z), the driver's declared convention: the
+        // optical frame is x=down, y=left, z=forward, so -y is the
+        // starboard-positive lateral component. (The extraction step in
+        // feature_extraction_node negates lateral again, which is what
+        // finally yields ROS FLU left-positive — two negations that cancel.)
         ping.bearings.reserve(msg.beam_directions.size());
         for (const auto& d : msg.beam_directions)
           ping.bearings.push_back(static_cast<float>(std::atan2(-d.y, d.z)));
+
+        // Convention guard, once per run. This expression is HARDCODED while
+        // sonar_proc derives the same rotation from TF (base_link <-
+        // frame_id, SonarProcessingNode.cpp), so a change to the Oculus
+        // xacro's optical_joint rpy would silently move sonar_proc and leave
+        // this behind — every feature mis-bearing'd with no error anywhere.
+        //
+        // Checked against the DATA rather than TF, so it needs no listener:
+        // a forward-looking fan sweeps in the LATERAL axis, so under the
+        // assumed convention beam_directions must spread in y while x (the
+        // out-of-fan-plane axis) stays ~constant. If the spread is in x
+        // instead, the axes have been swapped and the bearings are wrong.
+        if (!*checked) {
+          *checked = true;
+          double xlo = 1e9, xhi = -1e9, ylo = 1e9, yhi = -1e9;
+          for (const auto& d : msg.beam_directions) {
+            xlo = std::min(xlo, static_cast<double>(d.x));
+            xhi = std::max(xhi, static_cast<double>(d.x));
+            ylo = std::min(ylo, static_cast<double>(d.y));
+            yhi = std::max(yhi, static_cast<double>(d.y));
+          }
+          const double xspread = xhi - xlo, yspread = yhi - ylo;
+          if (xspread > yspread)
+            RCLCPP_ERROR(
+              node->get_logger(),
+              "Sonar beam_directions spread in x (%.3f) more than y (%.3f). "
+              "This adapter assumes the optical convention x=down, y=left, "
+              "z=forward and computes bearing as atan2(-y, z); that spread "
+              "says the lateral axis is x instead, so EVERY feature bearing "
+              "is wrong. Check the sonar xacro's optical_joint rpy against "
+              "sonar_proc's TF-derived mount rotation.",
+              xspread, yspread);
+        }
         ping.num_ranges = num_ranges;
         ping.range_resolution = res;
         // range of image row 0: for a multibeam whose first sample is at a

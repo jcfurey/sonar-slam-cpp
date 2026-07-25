@@ -289,6 +289,17 @@ struct SMParams
   double init_ftol = 0.01;
 
   int min_points = 50;
+  // Minimum fraction of the SOURCE cloud that must find a correspondence in
+  // the target after registration (rtabmap Icp/CorrespondenceRatio, default
+  // 0.1). 0 disables.
+  //
+  // Complements min_points, which is an ABSOLUTE count and therefore
+  // venue-coupled: pool keyframes carry 80-160 points and want 60, field
+  // keyframes carry 19-63 and 60 kills every closure there (venue/*.yaml
+  // exists solely to carry that difference). A ratio asks the
+  // scale-independent question — "did most of what I can see actually
+  // match?" — so it should port across venues where the count cannot.
+  double min_overlap_ratio = 0.0;
   double max_translation = 2.0;
   double max_rotation = M_PI / 6.0;
   int min_st_sep = 1;

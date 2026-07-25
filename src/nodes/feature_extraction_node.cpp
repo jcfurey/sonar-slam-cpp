@@ -87,6 +87,8 @@ public:
 
     // Live tuning at sea: the CFAR/filter knobs are dynamic —
     //   ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005
+    // (both launch files put this node at /bruce/slam/feature_extraction;
+    // run it bare with `ros2 run` and it is just /feature_extraction_node)
     // rebuilds the detector for the next ping, no relaunch. Safe under the
     // default single-threaded executor (the swap and detect() serialize).
     param_cb_ = add_on_set_parameters_callback(

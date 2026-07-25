@@ -108,14 +108,22 @@ public:
   // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
   // under this bound or the loops are rolled back (see update_factor_graph)
   double post_loop_max_yaw_rms = 0.15;  // rad
-  // post-loop CHAIN-TEAR check: max allowed |optimized - DR| consecutive
-  // keyframe separation (m). Parallel-wall translational aliases pass every
-  // per-closure gate (compass agrees between parallel walls, wall-to-wall
-  // locks are compact, mutually-consistent aliases satisfy PCM) — but to
-  // win they must stretch weak sequential links by many meters. DR is
-  // drift-free over one ~0.75 m keyframe interval, so a large tear is
-  // unambiguous. 0 disables.
-  double post_loop_max_translation_err = 1.0;  // m
+  // Post-loop CHAIN-TEAR check, in SIGMA of the link's own noise model
+  // (rtabmap RGBD/OptimizeMaxError, Graph.cpp computeMaxGraphErrors; its
+  // default is 3.0). Parallel-wall translational aliases pass every
+  // per-closure gate — compass agrees between parallel walls, wall-to-wall
+  // locks are compact, mutually-consistent aliases satisfy PCM — but to win
+  // they must stretch consecutive links well beyond what those links'
+  // factors claimed.
+  //
+  // Replaced an ABSOLUTE metre bound (post_loop_max_translation_err) on
+  // 2026-07-25. The absolute form judged every link against one number
+  // regardless of how far it spanned, so a link bridging a long DR-only gap
+  // (the whole head-pitch-gated head sweep, during which no keyframe is
+  // created) read as a tear purely for being long. Normalising by the link's
+  // own sigma — which now scales with span, see add_odometry — removes that.
+  // 0 disables.
+  double post_loop_max_link_error_sigma = 3.0;  // sigma
 
   OculusProperty oculus;
 
@@ -267,6 +275,19 @@ private:
   gtsam::SharedNoiseModel create_noise_model(const Eigen::Vector3d& sigmas) const;
   gtsam::SharedNoiseModel create_full_noise_model(const Eigen::Matrix3d& cov) const;
 
+  // Odometry noise model scaled to the link's ACTUAL span. odom_sigmas
+  // describes one nominal keyframe step (keyframe_translation /
+  // keyframe_rotation); a link bridging a long DR-only gap accumulates
+  // proportionally more drift and must not be weighted as a nominal step.
+  // Mirrors the inflation publish_pose already applies to the PUBLISHED
+  // covariance. Scale is floored at 1 — never MORE confident than configured.
+  gtsam::SharedNoiseModel scaled_odom_model(const gtsam::Pose2& delta,
+                                            double& trans_sigma,
+                                            double& rot_sigma) const;
+
+  void record_consecutive_link(int key, const gtsam::Pose2& measured,
+                               double trans_sigma, double rot_sigma);
+
   // failure recovery for update_factor_graph: undo loop-closure bookkeeping
   // written before a failed solve, and reconstruct ISAM2 from the committed
   // factor mirror (a thrown ISAM2::update leaves the estimator in an
@@ -294,10 +315,32 @@ private:
   // of FAILED rounds, which are never recorded here, and undo removal
   // null-holes the graph in place instead of shifting indices.
   std::vector<std::size_t> manual_prior_indices_;
-  // per-link tear recorded when the link first exceeded the chain-tear
+  // per-link tear RATIO recorded when the link first exceeded the chain-tear
   // bound after an accepted correction round (-1 = under bound); the growth
-  // gate judges against this persistent baseline (see update_factor_graph)
+  // gate judges against this persistent baseline (see update_factor_graph).
+  // Still required after the switch to a sigma ratio: normalising fixes
+  // long-link false positives, but NOT latching — a link legitimately
+  // stretched past the bound by an accepted USBL/manual fix would otherwise
+  // veto every later round forever, and repeated sub-gate aliases could
+  // ratchet the graph a fraction of the bound at a time.
   std::vector<double> tear_baseline_;
+
+  // What the factor between keyframes k-1 and k actually MEASURED, indexed
+  // by k (index 0 unused; invalid entries are skipped). The post-loop check
+  // judges the optimized relative pose against this — rtabmap
+  // Graph.cpp:computeMaxGraphErrors compares against the link transform —
+  // rather than against dead reckoning. DR is only the measurement for
+  // add_odometry links; an SSM-accepted link measures ICP, so a DR
+  // comparison charges a healthy graph a standing offset for agreeing with
+  // the very factor it was given (bounded by ssm/max_translation).
+  struct ConsecutiveLink
+  {
+    bool valid = false;
+    gtsam::Pose2 measured;      // (k-1) -> k, as the factor measured it
+    double trans_sigma = 1.0;   // m
+    double rot_sigma = 1.0;     // rad
+  };
+  std::vector<ConsecutiveLink> consecutive_links_;
   // map persistence / relocalization state (see load_map)
   int loaded_key_count_ = 0;
   bool awaiting_relocalization_ = false;

@@ -125,7 +125,7 @@
     # away from the compass-anchored DR (worst sliding-window yaw RMS) or
     # tears a consecutive keyframe link vs its DR link (0 disables)
     post_loop_max_yaw_rms: 0.15        # rad
-    post_loop_max_translation_err: 1.0 # m
+    post_loop_max_link_error_sigma: 3.0 # sigma of the link's own noise model (rtabmap RGBD/OptimizeMaxError)
     # extra ISAM2 iterations after inserting loop factors, BEFORE the checks
     # above judge the graph (one Gauss-Newton pass under-converges a large
     # correction and the transient would read as a fold)

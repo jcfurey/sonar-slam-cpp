@@ -4,12 +4,15 @@
 
 #include <vector>
 
-// The shipped ICP now uses PointToPlaneErrorMinimizer (config/icp.yaml), but
-// this older helper still builds the point-to-point residual Hessian below.
-// Those objectives cannot be mixed: Slam::configure therefore rejects the
-// CENSI mode and the runtime uses sampled + FAST-MCD covariance. This helper
-// remains only as tested reference math until a point-to-plane implementation
-// consumes the same normals/correspondences as libpointmatcher.
+// This helper builds a point-to-POINT residual Hessian, so it is only valid
+// when the loaded ICP chain minimises the same objective. That is config
+// dependent, not fixed: the package default config/icp.yaml uses
+// PointToPlaneErrorMinimizer (helper INVALID), while the deployed
+// settings_erdc icp.yaml uses PointToPointErrorMinimizer (helper VALID).
+// Slam::configure therefore tests ICP::error_minimizer_name() at startup
+// rather than rejecting CENSI unconditionally — it used to assert
+// point-to-plane, which was wrong for the deployed chain. `sampled` +
+// FAST-MCD remains the default covariance path either way.
 namespace sonar_slam {
 
 CensiCovResult censi_icp_covariance(const Matrix& source, const Matrix& target,

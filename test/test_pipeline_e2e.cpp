@@ -10,6 +10,7 @@
 //  [4] A USBL-style absolute position prior pulls the estimate toward truth.
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 
 #include "sonar_slam_cpp/cfar.hpp"
 #include "sonar_slam_cpp/slam_core.hpp"
@@ -55,7 +56,13 @@ void configure_slam(Slam& slam)
   slam.ssm_params.init_n = 50;
   slam.ssm_params.init_iters = 1;
   slam.ssm_params.init_ftol = 0.01;
-  slam.ssm_params.cov_samples = 0;
+  // Exercise the SAMPLED covariance path the deployed config actually runs
+  // (slam.yaml: cov_samples 30, cov_method sampled). It was 0 here, so the
+  // whole ICP-covariance -> degeneracy-gate chain — the subject of the
+  // max_sigma / max_anisotropy gates — had NO test coverage at all.
+  slam.ssm_params.min_overlap_ratio = 0.1;   // deployed value
+  slam.ssm_params.cov_samples = 30;
+  slam.ssm_params.cov_method = sonar_slam::SMParams::SAMPLED;
 
   slam.nssm_params.enable = true;
   slam.nssm_params.min_st_sep = 10;
@@ -67,7 +74,9 @@ void configure_slam(Slam& slam)
   slam.nssm_params.init_n = 100;
   slam.nssm_params.init_iters = 3;
   slam.nssm_params.init_ftol = 0.01;
-  slam.nssm_params.cov_samples = 0;
+  slam.nssm_params.min_overlap_ratio = 0.1;  // deployed value
+  slam.nssm_params.cov_samples = 30;
+  slam.nssm_params.cov_method = sonar_slam::SMParams::SAMPLED;
 
   slam.pcm_queue_size = 5;
   slam.min_pcm = 2;
@@ -113,18 +122,48 @@ bool feed(Slam& slam, int k, const gtsam::Pose2& truth, const gtsam::Pose2& dr,
 
 int main()
 {
-  // A point-to-point covariance Hessian must never be paired silently with
-  // the point-to-plane ICP configured for the runtime pipeline.
+  // The Censi covariance Hessian is point-to-POINT, so it must be paired
+  // with a point-to-point ICP chain and refused against a point-to-plane
+  // one. Which of those is loaded is a CONFIG question, not a constant: the
+  // package default config/icp.yaml is point-to-plane while the deployed
+  // settings_erdc icp.yaml is point-to-point. configure() therefore has to
+  // test the loaded chain — this used to assert unconditional rejection,
+  // which was wrong for the deployed configuration.
   {
-    Slam invalid;
-    invalid.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
-    bool rejected = false;
-    try {
-      invalid.configure();
-    } catch (const std::invalid_argument&) {
-      rejected = true;
-    }
-    CHECK(rejected, "configure accepted the incompatible Censi covariance");
+    const auto write_icp = [](const char* path, const char* minimizer) {
+      std::ofstream f(path);
+      f << "matcher:\n  KDTreeMatcher:\n    knn: 1\n    maxDist: 2.5\n"
+        << "errorMinimizer:\n  " << minimizer << "\n"
+        << "transformationCheckers:\n"
+        << "  - CounterTransformationChecker:\n      maxIterationCount: 40\n"
+        << "inspector:\n  NullInspector\n";
+    };
+    const auto censi_rejected = [](const char* icp_path) {
+      Slam s;
+      s.icp.load_from_yaml(icp_path);
+      s.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
+      try {
+        s.configure();
+      } catch (const std::invalid_argument&) {
+        return true;
+      }
+      return false;
+    };
+
+    write_icp("/tmp/sslm_test_icp_p2plane.yaml", "PointToPlaneErrorMinimizer");
+    write_icp("/tmp/sslm_test_icp_p2point.yaml", "PointToPointErrorMinimizer");
+
+    CHECK(censi_rejected("/tmp/sslm_test_icp_p2plane.yaml"),
+          "configure accepted Censi against a point-to-plane ICP chain");
+    CHECK(!censi_rejected("/tmp/sslm_test_icp_p2point.yaml"),
+          "configure rejected Censi against a point-to-point ICP chain");
+
+    // and the reported name must reflect what was actually loaded
+    Slam probe;
+    probe.icp.load_from_yaml("/tmp/sslm_test_icp_p2plane.yaml");
+    CHECK(probe.icp.error_minimizer_name() == "PointToPlaneErrorMinimizer",
+          "error_minimizer_name reported '%s'",
+          probe.icp.error_minimizer_name().c_str());
   }
 
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);

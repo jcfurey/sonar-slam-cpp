@@ -235,6 +235,59 @@ void ICP::load_from_yaml(const std::string& filename)
   impl_->pool.clear();
 }
 
+std::string ICP::error_minimizer_name() const
+{
+  // libpointmatcher's setDefault() chain uses point-to-point
+  if (impl_->yaml_text.empty()) return "PointToPointErrorMinimizer";
+
+  // Accepts every form the shipped configs use:
+  //   errorMinimizer: PointToPointErrorMinimizer
+  //   errorMinimizer:
+  //     PointToPointErrorMinimizer
+  //   errorMinimizer:
+  //     PointToPlaneErrorMinimizer:
+  //       force2D: 1
+  //     # PointToPointErrorMinimizer      <- comment, must NOT match
+  const auto first_token = [](std::string s) -> std::string {
+    const std::size_t b = s.find_first_not_of(" \t\r-");
+    if (b == std::string::npos) return {};
+    s = s.substr(b);
+    const std::size_t e = s.find_first_of(" \t\r:");
+    if (e != std::string::npos) s = s.substr(0, e);
+    return s;
+  };
+
+  std::istringstream iss(impl_->yaml_text);
+  std::string line;
+  bool in_section = false;
+  while (std::getline(iss, line)) {
+    // strip comments before anything else so a commented-out alternative
+    // never wins
+    const std::size_t hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+
+    if (!in_section) {
+      const std::size_t key = line.find("errorMinimizer");
+      if (key == std::string::npos) continue;
+      // same-line value?
+      const std::size_t colon = line.find(':', key);
+      if (colon != std::string::npos) {
+        const std::string tok = first_token(line.substr(colon + 1));
+        if (tok.find("ErrorMinimizer") != std::string::npos) return tok;
+      }
+      in_section = true;
+      continue;
+    }
+    // first non-comment token inside the section
+    const std::string tok = first_token(line);
+    if (tok.find("ErrorMinimizer") != std::string::npos) return tok;
+    // a non-matching token means the section ended (next top-level key)
+    if (!tok.empty()) break;
+  }
+  return "unknown";
+}
+
 std::pair<std::string, Eigen::Matrix3f> ICP::compute(const Matrix& source,
                                                      const Matrix& target,
                                                      const Eigen::Matrix3f& guess)

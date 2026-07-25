@@ -41,6 +41,14 @@ public:
   // falls back to the default libpointmatcher chain when the file is missing
   void load_from_yaml(const std::string& filename);
 
+  // Class name of the CONFIGURED error minimizer, e.g.
+  // "PointToPointErrorMinimizer". Read from the cached config text, so it
+  // reflects the chain actually in force rather than an assumption. An empty
+  // config (setDefault) reports libpointmatcher's default, which is
+  // point-to-point. Used by Slam::configure to decide whether the Censi
+  // covariance helper's point-to-point Hessian matches the running objective.
+  std::string error_minimizer_name() const;
+
   // returns ("success", T) or (convergence error message, guess)
   std::pair<std::string, Eigen::Matrix3f> compute(const Matrix& source,
                                                   const Matrix& target,

@@ -8,7 +8,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
@@ -109,6 +111,8 @@ public:
 
     slam_.ssm_params.enable = get_bool("ssm/enable");
     slam_.ssm_params.min_points = get_int("ssm/min_points");
+    slam_.ssm_params.min_overlap_ratio =
+      get_double("ssm/min_overlap_ratio", 0.0);
     slam_.ssm_params.max_translation = get_double("ssm/max_translation");
     slam_.ssm_params.max_rotation = get_double("ssm/max_rotation");
     slam_.ssm_params.target_frames = get_int("ssm/target_frames");
@@ -128,6 +132,8 @@ public:
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
     slam_.nssm_params.min_revisit_sep = get_int("nssm/min_revisit_sep", 10);
     slam_.nssm_params.min_points = get_int("nssm/min_points");
+    slam_.nssm_params.min_overlap_ratio =
+      get_double("nssm/min_overlap_ratio", 0.0);
     slam_.nssm_params.max_translation = get_double("nssm/max_translation");
     slam_.nssm_params.max_rotation = get_double("nssm/max_rotation");
     slam_.nssm_params.source_frames = get_int("nssm/source_frames");
@@ -143,6 +149,26 @@ public:
     slam_.nssm_params.cov_samples = get_int("nssm/cov_samples");
     slam_.nssm_params.cov_method = cov_method("nssm/cov_method");
 
+    // min_st_sep builds the NSSM candidate pool (k < current_key -
+    // min_st_sep); min_revisit_sep then filters it (source_key - f >=
+    // min_revisit_sep). Since source_key == current_key - 1, the pool admits
+    // gaps >= min_st_sep while the revisit floor demands >= min_revisit_sep,
+    // so once min_revisit_sep >= min_st_sep the exclusion zone contributes
+    // NOTHING to target selection and tuning it has no effect. That is the
+    // deployed state (8 vs 10) — and venue/field.yaml lists min_st_sep as a
+    // tuning candidate it cannot actually influence. Warn rather than throw:
+    // min_st_sep still gates when NSSM starts at all, and still bounds
+    // source_frames, so the configuration is legal, just partly inert.
+    if (slam_.nssm_params.min_revisit_sep >= slam_.nssm_params.min_st_sep)
+      RCLCPP_WARN(
+        get_logger(),
+        "nssm/min_st_sep (%d) does not affect loop-closure target selection: "
+        "nssm/min_revisit_sep (%d) is >= it, so the revisit floor already "
+        "excludes everything the exclusion zone would have. Tuning min_st_sep "
+        "will change only when NSSM starts. Raise it above min_revisit_sep to "
+        "make it bind on target selection.",
+        slam_.nssm_params.min_st_sep, slam_.nssm_params.min_revisit_sep);
+
     slam_.pcm_queue_size = get_int("pcm_queue_size");
     slam_.min_pcm = get_int("min_pcm");
     // NSSM degeneracy gate (see slam_core.hpp)
@@ -153,8 +179,22 @@ public:
     slam_.nssm_max_translation_vs_dr =
       get_double("nssm/max_translation_vs_dr", 0.0);
     slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
-    slam_.post_loop_max_translation_err =
-      get_double("post_loop_max_translation_err", 1.0);
+    slam_.post_loop_max_link_error_sigma =
+      get_double("post_loop_max_link_error_sigma", 3.0);
+    // The chain-tear bound changed UNITS on 2026-07-25 (metres -> sigma of
+    // the link's own noise model). Silently ignoring a stale key would leave
+    // a deployment running the 3.0 default while its YAML says 1.0 and its
+    // operator believes the config is in force — so say so, loudly, once.
+    if (has_parameter("post_loop_max_translation_err"))
+      RCLCPP_ERROR(
+        get_logger(),
+        "'post_loop_max_translation_err' is set but NO LONGER READ: the "
+        "post-loop chain-tear bound is now 'post_loop_max_link_error_sigma' "
+        "and is expressed in SIGMA of each link's own noise model, not "
+        "metres (rtabmap RGBD/OptimizeMaxError; its default is 3.0). "
+        "Running with post_loop_max_link_error_sigma=%.2f. Remove the old "
+        "key once the new bound is tuned.",
+        slam_.post_loop_max_link_error_sigma);
     // loop-factor robust kernel (default OFF — see slam_core.hpp: DCS muted
     // exactly the meaningful corrections; verify+revert is the protection)
     slam_.nssm_use_dcs = get_bool("nssm/use_dcs", false);
@@ -318,6 +358,18 @@ public:
 
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
+    // map->odom republish timer (rtabmap tf_delay / tf_tolerance). Decouples
+    // the edge from the sensor callback so a sonar dropout or sync starvation
+    // no longer starves every map-frame consumer, and future-dates it to
+    // match the odom EKF's transform_time_offset. <= 0 restores the old
+    // publish-inline-from-the-callback behaviour.
+    tf_publish_period_ = get_double("tf_publish_period", 0.05);  // 20 Hz
+    tf_tolerance_ = get_double("tf_tolerance", 0.1);
+    if (publish_tf_ && tf_publish_period_ > 0.0)
+      tf_timer_ = create_wall_timer(
+        std::chrono::duration<double>(tf_publish_period_),
+        [this]() { republish_map_odom(); });
+
     slam_.configure();
 
     // Map persistence: ~/save_map serializes the whole keyframe map;
@@ -353,23 +405,30 @@ public:
     usbl_max_innovation_ = get_double("usbl/max_innovation", 10.0);
     usbl_min_sigma_ = get_double("usbl/min_sigma", 0.5);
     usbl_max_stamp_delta_ = get_double("usbl/max_stamp_delta", 1.0);
+    usbl_frame_id_ = get_string("usbl/frame_id", "");
     if (!usbl_topic.empty()) {
+      // TF listener for the transponder lever arm (see usbl_lever_arm).
+      // Created only when USBL is wired — it is the sole TF *consumer* in
+      // this node, everything else only broadcasts.
+      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+      tf_listener_ =
+        std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this);
       if (usbl_driver == "pose_cov") {
         usbl_sub_ = create_subscription<
           geometry_msgs::msg::PoseWithCovarianceStamped>(
           usbl_topic, rclcpp::SensorDataQoS(),
           [this](const geometry_msgs::msg::PoseWithCovarianceStamped& m) {
-            usbl_callback(m.header.stamp, m.pose.pose.position.x,
-                          m.pose.pose.position.y, m.pose.covariance[0],
-                          m.pose.covariance[7]);
+            usbl_callback(m.header.stamp, m.header.frame_id,
+                          m.pose.pose.position.x, m.pose.pose.position.y,
+                          m.pose.covariance[0], m.pose.covariance[7]);
           });
       } else if (usbl_driver == "odom") {
         usbl_sub_ = create_subscription<nav_msgs::msg::Odometry>(
           usbl_topic, rclcpp::SensorDataQoS(),
           [this](const nav_msgs::msg::Odometry& m) {
-            usbl_callback(m.header.stamp, m.pose.pose.position.x,
-                          m.pose.pose.position.y, m.pose.covariance[0],
-                          m.pose.covariance[7]);
+            usbl_callback(m.header.stamp, m.header.frame_id,
+                          m.pose.pose.position.x, m.pose.pose.position.y,
+                          m.pose.covariance[0], m.pose.covariance[7]);
           });
       } else {
         RCLCPP_ERROR(get_logger(),
@@ -394,6 +453,52 @@ public:
   }
 
 private:
+  // Update the cached map->odom. With tf_publish_period_ > 0 the timer is the
+  // sole publisher (see MapOdomTf); otherwise broadcast inline exactly as
+  // before, so the timer can be disabled without changing behaviour.
+  void set_map_odom(const Eigen::Vector3d& t, const Eigen::Quaterniond& q,
+                    const builtin_interfaces::msg::Time& data_stamp)
+  {
+    if (tf_publish_period_ <= 0.0) {
+      tf_->sendTransform(make_transform(t, q, data_stamp, "map", "odom"));
+      return;
+    }
+    std::lock_guard<std::mutex> lock(tf_mutex_);
+    map_odom_tf_ = {true, t, q, rclcpp::Time(data_stamp), now()};
+  }
+
+  // Timer body: re-broadcast the cached correction, future-dated.
+  //
+  // Stamping is done in the DATA clock domain, not the node's: bag replay in
+  // this workspace defaults to use_sim_time=False (bag/play.launch.xml), so
+  // now() is wall time while frames carry bag time — stamping with now()
+  // directly would inject transforms decades away from the rest of TF.
+  // Advancing the last data stamp by the node-clock interval since it was
+  // cached is correct in BOTH domains: under sim time the two clocks are the
+  // same and this reduces to now() + tolerance (rtabmap's form), and under
+  // wall time a bag playing at ~1x advances data time at ~1x real time.
+  //
+  // map->odom is a slowly-varying correction, not motion, so holding it
+  // constant and extrapolating the STAMP forward is safe between updates —
+  // which is the whole reason rtabmap can run this at a fixed 20 Hz.
+  void republish_map_odom()
+  {
+    MapOdomTf c;
+    {
+      std::lock_guard<std::mutex> lock(tf_mutex_);
+      if (!map_odom_tf_.valid) return;
+      c = map_odom_tf_;
+    }
+    const double elapsed = (now() - c.cached_at).seconds();
+    // negative = node clock jumped backwards (bag loop): fall back to the
+    // cached stamp rather than emitting a transform in the past
+    const rclcpp::Time stamp =
+      c.data_stamp +
+      rclcpp::Duration::from_seconds((elapsed > 0.0 ? elapsed : 0.0) +
+                                     tf_tolerance_);
+    tf_->sendTransform(make_transform(c.t, c.q, stamp, "map", "odom"));
+  }
+
   void slam_callback(const sensor_msgs::msg::PointCloud2& feature_msg,
                      const nav_msgs::msg::Odometry& odom_msg)
   {
@@ -478,9 +583,8 @@ private:
     // keyframe publishes the estimated transform. Loaded-map relocalization
     // returns above and must not use this identity bootstrap.
     if (!frame->status && slam_.keyframes.empty() && publish_tf_) {
-      tf_->sendTransform(make_transform(
-        Eigen::Vector3d::Zero(), Eigen::Quaterniond::Identity(),
-        frame->time, "map", "odom"));
+      set_map_odom(Eigen::Vector3d::Zero(), Eigen::Quaterniond::Identity(),
+                   frame->time);
       RCLCPP_INFO_ONCE(
         get_logger(),
         "Publishing identity map->odom while waiting for the first usable "
@@ -687,9 +791,8 @@ private:
         ty = -ty; tz = -tz;
         qy = -qy; qz = -qz;
       }
-      tf_->sendTransform(make_transform(Eigen::Vector3d(tx, ty, tz),
-                                        Eigen::Quaterniond(qw, qx, qy, qz),
-                                        frame->time, "map", "odom"));
+      set_map_odom(Eigen::Vector3d(tx, ty, tz),
+                   Eigen::Quaterniond(qw, qx, qy, qz), frame->time);
     }
 
     nav_msgs::msg::Odometry odom_msg;
@@ -964,8 +1067,67 @@ private:
   // innovation bound (a multipath outlier must not yank the map), stamp
   // match within usbl_max_stamp_delta (USBL latency is real; an unmatched
   // fix belongs to no keyframe).
-  void usbl_callback(const builtin_interfaces::msg::Time& stamp, double x,
-                     double y, double var_x, double var_y)
+  // Linear interpolation of the DR chain at an arbitrary time (caller holds
+  // mutex_). Keyframes are >= keyframe_duration apart (1.0 s deployed) and
+  // usbl/max_stamp_delta is the same order, so a geodesic lerp between the
+  // bracketing keyframes is adequate. Clamps to the ends of the chain.
+  gtsam::Pose2 dr_pose_at(double t) const
+  {
+    const auto& kfs = slam_.keyframes;
+    if (t <= to_sec(kfs.front()->time)) return kfs.front()->dr_pose;
+    if (t >= to_sec(kfs.back()->time)) return kfs.back()->dr_pose;
+    std::size_t lo = 0, hi = kfs.size() - 1;
+    while (hi - lo > 1) {  // keyframe times are ascending
+      const std::size_t mid = (lo + hi) / 2;
+      if (to_sec(kfs[mid]->time) <= t) lo = mid; else hi = mid;
+    }
+    const double t0 = to_sec(kfs[lo]->time), t1 = to_sec(kfs[hi]->time);
+    const double a = t1 > t0 ? (t - t0) / (t1 - t0) : 0.0;
+    const gtsam::Pose2& p0 = kfs[lo]->dr_pose;
+    const gtsam::Pose2 d = p0.between(kfs[hi]->dr_pose);
+    return p0.compose(gtsam::Pose2::Expmap(a * gtsam::Pose2::Logmap(d)));
+  }
+
+  // Transponder offset in base_link, from TF. Cached after the first success:
+  // the mount is static, so one lookup is enough and a later TF hiccup must
+  // not silently drop the correction. Returns false until it resolves.
+  bool usbl_lever_arm(const std::string& frame, Eigen::Vector2d& r_bt)
+  {
+    if (usbl_lever_arm_valid_) { r_bt = usbl_lever_arm_; return true; }
+    const std::string src = usbl_frame_id_.empty() ? frame : usbl_frame_id_;
+    if (src.empty() || src == "base_link") {
+      usbl_lever_arm_ = Eigen::Vector2d::Zero();
+      usbl_lever_arm_valid_ = true;
+      r_bt = usbl_lever_arm_;
+      return true;
+    }
+    try {
+      const auto tf = tf_buffer_->lookupTransform("base_link", src,
+                                                  tf2::TimePointZero);
+      usbl_lever_arm_ =
+        Eigen::Vector2d(tf.transform.translation.x, tf.transform.translation.y);
+      usbl_lever_arm_valid_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "USBL transponder '%s' is (%.3f, %.3f) m from base_link — "
+                  "lever arm will be removed from every fix",
+                  src.c_str(), usbl_lever_arm_.x(), usbl_lever_arm_.y());
+      r_bt = usbl_lever_arm_;
+      return true;
+    } catch (const tf2::TransformException& e) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "USBL lever arm unavailable (base_link <- %s: %s). Fixes are being "
+        "applied AS IF the transponder were at base_link — on a masted "
+        "transponder that injects a heading-correlated position bias. Set "
+        "usbl/frame_id or publish the mount TF.",
+        src.c_str(), e.what());
+      return false;
+    }
+  }
+
+  void usbl_callback(const builtin_interfaces::msg::Time& stamp,
+                     const std::string& frame_id, double x, double y,
+                     double var_x, double var_y)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (slam_.keyframes.empty() || slam_.awaiting_relocalization()) return;
@@ -996,6 +1158,31 @@ private:
       return;
     }
     if (usbl_applied_.count(best)) return;
+
+    // ---- corrections rtabmap applies to a global-pose prior and this did
+    // not (CoreWrapper.cpp globalPose: `globalPose *= sensorToBase` then
+    // `globalPose *= correction`). Both are applied in the GRAPH frame, so
+    // body-frame FLU vectors get their y negated first (the roll-pi chart).
+    //
+    // 1. LEVER ARM. The fix locates the TRANSPONDER, not base_link. A masted
+    //    transponder's offset rotates with vehicle heading, so leaving it in
+    //    is a heading-CORRELATED bias, not a constant one that calibrates
+    //    out.
+    // 2. MOTION. The fix is associated to the stamp-nearest keyframe within
+    //    usbl/max_stamp_delta (1.0 s deployed). At 0.5 m/s that admits up to
+    //    0.5 m of pure position error — the same size as usbl/min_sigma —
+    //    unless the DR motion between the two instants is removed.
+    const gtsam::Pose2 dr_fix = dr_pose_at(t);
+    const double c = std::cos(dr_fix.theta()), sn = std::sin(dr_fix.theta());
+    Eigen::Vector2d r_bt;
+    if (usbl_lever_arm(frame_id, r_bt) && r_bt.squaredNorm() > 0.0) {
+      const double by = enu_world_ ? -r_bt.y() : r_bt.y();  // FLU -> graph body
+      x -= c * r_bt.x() - sn * by;
+      y -= sn * r_bt.x() + c * by;
+    }
+    const gtsam::Pose2 motion = dr_fix.between(dr_pose_at(to_sec(slam_.keyframes[best]->time)));
+    x += c * motion.x() - sn * motion.y();
+    y += sn * motion.x() + c * motion.y();
 
     const gtsam::Pose2& kp = slam_.keyframes[best]->pose;
     const double inno = std::hypot(kp.x() - x, kp.y() - y);
@@ -1137,6 +1324,33 @@ private:
   rclcpp::Time last_cloud_pub_{0, 0, RCL_ROS_TIME};
   rclcpp::TimerBase::SharedPtr cloud_republish_timer_;
 
+  // ---- map->odom republish (rtabmap CoreWrapper's transformThread_) --------
+  // The edge used to be broadcast ONLY from the synced feature+odom callback,
+  // so a sonar dropout or sync starvation stopped it entirely and every
+  // map-frame consumer (nav2 global costmap, bt_navigator, the accumulator
+  // chain, RViz) starved. It also carried no future-dating while the odom EKF
+  // future-dates odom->base_link by transform_time_offset 0.1, leaving the
+  // map edge systematically the older of the two.
+  //
+  // The callback now only UPDATES this cache and the timer is the sole
+  // publisher (rtabmap's structure), so the two cannot interleave stamps.
+  struct MapOdomTf
+  {
+    bool valid = false;
+    Eigen::Vector3d t = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+    rclcpp::Time data_stamp{0, 0, RCL_ROS_TIME};  // stamp of the source frame
+    rclcpp::Time cached_at{0, 0, RCL_ROS_TIME};   // node clock when cached
+  };
+  std::mutex tf_mutex_;
+  MapOdomTf map_odom_tf_;
+  // TF consumer, created only when USBL is enabled (transponder lever arm)
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+  double tf_publish_period_ = 0.05;  // s; <= 0 -> publish inline (old behavior)
+  double tf_tolerance_ = 0.1;        // s of future-dating
+  rclcpp::TimerBase::SharedPtr tf_timer_;
+
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr feature_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -1150,6 +1364,12 @@ private:
   double usbl_max_innovation_ = 10.0;
   double usbl_min_sigma_ = 0.5;
   double usbl_max_stamp_delta_ = 1.0;
+  // Frame the USBL fix is reported in. Empty = trust the message's
+  // header.frame_id. Resolved to a base_link offset once via TF and cached
+  // (the mount is static).
+  std::string usbl_frame_id_;
+  Eigen::Vector2d usbl_lever_arm_ = Eigen::Vector2d::Zero();
+  bool usbl_lever_arm_valid_ = false;
   std::set<int> usbl_applied_;
   std::uint64_t usbl_rejected_ = 0;
   // diagnostics: sync counters bump on the subscription path while the 1 Hz
