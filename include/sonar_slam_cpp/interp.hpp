@@ -44,7 +44,11 @@ public:
     if (kind_ == LINEAR || m_.empty()) {
       return y_[lo] + t * (y_[hi] - y_[lo]);
     }
-    // natural cubic spline on [lo, hi]
+    // Cubic spline on [lo, hi], moment (second-derivative) form. The boundary
+    // condition lives entirely in how m_ was solved — build_spline() uses
+    // NOT-A-KNOT (scipy's interp1d(kind='cubic') default), not natural, which
+    // an earlier version of this comment claimed. The evaluation below is
+    // boundary-condition agnostic.
     const double a = y_[lo], b = y_[hi];
     const double m0 = m_[lo], m1 = m_[hi];
     const double u = 1.0 - t;

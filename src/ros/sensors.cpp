@@ -626,6 +626,23 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
             ylo = std::min(ylo, static_cast<double>(d.y));
             yhi = std::max(yhi, static_cast<double>(d.y));
           }
+          // Bearings must be strictly ascending in column order: Interp1d
+          // binary-searches on them (bearing -> beam column, in both
+          // generate_map_xy and mapping's b2c_) and normalize_bearing_order
+          // only compares front() against back(), so a non-monotonic array
+          // passes that check and then mis-maps every beam silently.
+          std::size_t bad = 0;
+          for (std::size_t i = 1; i < ping.bearings.size(); ++i)
+            if (!(ping.bearings[i] > ping.bearings[i - 1])) ++bad;
+          if (bad)
+            RCLCPP_ERROR(
+              node->get_logger(),
+              "Sonar bearings are not strictly ascending after normalisation "
+              "(%zu of %zu steps non-increasing). Every bearing->column "
+              "lookup binary-searches this array, so features will be placed "
+              "at the wrong beams. Check the driver's beam_directions order.",
+              bad, ping.bearings.size() - 1);
+
           const double xspread = xhi - xlo, yspread = yhi - ylo;
           if (xspread > yspread)
             RCLCPP_ERROR(
