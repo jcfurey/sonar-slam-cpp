@@ -77,6 +77,12 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   // sklearn MinCovDet floors: n_support = int(support_fraction * n_samples)
   const int h = static_cast<int>(support_fraction * n);
   if (n < d + 1 || h < d + 1 || h > n) return result;
+  // CHI2_MEDIAN_3 / CHI2_975_3 are inverse-CDF constants for d = 3. Both
+  // callers pass (x, y, theta) samples, but a different width would silently
+  // mis-scale the consistency correction AND mis-set the reweighting cutoff —
+  // a wrong covariance rather than a failure, which now feeds the NSSM
+  // degeneracy gate. Fail loudly instead.
+  if (d != 3) return result;
 
   std::mt19937 rng(0x5eed);  // deterministic across runs
   std::uniform_int_distribution<int> pick(0, n - 1);
