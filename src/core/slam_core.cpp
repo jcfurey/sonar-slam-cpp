@@ -1,7 +1,9 @@
 #include "sonar_slam_cpp/slam_core.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/global_init.hpp"
 #include "sonar_slam_cpp/icp_covariance.hpp"
@@ -1298,9 +1300,20 @@ gtsam::Pose3 get_pose3(std::ifstream& f)
 
 bool Slam::save_map(const std::string& path)
 {
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  // Write to a sibling temp file and rename into place.
+  //
+  // Opening `path` directly with trunc destroyed the existing map the moment
+  // the save STARTED, so a full disk, a crash, or a kill mid-write left
+  // neither the old map nor a valid new one — and this file can represent
+  // hours of survey. The short-write check below already existed, but by the
+  // time it fires the previous map is long gone.
+  //
+  // rename(2) within a directory is atomic, so any reader (including a later
+  // load_map) sees either the untouched old map or the complete new one.
+  const std::string tmp = path + ".tmp";
+  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
   if (!f) {
-    last_error_ = "cannot open '" + path + "' for writing";
+    last_error_ = "cannot open '" + tmp + "' for writing";
     return false;
   }
   f.write(kMapMagic, 8);
@@ -1331,8 +1344,16 @@ bool Slam::save_map(const std::string& path)
   // the buffered stream only surfaces ENOSPC at flush — close BEFORE the
   // verdict or a truncated save reports success
   f.close();
+  std::error_code ec;
   if (f.fail()) {
-    last_error_ = "short write to '" + path + "'";
+    last_error_ = "short write to '" + tmp + "'";
+    std::filesystem::remove(tmp, ec);  // leave no partial file behind
+    return false;
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    last_error_ = "cannot move '" + tmp + "' into place: " + ec.message();
+    std::filesystem::remove(tmp, ec);
     return false;
   }
   return true;

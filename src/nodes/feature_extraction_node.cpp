@@ -634,8 +634,5 @@ private:
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::FeatureExtractionNode>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::FeatureExtractionNode>(argc, argv);
 }

@@ -11,6 +11,41 @@
 
 namespace sonar_slam {
 
+// Construct, spin and shut down a node, translating the one startup failure
+// whose native message does not say what to do about it.
+//
+// Every node here uses automatically_declare_parameters_from_overrides, so
+// rclcpp::Node's CONSTRUCTOR walks the whole override set. An empty YAML
+// sequence (`key: []`) reaches rcl as UNSET rather than as an empty array,
+// and auto-declare then throws
+//   InvalidParameterValueException: parameter_value_from failed for
+//   parameter 'key': No parameter value set
+// which names the key but not the cause or the fix. It happens before any
+// node code runs, so no accessor guard inside SlamNodeBase can catch it —
+// this wrapper is the only place it can be intercepted.
+template <class NodeT>
+int run_node(int argc, char** argv)
+{
+  rclcpp::init(argc, argv);
+  int rc = 0;
+  try {
+    rclcpp::spin(std::make_shared<NodeT>());
+  } catch (const rclcpp::exceptions::InvalidParameterValueException& e) {
+    RCLCPP_FATAL(
+      rclcpp::get_logger("sonar_slam"),
+      "%s\n"
+      "  This is almost always an EMPTY YAML LIST in a params file: `key: []` "
+      "parses as UNSET in rcl, not as an empty array, and parameter "
+      "auto-declaration rejects it at startup.\n"
+      "  Fix: give the key a value, or comment it out entirely if you meant "
+      "'not configured' (see the optional `datum` in mapping.yaml).",
+      e.what());
+    rc = 1;
+  }
+  rclcpp::shutdown();
+  return rc;
+}
+
 class SlamNodeBase : public rclcpp::Node
 {
 public:
@@ -38,7 +73,18 @@ protected:
       throw std::runtime_error("Required parameter '" + name +
                                "' is not set for node '" + get_name() +
                                "'. Check the YAML/launch configuration.");
-    return get_parameter(name);
+    const auto p = get_parameter(name);
+    // An empty YAML sequence (`key: []`) reaches rcl as NOT_SET rather than
+    // as an empty array, so has_parameter() is true but every as_*() accessor
+    // throws rclcpp::exceptions::InvalidParameterTypeException — an opaque
+    // startup crash. Name the real cause instead.
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET)
+      throw std::runtime_error(
+        "Parameter '" + name + "' on node '" + get_name() +
+        "' is declared but has no value. An empty YAML list (`" + name +
+        ": []`) parses as UNSET in rcl — give it a value, or comment the key "
+        "out entirely if you meant 'not configured'.");
+    return p;
   }
 
   double get_double(const std::string& raw_name)
@@ -112,7 +158,15 @@ protected:
   {
     const std::string name = normalize(raw_name);
     if (!has_parameter(name)) declare_parameter(name, default_value);
-    return as_double_array(get_parameter(name));
+    const auto p = get_parameter(name);
+    // `key: []` in YAML reaches rcl as NOT_SET, not as an empty array, so
+    // as_double_array() would throw. For a DEFAULTED lookup that is exactly
+    // "not configured" — which is what someone writing `datum: []` means —
+    // so fall back rather than killing the node. (mapping.yaml documents the
+    // optional `datum` by commenting the key out for this reason.)
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET)
+      return default_value;
+    return as_double_array(p);
   }
 
 private:
