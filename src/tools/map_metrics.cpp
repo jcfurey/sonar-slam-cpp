@@ -153,6 +153,7 @@ struct Metrics
   double thick_med = 0.0;
   double thick_p95 = 0.0;
   double doubled_frac = 0.0;
+  long skel_cells = 0;
 };
 
 Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max)
@@ -255,27 +256,63 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
   m.thick_p95 = th[static_cast<std::size_t>(th.size() * 0.95)];
   // sum actual 8-connected step lengths — counting every pixel as g reads a
   // 45-degree wall 29% short
+  //
+  // Each edge's length is also split evenly between its two endpoint cells,
+  // giving a per-cell length weight that sums back to `len`. The doubling
+  // probe below needs it: reporting doubled/px.size() would be a CELL-COUNT
+  // fraction while the metric is documented (and named) as a fraction of
+  // skeleton LENGTH, and a diagonal cell carries sqrt(2) times the length of
+  // an axis-aligned one. Since a graph fold rotates walls, the orientation
+  // mix differs between the runs this tool exists to compare -- exactly when
+  // the two definitions diverge.
+  cv::Mat idx_map(rows, cols, CV_32S, cv::Scalar(-1));
+  for (std::size_t i = 0; i < px.size(); ++i)
+    idx_map.at<int>(px[i].r, px[i].c) = static_cast<int>(i);
+
+  std::vector<double> cell_len(px.size(), 0.0);
   double len = 0.0;
-  for (const auto& s : px) {
+  for (std::size_t i = 0; i < px.size(); ++i) {
+    const auto& s = px[i];
     auto sk = [&](int r, int c) {
       return r >= 0 && r < rows && c >= 0 && c < cols &&
              skel.at<std::uint8_t>(r, c) != 0;
     };
-    if (sk(s.r, s.c + 1)) len += g;
-    if (sk(s.r + 1, s.c)) len += g;
+    auto edge = [&](int r, int c, double L) {
+      len += L;
+      cell_len[i] += 0.5 * L;
+      const int j = idx_map.at<int>(r, c);
+      if (j >= 0) cell_len[static_cast<std::size_t>(j)] += 0.5 * L;
+    };
+    if (sk(s.r, s.c + 1)) edge(s.r, s.c + 1, g);
+    if (sk(s.r + 1, s.c)) edge(s.r + 1, s.c, g);
     if (sk(s.r + 1, s.c + 1) && !sk(s.r, s.c + 1) && !sk(s.r + 1, s.c))
-      len += g * M_SQRT2;
+      edge(s.r + 1, s.c + 1, g * M_SQRT2);
     if (sk(s.r + 1, s.c - 1) && !sk(s.r, s.c - 1) && !sk(s.r + 1, s.c))
-      len += g * M_SQRT2;
+      edge(s.r + 1, s.c - 1, g * M_SQRT2);
   }
   m.wall_len = len;
+  m.skel_cells = static_cast<long>(px.size());
+  // Thinning can COLLAPSE a wall instead of thinning it: two parallel 45-deg
+  // walls 1 m apart (the exact doubled-wall geometry this tool exists to
+  // measure) reduced 566 occupied cells to 2 skeleton cells and reported
+  // wall_len 0.0 m for 20 m of wall. A single 45-deg or axis-aligned wall
+  // measures correctly, so the trigger is a rasterisation/thinning
+  // interaction, not orientation alone. Surface the ratio rather than let
+  // every metric silently read ~0.
+  if (m.occupied_cells > 100 && px.size() * 50 < static_cast<std::size_t>(m.occupied_cells))
+    std::fprintf(stderr,
+                 "[map_metrics] WARNING: skeleton collapsed (%zu cells from %ld "
+                 "occupied). Thinning erased the walls — wall_len, thickness "
+                 "and doubled are all unreliable for this cloud. Try a finer "
+                 "--grid.\n",
+                 px.size(), m.occupied_cells);
 
   // doubling probe: march the wall normal in [band_min, band_max]; doubled if
   // a near-parallel skeleton cell sits in the band on EITHER side
   cv::Mat theta_map(rows, cols, CV_32F, cv::Scalar(1e9f));
   for (const auto& s : px) theta_map.at<float>(s.r, s.c) = s.theta;
   const float ang_tol = static_cast<float>(20.0 * M_PI / 180.0);
-  long doubled = 0;
+  double doubled_len = 0.0;
   // the probe dilates its target by one cell, so the inner band edge must
   // clear the source's own 3x3 neighborhood or a coarsened grid (or small
   // --band min) makes every wall "doubled" by matching itself
@@ -295,7 +332,8 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
                  band_min, band_max, g);
     return m;
   }
-  for (const auto& s : px) {
+  for (std::size_t i = 0; i < px.size(); ++i) {
+    const auto& s = px[i];
     const float nx = -std::sin(s.theta), ny = std::cos(s.theta);
     bool hit = false;
     for (int sign = -1; sign <= 1 && !hit; sign += 2) {
@@ -317,9 +355,11 @@ Metrics analyze(const Matrix& xyz, double grid, double band_min, double band_max
           }
       }
     }
-    if (hit) ++doubled;
+    if (hit) doubled_len += cell_len[i];
   }
-  m.doubled_frac = static_cast<double>(doubled) / static_cast<double>(px.size());
+  // length fraction, matching wall_len's units (isolated specks carry no
+  // edge length and so weigh on neither side)
+  m.doubled_frac = len > 0.0 ? doubled_len / len : 0.0;
   return m;
 }
 
@@ -352,9 +392,9 @@ private:
     ++updates_;
     std::printf(
       "[map_metrics] update=%d pts=%ld cells=%ld wall_len=%.1fm "
-      "thick_med=%.2fm thick_p95=%.2fm doubled=%.1f%%\n",
+      "thick_med=%.2fm thick_p95=%.2fm doubled=%.1f%% skel=%ld\n",
       updates_, m.points, m.occupied_cells, m.wall_len, m.thick_med,
-      m.thick_p95, 100.0 * m.doubled_frac);
+      m.thick_p95, 100.0 * m.doubled_frac, m.skel_cells);
     std::fflush(stdout);
     if (once_) rclcpp::shutdown();
   }
