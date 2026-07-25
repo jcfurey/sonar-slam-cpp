@@ -39,8 +39,17 @@ namespace {
 struct Stream
 {
   std::string topic;
+  std::string type;
   rclcpp::GenericSubscription::SharedPtr sub;
   std::vector<std::pair<double, double>> samples;  // (arrival s, stamp s)
+  // parse_header_stamp's "is this header-first?" test is a VALUE heuristic
+  // (nanosec < 1e9), so on a type that does not begin with a std_msgs/Header
+  // it still accepts roughly 1 message in 4 by chance. Over a normal window
+  // that is easily more than the 5 samples needed to print a median, i.e. a
+  // confident stamp_offset synthesised from noise — which an operator then
+  // pastes into a config. Track the rejection rate so a non-header topic is
+  // called out instead.
+  std::size_t total = 0, rejected = 0;
 };
 
 double steady_now()
@@ -121,12 +130,14 @@ int main(int argc, char** argv)
       // capture the element by pointer: `streams` is sized once and never
       // reallocated, so the pointer is stable for the subscription's life
       Stream* sp = &stream;
+      stream.type = it->second.front();
       stream.sub = node->create_generic_subscription(
         stream.topic, it->second.front(), rclcpp::SensorDataQoS(),
         [sp](std::shared_ptr<rclcpp::SerializedMessage> msg) {
           const double stamp =
             parse_header_stamp(msg->get_rcl_serialized_message());
-          if (std::isnan(stamp)) return;
+          ++sp->total;
+          if (std::isnan(stamp)) { ++sp->rejected; return; }
           sp->samples.emplace_back(steady_now(), stamp);
         });
       std::fprintf(stderr, "[stamp_probe] %s (%s)\n", stream.topic.c_str(),
@@ -146,6 +157,19 @@ int main(int argc, char** argv)
   std::vector<double> med(streams.size(), std::nan(""));
   for (std::size_t i = 0; i < streams.size(); ++i) {
     const auto& sm = streams[i].samples;
+    // A header-first type only fails the parse on a truncated buffer, i.e.
+    // essentially never. A material rejection rate means the type does not
+    // start with a std_msgs/Header and every "stamp" read from it is garbage
+    // that happened to satisfy the nanosec heuristic — refuse to report on it
+    // rather than emit an authoritative-looking offset.
+    const auto& strm = streams[i];
+    if (strm.total > 0 && strm.rejected * 50 > strm.total) {
+      std::printf("%-40s  %zu/%zu msgs had no parsable header (%s) — NOT a "
+                  "header-first message type; no offset can be measured\n",
+                  strm.topic.c_str(), strm.rejected, strm.total,
+                  strm.type.c_str());
+      continue;
+    }
     if (sm.size() < 5) {
       std::printf("%-40s  %zu msgs — too few to measure\n",
                   streams[i].topic.c_str(), sm.size());

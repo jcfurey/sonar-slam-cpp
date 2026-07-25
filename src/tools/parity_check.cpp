@@ -54,6 +54,13 @@ int main()
               cfar.threshold_factor(sonar_slam::CFAR::OS));
 
   int failures = 0;
+  // Every comparison below is gated on BOTH `gpu` and SONAR_SLAM_WITH_CUDA.
+  // Without them nothing runs, and reporting the failure count alone made a
+  // CPU-only build (the package's own CI uses -DSONAR_SLAM_ENABLE_CUDA=OFF)
+  // print "parity OK" and exit 0 having compared nothing — a green light from
+  // a tool whose entire job is certifying GPU/CPU equivalence. Count what was
+  // actually checked and say so.
+  int compared = 0;
 
   // ------------------------------------------------------------------ CFAR
   for (const auto alg : {sonar_slam::CFAR::CA, sonar_slam::CFAR::SOCA,
@@ -80,6 +87,7 @@ int main()
         continue;
       }
       const int diff = cv::countNonZero(cpu_mask != gpu_mask);
+      ++compared;
       std::printf("CFAR alg %d: cpu %.2f ms, gpu %.2f ms, mismatched px %d\n",
                   static_cast<int>(alg), cpu_ms, gpu_ms, diff);
       // float summation order can flip a borderline comparison on rare pixels
@@ -185,6 +193,7 @@ int main()
       int bad = 0;
       for (int t = 0; t < n_transforms; ++t)
         if (got[t] != expected[t]) ++bad;
+      ++compared;
       std::printf("grid cost: mismatched transforms: %d\n", bad);
       if (bad != 0) ++failures;
     }
@@ -222,12 +231,24 @@ int main()
         const float dy = query[2 * q + 1] - ref[2 * ids[q] + 1];
         if (std::abs(dists2[q] - (dx * dx + dy * dy)) > 1e-6f) ++bad;
       }
+      ++compared;
       std::printf("1-NN: mismatched queries: %d\n", bad);
       if (bad != 0) ++failures;
     }
   }
 #endif
 
-  std::printf(failures ? "PARITY FAILURES: %d\n" : "parity OK (%d)\n", failures);
-  return failures ? 1 : 0;
+  if (failures) {
+    std::printf("PARITY FAILURES: %d (of %d comparisons)\n", failures, compared);
+    return 1;
+  }
+  if (compared == 0) {
+    std::printf(
+      "parity NOT CHECKED: 0 comparisons ran.\n"
+      "  Built without CUDA (-DSONAR_SLAM_ENABLE_CUDA=OFF), or no device is\n"
+      "  visible. This is NOT a pass — there was nothing to compare.\n");
+    return 2;
+  }
+  std::printf("parity OK (%d comparisons, 0 failures)\n", compared);
+  return 0;
 }
