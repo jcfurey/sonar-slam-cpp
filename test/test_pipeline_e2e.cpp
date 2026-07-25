@@ -78,6 +78,13 @@ void configure_slam(Slam& slam)
   slam.nssm_params.cov_samples = 30;
   slam.nssm_params.cov_method = sonar_slam::SMParams::SAMPLED;
 
+  // Deployed value (slam.yaml). With this false the per-eigenvalue covariance
+  // floor caps observable anisotropy at max_sigma/floor = 0.5/0.1 = 5.0,
+  // below the 8.0 threshold, so the anisotropy half of the degeneracy gate
+  // can never fire. Measured here: false -> 40 closures accepted, 0 degenerate
+  // rejects, 0.32 m final error; true -> 25 accepted, 16 degenerate rejects,
+  // 0.01 m.
+  slam.nssm_degeneracy_prefloor = true;
   slam.pcm_queue_size = 5;
   slam.min_pcm = 2;
   slam.icp.load_from_yaml(std::string(TEST_SOURCE_DIR) + "/config/icp.yaml");

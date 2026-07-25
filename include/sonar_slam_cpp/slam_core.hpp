@@ -292,10 +292,14 @@ private:
   // written before a failed solve, and reconstruct ISAM2 from the committed
   // factor mirror (a thrown ISAM2::update leaves the estimator in an
   // undefined, partially-mutated state — GTSAM gives no exception guarantee)
-  // quarantine=true additionally marks the rolled-back loops rejected (a
-  // verification revert: the clique is demonstrably bad); false leaves them
-  // eligible for retry (a solver failure says nothing about the loops)
-  void rollback_pending_loops(bool quarantine);
+  // quarantine=true additionally marks rolled-back loops rejected (a
+  // verification revert); false leaves them eligible for retry (a solver
+  // failure says nothing about the loops).
+  // culprit_link >= 0 narrows the quarantine to the closures SPANNING that
+  // consecutive link — the chain-tear check names one, and only closures
+  // crossing it can have stretched it, so the rest of the round stays
+  // eligible. -1 convicts the whole round (the yaw check is global).
+  void rollback_pending_loops(bool quarantine, long culprit_link = -1);
   void rebuild_isam();
 
   gtsam::ISAM2 isam_;

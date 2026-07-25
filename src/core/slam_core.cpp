@@ -1717,6 +1717,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     // elsewhere in the chain — exactly the fold this check exists to catch.
     double worst_tear = 0.0;
     bool tear_bad = false;
+    // Index of the consecutive link this round tore worst — the handle for
+    // the surgical quarantine below (rtabmap keeps the equivalent as
+    // MaxGraphErrors::linearLink so repairGraph can drop exactly that edge).
+    long worst_tear_link = -1;
     if (post_loop_max_link_error_sigma > 0.0) {
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
         // The link joining a LOADED map to the new session has no recorded
@@ -1754,7 +1758,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
                                      : tear_jitter_eps;
         if (tear > post_loop_max_link_error_sigma && tear > ref + growth_gate) {
           tear_bad = true;
-          worst_tear = std::max(worst_tear, tear);
+          if (tear > worst_tear) {
+            worst_tear = tear;
+            worst_tear_link = static_cast<long>(k);
+          }
         }
       }
     }
@@ -1775,7 +1782,15 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       // must not re-form and re-fail (accept/revert/rebuild churn) on the
       // next candidate.
       committed_graph_.resize(committed_before);
-      rollback_pending_loops(/*quarantine=*/true);
+      // Surgical quarantine: the yaw check is GLOBAL so it convicts the whole
+      // round (-1), but a chain tear names one link, and only the closures
+      // that actually span it can have stretched it. The rest are un-inserted
+      // (their factors were just truncated away) but stay eligible — a clique
+      // of 3 used to be blacklisted wholesale because one member was an
+      // alias, and with min_pcm 2 losing the honest ones makes every later
+      // clique harder to form.
+      rollback_pending_loops(/*quarantine=*/true,
+                             yaw_bad ? -1 : worst_tear_link);
       // Restore the pre-round poses EXACTLY, then rebuild from them. They are
       // the converged optimum of committed_graph_ (truncated back above, so
       // nothing it constrains has changed) — which means the rebuilt
@@ -1885,20 +1900,43 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   }
 }
 
-void Slam::rollback_pending_loops(bool quarantine)
+void Slam::rollback_pending_loops(bool quarantine, long culprit_link)
 {
   // Loops are marked inserted (and appended to their keyframe's constraints)
   // in add_nonsequential_scan_matching, BEFORE the update that actually
   // incorporates their factors. If that update failed, the factors were
   // discarded — un-mark them; with quarantine=true (a verification revert)
-  // they are additionally flagged rejected so the same demonstrably-bad
-  // clique can neither re-insert nor vote in future PCM cliques.
+  // they are additionally flagged rejected so the demonstrably-bad closure
+  // can neither re-insert nor vote in future PCM cliques.
+  //
+  // culprit_link >= 0 narrows the quarantine to the closures that SPAN that
+  // consecutive link (target_key <= k and k+1 <= source_key) — only those can
+  // have stretched it. Everything else in the round is rolled back but stays
+  // eligible. -1 quarantines the whole round, which is right for the yaw
+  // check because that one is global and cannot attribute blame.
+  //
+  // Never quarantines nothing: if no pending loop spans the named link the
+  // attribution failed, so fall back to convicting the round.
+  bool any_spans = false;
+  if (quarantine && culprit_link >= 0)
+    for (int m : pending_loops_) {
+      if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
+      const ICPResult& l = nssm_queue_[m];
+      if (l.target_key <= culprit_link && culprit_link + 1 <= l.source_key) {
+        any_spans = true;
+        break;
+      }
+    }
+
   for (int m : pending_loops_) {
     if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
     ICPResult& loop = nssm_queue_[m];
     if (!loop.inserted) continue;
     loop.inserted = false;
-    if (quarantine) loop.rejected = true;
+    const bool spans =
+      !any_spans || (loop.target_key <= culprit_link &&
+                     culprit_link + 1 <= loop.source_key);
+    if (quarantine && spans) loop.rejected = true;
     if (loop.source_key >= 0 &&
         loop.source_key < static_cast<int>(keyframes.size())) {
       auto& constraints = keyframes[loop.source_key]->constraints;
