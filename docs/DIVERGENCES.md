@@ -116,17 +116,49 @@ at the time of comparison.
 - **Here:** `slam_core.cpp` `initialize_nonsequential_scan_matching` requires the
   target to be a genuine revisit: (1) a `min_revisit_sep` **floor** — the target
   must be at least that many keyframes older than the source, which excludes the
-  current pass's recent trail; then (2) a contiguous-run **cluster** refinement
-  that drops any remaining trailing tail *only when* the survivors still split
-  into multiple index runs (a single run is kept — never over-drop). The target
-  and its submap are then built from these revisit frames only. The floor is
-  primary so the fix is robust when the sonar range covers the whole environment
-  and candidates form one unbroken run with no gap to cluster on (e.g. a small
-  pool). Upstream's argmax anchors every closure to a near-sequential trailing
-  frame ("same area, same time") because those carry the most overlap, so
-  out-and-back passes are never tied together and walls render doubled. This
-  change only narrows *which* frame becomes the target; all acceptance gates
-  (compass, degeneracy, PCM, DCS, post-loop revert) are unchanged.
+  current pass's recent trail; then (2) the survivors are segmented into
+  contiguous index **runs**, one per visiting episode, the trailing
+  (highest-index) run is dropped as the current pass's own tail when more than
+  one run exists, and **exactly one** run — the one carrying the most in-fan
+  points — becomes the target submap. The floor is primary so the fix is robust
+  when the sonar range covers the whole environment and candidates form one
+  unbroken run with no gap to cluster on (e.g. a small pool).
+
+  Upstream's argmax anchors every closure to a near-sequential trailing frame
+  ("same area, same time") because those carry the most overlap, so out-and-back
+  passes are never tied together and walls render doubled.
+
+  Keeping only ONE run matters (2026-07-25): an earlier form of this fix dropped
+  just the trailing run, so with three or more runs two distinct earlier
+  episodes survived together and `get_points` aggregated both into a single
+  target cloud **using current graph estimates**. If those episodes were
+  mis-aligned — exactly the situation the closure exists to fix — ICP registered
+  against a doubled target and produced a compromise transform, reintroducing
+  the wall doubling this whole path exists to prevent. rtabmap has no such
+  exposure: `getPaths` segments candidates into neighbour-link-connected runs
+  and attempts one detection **per path**, never merging clouds across paths.
+
+  This change only narrows *which* frames become the target; all acceptance
+  gates (compass, degeneracy, PCM, DCS, post-loop revert) are unchanged.
+
+### 10. Occupancy free-space: a row-0 hit erased its whole bearing column
+- **Upstream:** `mapping.py:218-223` locates the first return per bearing column
+  with `argmax`, which returns 0 both for "hit in row 0" and for "no hit at all"
+  (an all-equal array), then treats 0 as the latter and frees the entire column.
+  A single row-0 return therefore wiped every hit in that column and stamped
+  miss-logodds out to max range — a radial free-space stripe carved straight
+  through real structure, in the occupancy product only, silently.
+- **Here:** `mapping.cpp` `add_keyframe` uses an explicit scan that distinguishes
+  the two cases (`first` stays `sub_rows_` only when no cell exceeded the
+  threshold), so a row-0 hit frees nothing before it and a hitless column is
+  still freed entirely.
+- **Reachability:** row 0 is not a corner case. The row binding clamps, so any
+  feature at or inside `fan_range_min + 2*range_resolution` lands there, and the
+  Gaussian inflation spreads a hit up to `inflation_range` (0.3 m deployed) into
+  it. Near-field ringdown passing CFAR is enough.
+- **Impact:** occupancy grid only — the pose graph never consumes this tile, so
+  the failure shows up as a corrupted map rather than a SLAM divergence, which
+  is why it could persist unnoticed.
 
 ## Carried-over limitations left in place (with rationale)
 

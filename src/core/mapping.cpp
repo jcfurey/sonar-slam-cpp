@@ -215,14 +215,28 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
       cv::max(mask, 0.5, mask);
       cv::min(mask, static_cast<double>(hit_prob), mask);
 
-      // mark cells before the first hit (per bearing column) as free. Upstream
-      // quirk preserved: a hit in row 0 makes argmax==0, which the reset below
-      // treats as "no hit" and frees the whole column (mapping.py:218-223).
+      // Mark cells before the first hit (per bearing column) as free.
+      //
+      // DIVERGENCE from bruce_slam (mapping.py:218-223), 2026-07-25. Upstream
+      // finds the first hit with argmax, which returns 0 both for "hit in row
+      // 0" and for "no hit anywhere" (all-equal array), then treats 0 as the
+      // latter and frees the WHOLE column. So a single row-0 return erased
+      // every hit in that bearing column and stamped miss-logodds out to max
+      // range — carving a radial free-space stripe straight through real
+      // structure. This port had reproduced the conflation deliberately.
+      //
+      // Row 0 is reachable: the row binding below clamps, so any feature at
+      // or inside fan_range_min + 2*range_resolution lands there, and the
+      // Gaussian inflation spreads a hit up to inflation_range into it. Pool
+      // ringdown / near-field noise passing CFAR is enough.
+      //
+      // The explicit loop can tell the two cases apart, unlike argmax:
+      // `first` stays sub_rows_ only when no cell exceeded the threshold.
       for (int col = 0; col < sub_cols_; ++col) {
-        int first = sub_rows_;
+        int first = sub_rows_;  // no hit in this column -> free it entirely
         for (int row = 0; row < sub_rows_; ++row) {
           if (mask.at<float>(row, col) > 0.5f) {
-            first = (row == 0) ? sub_rows_ : row;
+            first = row;  // free only what lies BEFORE the hit (none if row 0)
             break;
           }
         }
