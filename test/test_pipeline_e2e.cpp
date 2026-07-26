@@ -305,8 +305,18 @@ int main()
   // ---- [3b] session-2 rounds after the load: the boundary link joins two
   // DR epochs, and its meaningless "tear" must not leak into the post-loop
   // verification (it used to revert + quarantine genuine closures)
+  //
+  // The accepted-count assertion is load-bearing, not decoration. nssm_reverted
+  // can only advance inside `if (!pending_loops_.empty())`, so "nothing was
+  // reverted" is VACUOUSLY true whenever nothing closes — a stage that only
+  // checks reverts passes just as happily when cross-session closure is
+  // completely dead. It silently did: the absolute translation gate compared
+  // the two DR epochs' dr_pose values and rejected every post-load closure,
+  // and this stage reported 0 accepted / 0 reverted as a pass. Assert that the
+  // relocalized map is actually being TIED to the new session.
   {
     const int reverted_before = s2.nssm_reverted;
+    const int accepted_before = s2.nssm_accepted;
     int ok2 = 0;
     double d2x = 0.0, d2y = 0.0;
     for (int k = 1; k <= 12; ++k) {
@@ -321,6 +331,11 @@ int main()
                 "reverted %d (was %d)\n",
                 ok2, s2.nssm_accepted, s2.nssm_reverted, reverted_before);
     CHECK(ok2 >= 10, "session-2 rounds failing (%d/12)", ok2);
+    CHECK(s2.nssm_accepted > accepted_before,
+          "no cross-session loop closure was accepted after the map load "
+          "(%d -> %d): the relocalized map is not being tied to the new "
+          "session, which makes the revert check below vacuous",
+          accepted_before, s2.nssm_accepted);
     CHECK(s2.nssm_reverted == reverted_before,
           "post-load rounds reverted (%d -> %d): session-boundary tear is "
           "leaking into the verify layer",

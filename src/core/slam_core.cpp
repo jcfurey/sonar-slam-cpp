@@ -202,6 +202,22 @@ void Slam::record_consecutive_link(int key, const gtsam::Pose2& measured,
                              std::max(rot_sigma, 1e-6)};
 }
 
+bool Slam::same_dr_epoch(int key_a, int key_b) const
+{
+  if (loaded_key_count_ <= 0) return true;
+  return (key_a < loaded_key_count_) == (key_b < loaded_key_count_);
+}
+
+gtsam::Pose2 Slam::predicted_relative_pose(int target_key, int source_key,
+                                           bool* dr_backed) const
+{
+  const bool dr = same_dr_epoch(target_key, source_key);
+  if (dr_backed) *dr_backed = dr;
+  return dr ? keyframes[target_key]->dr_pose.between(
+                keyframes[source_key]->dr_pose)
+            : keyframes[target_key]->pose.between(keyframes[source_key]->pose);
+}
+
 // ---------------------------------------------------------------------------
 // point accumulation
 // ---------------------------------------------------------------------------
@@ -1070,20 +1086,32 @@ bool Slam::add_nonsequential_scan_matching()
   // that seed. On CHL_Pool, max_translation_vs_dr=1.0 still admitted
   // parallel-wall aliases demanding 2-5 m corrections because ICP walked
   // from the edge of the 1 m initialization window into the alias basin.
-  // Judge the final target->source transform against the DR-predicted one,
+  // Judge the final target->source transform against the predicted one,
   // matching the absolute compass check below. 0 disables.
+  //
+  // CROSS-SESSION (2026-07-26): the predictor comes from
+  // predicted_relative_pose, NOT from dr_pose directly. A closure onto a
+  // LOADED map spans two dead-reckoning epochs, whose dr_pose difference is
+  // an arbitrary offset — typically the whole distance between the two
+  // missions' DR origins, so every such closure failed this gate and map
+  // persistence silently produced no loop closures at all (measured: 0
+  // accepted post-load with the gate at 1.0 m, 10 with it disabled). Across
+  // the boundary the graph estimate is the common frame and becomes the
+  // reference; within one epoch DR still is, unchanged. The chain-tear check
+  // skips the same boundary for the same reason (loaded_key_count_ below).
   if (ret2.status && nssm_max_translation_vs_dr > 0.0) {
-    const gtsam::Pose2 dr_rel =
-      keyframes[ret2.target_key]->dr_pose.between(
-        keyframes[ret2.source_key]->dr_pose);
-    const gtsam::Pose2 corr = dr_rel.between(ret2.estimated_transform);
+    bool dr_backed = true;
+    const gtsam::Pose2 rel =
+      predicted_relative_pose(ret2.target_key, ret2.source_key, &dr_backed);
+    const gtsam::Pose2 corr = rel.between(ret2.estimated_transform);
     const double trans_err = std::hypot(corr.x(), corr.y());
     // Inverted comparison makes a non-finite transform fail closed.
     if (!(trans_err <= nssm_max_translation_vs_dr)) {
       ret2.status = Status(Status::LARGE_TRANSFORMATION);
       ret2.status.description =
-        "DR-translation-inconsistent (closure translation vs DR differs by " +
-        std::to_string(trans_err) + " m)";
+        std::string("DR-translation-inconsistent (closure translation vs ") +
+        (dr_backed ? "DR" : "graph estimate, cross-session") +
+        " differs by " + std::to_string(trans_err) + " m)";
     }
   }
 
@@ -1095,6 +1123,12 @@ bool Slam::add_nonsequential_scan_matching()
   // compass cannot be aliased: both keyframes' DR yaws are compass-anchored
   // and drift-free, so the closure's measured relative yaw must match the
   // DR relative yaw within compass noise.
+  //
+  // Deliberately reads dr_pose directly rather than going through
+  // predicted_relative_pose: compass-anchored yaw is ABSOLUTE, so it is the
+  // one DR quantity that survives a map-load epoch change intact, and the
+  // graph yaw this gate is meant to police must never become its own
+  // reference. Only translation needs the cross-session treatment above.
   if (ret2.status) {
     const double dr_rel_yaw = keyframes[ret2.target_key]
                                 ->dr_pose.between(keyframes[ret2.source_key]->dr_pose)
@@ -1185,18 +1219,23 @@ bool Slam::add_nonsequential_scan_matching()
         loop.target_key, loop.estimated_transform);
       loop.inserted = true;
       // Diagnostic: the correction this closure demands, ICP relative pose vs
-      // the DR-predicted relative pose (same target->source convention as the
+      // the predicted relative pose (same target->source convention as the
       // factor above). Legit ~1 m drift fix => trans ~drift, yaw ~0; a
       // parallel-wall alias => large trans and/or non-zero yaw. Logged by the
       // node so it lands right before any post-loop revert message.
+      // Uses the same predictor as the translation gate, so a cross-session
+      // closure reports against the graph estimate instead of printing the
+      // meaningless difference of two DR epochs (labelled in the text).
       {
-        const gtsam::Pose2 dr_rel = keyframes[loop.target_key]->dr_pose.between(
-          keyframes[loop.source_key]->dr_pose);
+        bool dr_backed = true;
+        const gtsam::Pose2 dr_rel = predicted_relative_pose(
+          loop.target_key, loop.source_key, &dr_backed);
         const gtsam::Pose2 corr = dr_rel.between(loop.estimated_transform);
         last_nssm_inserted_geom.push_back(
           "closure src=" + std::to_string(loop.source_key) + " tgt=" +
           std::to_string(loop.target_key) + " gap=" +
           std::to_string(loop.source_key - loop.target_key) +
+          (dr_backed ? "" : " [cross-session: ref=graph]") +
           " | ICP-vs-DR corr trans=" +
           std::to_string(std::hypot(corr.x(), corr.y())) + "m yaw=" +
           std::to_string(corr.theta()) + "rad | DR rel=(" +

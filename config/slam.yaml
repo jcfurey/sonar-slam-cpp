@@ -110,6 +110,20 @@
       # absolute compass gate AND (fix 3a) the clamp on the global-init yaw
       # search window — candidates beyond this band can only be rejected
       max_yaw_vs_compass: 0.15   # rad (~8.6 deg, above compass noise)
+      # translational analog of the compass gate, for parallel-wall aliasing
+      # on symmetric venues: bounds the global-init x/y window AND rejects a
+      # final ICP result further than this from the predicted relative pose
+      # (ICP can otherwise walk out of a bounded seed into an alias basin).
+      # Set just above the real revisit-drift scale; ~1.0 on CHL_Pool.
+      # 0 disables both checks — the shipped default, so the lever stays
+      # inert until a replay confirms aliasing.
+      # Cross-session: after load_map the predictor is the GRAPH estimate, not
+      # DR (the two missions' dr_pose values are different epochs and their
+      # difference is meaningless). So on a return visit this bound is
+      # measured against the relocalized alignment: it must be wide enough to
+      # admit the residual relocalization error or no closure onto the loaded
+      # map can ever be accepted.
+      max_translation_vs_dr: 0.0   # m; 0 disables
       # DCS robust kernel on loop factors — default OFF: it scaled a genuine
       # closure correcting drift D to ~2*phi/(D/sigma)^2 of its weight (0.5%
       # at D=1 m, sigma=5 cm), muting exactly the corrections SLAM exists to

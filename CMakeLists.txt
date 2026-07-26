@@ -316,8 +316,15 @@ if(BUILD_TESTING)
   # In CPU-only CI this is a CPU smoke test; on a CUDA build with a visible
   # device the same registered test exercises every GPU kernel against its CPU
   # twin.
+  #
+  # --smoke-ok is REQUIRED here and must not be dropped: without it the tool
+  # exits 2 ("nothing was compared, NOT a pass"), which is the right answer for
+  # an operator running it by hand but turns this test — and therefore the
+  # package's own CI, which builds -DSONAR_SLAM_ENABLE_CUDA=OFF — permanently
+  # red on every machine that cannot observe parity at all. A genuine mismatch
+  # still exits 1 and still fails the test.
   ament_add_test(test_runtime_parity
-    COMMAND $<TARGET_FILE:parity_check>
+    COMMAND $<TARGET_FILE:parity_check> --smoke-ok
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 120)
 

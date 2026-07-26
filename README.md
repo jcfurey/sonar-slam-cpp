@@ -277,6 +277,15 @@ SONAR_SLAM_FORCE_CPU=1 ros2 launch sonar_slam_cpp slam.launch.xml
 ros2 run sonar_slam_cpp parity_check
 ```
 
+`parity_check` exits `0` when every CPU/GPU comparison passed (it prints the
+count), `1` on a mismatch, and `2` when **nothing was compared** — a CPU-only
+build or no visible device. Exit 2 is deliberately not a pass: a green light
+from a tool that compared nothing is worse than no answer. The registered
+`test_runtime_parity` test invokes it with `--smoke-ok`, which downgrades 2 to
+0 so the suite stays green where parity is unobservable (CI builds
+`-DSONAR_SLAM_ENABLE_CUDA=OFF`); a real mismatch still fails. Run it without
+the flag to actually certify a GPU build.
+
 ### Hand correction
 
 The operator can correct the SLAM estimate live: use RViz's **2D Pose
