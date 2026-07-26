@@ -92,7 +92,7 @@ struct Keyframe
     update(new_pose);
   }
 
-  // SE3 graph update (FULL_3D_ROADMAP.md Phase 4): the graph estimates
+  // SE3 graph update: the graph estimates
   // HORIZON poses — yaw-only rotation with z a live state — because point
   // clouds are attitude-rotated at ingestion (roll/pitch in a pose would
   // double-apply them). z comes from the estimate; roll/pitch ride from DR.
@@ -114,6 +114,17 @@ struct Keyframe
     update(est_h);
   }
 
+  // Covariance-only refresh: update cov and the global-frame transf_cov WITHOUT
+  // re-transforming the point cloud. transf_points depends only on pose+points,
+  // so when only the marginal covariance changed (pose unchanged) this avoids a
+  // redundant O(cloud) transform (used on the loop-closure marginal refresh).
+  void set_cov(const Eigen::Matrix3d& new_cov)
+  {
+    cov = new_cov;
+    has_cov = true;
+    update_transf_cov();
+  }
+
   // the keyframe's current estimate as a horizon pose (graph state chart)
   gtsam::Pose3 horizon_pose3() const
   {
@@ -130,7 +141,7 @@ struct Keyframe
 
   static Matrix transform_points(const Matrix& pts, const gtsam::Pose2& pose)
   {
-    if (pts.rows() == 0) return Matrix::Zero(0, pts.cols());
+    if (pts.rows() == 0) return Matrix::Zero(0, 2);
     const float c = static_cast<float>(std::cos(pose.theta()));
     const float s = static_cast<float>(std::sin(pose.theta()));
     Eigen::Matrix2f R;
@@ -249,6 +260,7 @@ struct ICPResult
 
   bool has_cov = false;
   Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d cov_raw = Eigen::Matrix3d::Zero();  // pre-floor cov (degeneracy gate)
   bool inserted = false;
   // quarantined by a post-loop verification revert: this closure (as part of
   // its clique) demonstrably bent the graph, so it must not be re-inserted or
@@ -265,7 +277,11 @@ struct SMParams
   // how the ICP factor covariance is estimated when cov_samples > 0:
   //   SAMPLED - run cov_samples ICPs from the best init guesses and take a
   //             robust (FAST-MCD) covariance of the results (slam.py default)
-  //   CENSI   - one ICP plus the Censi (2007) closed-form covariance
+  //   CENSI   - one ICP plus the Censi (2007) closed form. Its Hessian is
+  //             point-to-POINT, so Slam::configure accepts it only when the
+  //             LOADED ICP chain minimises the same objective (it reads
+  //             ICP::error_minimizer_name(); the package default icp.yaml is
+  //             point-to-plane, so censi is rejected there)
   enum CovMethod { SAMPLED, CENSI };
 
   bool enable = true;
@@ -276,11 +292,35 @@ struct SMParams
   double init_ftol = 0.01;
 
   int min_points = 50;
+  // Minimum fraction of the SOURCE cloud that must find a correspondence in
+  // the target after registration (rtabmap Icp/CorrespondenceRatio, default
+  // 0.1). 0 disables.
+  //
+  // Complements min_points, which is an ABSOLUTE count and therefore
+  // venue-coupled: pool keyframes carry 80-160 points and want 60, field
+  // keyframes carry 19-63 and 60 kills every closure there (venue/*.yaml
+  // exists solely to carry that difference). A ratio asks the
+  // scale-independent question — "did most of what I can see actually
+  // match?" — so it should port across venues where the count cannot.
+  double min_overlap_ratio = 0.0;
   double max_translation = 2.0;
   double max_rotation = M_PI / 6.0;
   int min_st_sep = 1;
+  // Safety floor on the source->target keyframe index gap for a loop closure:
+  // frames closer in index than this can never become the target. NOT the main
+  // trail/revisit separator — that is the contiguity clustering in
+  // initialize_nonsequential_scan_matching (the in-fan trail spans
+  // ~max_range/keyframe_translation keyframes, far more than any usable floor).
+  // This just guards the degenerate case where a revisit run abuts the trail.
+  int min_revisit_sep = 10;
   int source_frames = 5;
   int target_frames = 3;
+  // Bounded-drift rates used to inflate the anchor keyframe's fresh covariance
+  // when padding the candidate fan for older source frames (whose stored
+  // covariances are stale — only the newest keyframe's is refreshed by
+  // update_factor_graph). Added as (rate * age_seconds)^2 to the diagonal.
+  double fan_drift_trans = 0.01;    // m / s
+  double fan_drift_rot = 0.0017;    // rad / s (~0.1 deg/s)
   int cov_samples = 0;
   CovMethod cov_method = SAMPLED;
 };

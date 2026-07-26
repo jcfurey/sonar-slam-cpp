@@ -251,11 +251,29 @@ GlobalInitResult global_scan_match_init(
   // the ~1k-point grid scan it replaces. GPU-offloading the refinement would
   // only pay off with a device-resident grid AND a batched multi-candidate
   // evaluation — deferred (see README "GPU acceleration").
+  // NOTE (2026-07-25): Nelder-Mead probes are deliberately NOT recorded into
+  // result.pose_samples. That vector's ONLY consumer is the covariance
+  // seeding in ICPResult -> Slam::run_scan_match_icp, which sorts by cost and
+  // takes the best cov_samples as ICP restart guesses.
+  //
+  // NM converges toward the optimum, so its probes carry the lowest costs AND
+  // cluster ever more tightly as the simplex contracts — ~200 of them against
+  // 50 (SSM) / 500 (NSSM) Sobol samples. Sorting by cost therefore put an
+  // almost-degenerate cluster at the front, and the "sampled" covariance
+  // measured ICP's sensitivity to a TINY perturbation of the initial guess
+  // rather than to realistic initialisation uncertainty — systematically
+  // over-confident. That over-confidence is what the per-eigenvalue floor in
+  // compute_icp_with_cov was compensating for, and the floor in turn is what
+  // made the max_anisotropy degeneracy gate unreachable.
+  //
+  // The Sobol population spans the actual ±5σ search bounds, which is the
+  // uncertainty the covariance is supposed to describe. result.delta (the
+  // single best guess) still comes from the refined NM optimum below, so
+  // registration quality is unchanged — only the covariance POPULATION moves.
   auto cost_of = [&](const Eigen::Vector3d& d) {
     std::vector<std::array<float, 6>> one{pack_transform(source_pose, target_pose, d)};
     std::vector<float> c;
     eval_costs_cpu(source_points, one, grid, c);
-    record(d, c[0]);
     return static_cast<double>(c[0]);
   };
 

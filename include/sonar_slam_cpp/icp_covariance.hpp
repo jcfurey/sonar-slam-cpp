@@ -1,7 +1,9 @@
-// Censi (2007) closed-form covariance for a point-to-point ICP registration —
-// "An accurate closed-form estimate of ICP's covariance", ICRA 2007. A cheap
-// analytic alternative to the sampled-ICP + FAST-MCD covariance path: one ICP
-// plus this call, instead of cov_samples registrations. See docs/RESEARCH.md.
+// Point-to-point Censi covariance math, separately unit-tested. Selectable at
+// runtime (cov_method: censi) only when the LOADED ICP chain minimises the
+// same objective: Slam::configure reads ICP::error_minimizer_name() and
+// rejects censi against a point-to-plane chain, which is what this package's
+// default config/icp.yaml ships. See the caveat block in icp_covariance.cpp —
+// even against a matching chain this estimate is optimistic.
 #pragma once
 
 #include <Eigen/Dense>
@@ -15,7 +17,7 @@ namespace sonar_slam {
 struct CensiCovResult
 {
   bool success = false;
-  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();  // (x, y, theta), local frame
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();  // (x, y, theta) in the TARGET frame - the consumer must conjugate the translation block into the body frame (slam_core.cpp does)
   int n_correspondences = 0;
 };
 

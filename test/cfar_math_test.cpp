@@ -190,6 +190,77 @@ int main()
                 ms_naive, ms_fast, ms_naive / ms_fast);
   }
 
+  // ---- 5. realized false-alarm rate of detect() on uint8 IMAGES -------------
+  // Stage 2 above validates the threshold FORMULAS by Monte Carlo over
+  // continuous doubles. That cannot see quantization: the runtime detector
+  // consumes uint8 polar frames, where the reference statistic is an integer.
+  // This stage drives the shipped detect() path end to end on pure exponential
+  // clutter (square-law detected Rayleigh — the model the factors are derived
+  // under, docs/MATH_NOTES.md §1) with NO targets, so every detection is a
+  // false alarm, and asserts the realized rate against nominal.
+  //
+  // It is also the regression guard for CFAR/rank: on uint8 the shipped-by-
+  // bruce_slam rank 10 realizes ~13% more false alarms than requested while
+  // Rohling's 3N/4 tracks nominal, which is why feature.yaml now ships 30
+  // (docs/SONAR_FRONTEND_REVIEW.md §3).
+  {
+    const int rows = 716, cols = 512;
+    const int border = N / 2 + NGC / 2;
+    std::mt19937 rng(11);
+    std::exponential_distribution<double> ex(1.0);
+    // mean 30 matches the synthetic fixture's background level, so the
+    // absolute intensity gate sits in the same place relative to the clutter
+    cv::Mat clutter(rows, cols, CV_8UC1);
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c)
+        clutter.at<std::uint8_t>(r, c) =
+          static_cast<std::uint8_t>(std::min(255.0, 30.0 * ex(rng)));
+
+    const auto realized = [&](const CFAR& d, CFAR::Alg alg) {
+      const cv::Mat m = d.detect(clutter, alg);  // no intensity gate
+      long hits = 0, valid = 0;
+      for (int r = border; r < rows - border; ++r)
+        for (int c = 0; c < cols; ++c) {
+          ++valid;
+          if (m.at<std::uint8_t>(r, c)) ++hits;
+        }
+      return static_cast<double>(hits) / static_cast<double>(std::max(1L, valid));
+    };
+
+    std::printf("[5] realized P_FA of detect() on uint8 exponential clutter"
+                " (target %.3f):\n", PFA);
+    // The averaging detectors are accurate on quantized data: their statistic
+    // is a SUM over Ntc cells, so the quantization step is diluted N-fold.
+    struct { const char* n; CFAR::Alg a; } avg[] = {
+      {"CA", CFAR::CA}, {"SOCA", CFAR::SOCA}, {"GOCA", CFAR::GOCA}};
+    for (const auto& c : avg) {
+      const double got = realized(cfar, c.a);
+      const bool ok = std::abs(got - PFA) < 0.01;
+      std::printf("    %-4s realized = %.4f  %s\n", c.n, got, ok ? "OK" : "FAIL");
+      if (!ok) ++fails;
+    }
+    // OS uses a single order statistic, so quantization is NOT diluted.
+    const CFAR os_low(N, NGC, PFA, 10);          // bruce_slam's N/4
+    const CFAR os_rohling(N, NGC, PFA, 3 * N / 4);  // shipped
+    const double fa_low = realized(os_low, CFAR::OS);
+    const double fa_roh = realized(os_rohling, CFAR::OS);
+    std::printf("    OS rank %2d realized = %.4f (tau %.3f)\n", 10, fa_low,
+                os_low.threshold_factor(CFAR::OS));
+    std::printf("    OS rank %2d realized = %.4f (tau %.3f)  <- shipped\n",
+                3 * N / 4, fa_roh, os_rohling.threshold_factor(CFAR::OS));
+    if (!(std::abs(fa_roh - PFA) < 0.01)) {
+      std::printf("    FAIL: shipped OS rank does not hold nominal P_FA\n");
+      ++fails;
+    }
+    // The ordering is the finding, and it must not silently invert: the
+    // 3N/4 rank has to stay closer to nominal than N/4 on quantized input.
+    if (!(std::abs(fa_roh - PFA) < std::abs(fa_low - PFA))) {
+      std::printf("    FAIL: rank %d is no longer closer to nominal than %d\n",
+                  3 * N / 4, 10);
+      ++fails;
+    }
+  }
+
   std::printf("%s\n", fails ? "FAIL" : "ALL PASS");
   return fails ? 1 : 0;
 }

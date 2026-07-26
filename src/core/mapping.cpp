@@ -96,7 +96,8 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
   // changed (mapping.py:152-168 — keyframes otherwise reuse the previous fan).
   if ((changed || !sonar_xy_ || sub_rows_ == 0 ||
        ping.range_min != fan_range_min_) &&
-      oculus_.range_resolution > 0.0 && num_ranges > 0 && num_bearings > 0) {
+      oculus_.range_resolution > 0.0 && oculus_.angular_resolution > 0.0 &&
+      num_ranges > 0 && num_bearings > 1) {
     r_skip_ = std::max(1, static_cast<int>(std::floor(resolution / oculus_.range_resolution)));
     const double bearing_arc_res = oculus_.angular_resolution * oculus_.max_range;
     c_skip_ = std::max(1, static_cast<int>(std::floor(resolution / bearing_arc_res)));
@@ -214,14 +215,28 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
       cv::max(mask, 0.5, mask);
       cv::min(mask, static_cast<double>(hit_prob), mask);
 
-      // mark cells before the first hit (per bearing column) as free. Upstream
-      // quirk preserved: a hit in row 0 makes argmax==0, which the reset below
-      // treats as "no hit" and frees the whole column (mapping.py:218-223).
+      // Mark cells before the first hit (per bearing column) as free.
+      //
+      // DIVERGENCE from bruce_slam (mapping.py:218-223), 2026-07-25. Upstream
+      // finds the first hit with argmax, which returns 0 both for "hit in row
+      // 0" and for "no hit anywhere" (all-equal array), then treats 0 as the
+      // latter and frees the WHOLE column. So a single row-0 return erased
+      // every hit in that bearing column and stamped miss-logodds out to max
+      // range — carving a radial free-space stripe straight through real
+      // structure. This port had reproduced the conflation deliberately.
+      //
+      // Row 0 is reachable: the row binding below clamps, so any feature at
+      // or inside fan_range_min + 2*range_resolution lands there, and the
+      // Gaussian inflation spreads a hit up to inflation_range into it. Pool
+      // ringdown / near-field noise passing CFAR is enough.
+      //
+      // The explicit loop can tell the two cases apart, unlike argmax:
+      // `first` stays sub_rows_ only when no cell exceeded the threshold.
       for (int col = 0; col < sub_cols_; ++col) {
-        int first = sub_rows_;
+        int first = sub_rows_;  // no hit in this column -> free it entirely
         for (int row = 0; row < sub_rows_; ++row) {
           if (mask.at<float>(row, col) > 0.5f) {
-            first = (row == 0) ? sub_rows_ : row;
+            first = row;  // free only what lies BEFORE the hit (none if row 0)
             break;
           }
         }
@@ -450,8 +465,8 @@ OccGrid Mapping::get_occupancy_grid() const
   g.width = W;
   g.height = H;
   g.resolution = resolution;
-  g.origin_x = x0 + cmin_ * resolution;
-  g.origin_y = y0 + rmin_ * resolution;
+  g.origin_x = x0 + (cmin_ - 0.5) * resolution;
+  g.origin_y = y0 + (rmin_ - 0.5) * resolution;
   g.data.resize(static_cast<size_t>(H) * W);
   for (int rr = rmin_; rr <= rmax_; ++rr) {
     for (int cc = cmin_; cc <= cmax_; ++cc) {
@@ -473,8 +488,8 @@ OccGrid Mapping::get_intensity_grid() const
   g.width = W;
   g.height = H;
   g.resolution = resolution;
-  g.origin_x = x0 + cmin_ * resolution;
-  g.origin_y = y0 + rmin_ * resolution;
+  g.origin_x = x0 + (cmin_ - 0.5) * resolution;
+  g.origin_y = y0 + (rmin_ - 0.5) * resolution;
   g.data.resize(static_cast<size_t>(H) * W);
   for (int rr = rmin_; rr <= rmax_; ++rr) {
     for (int cc = cmin_; cc <= cmax_; ++cc) {

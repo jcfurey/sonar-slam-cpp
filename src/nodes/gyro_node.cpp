@@ -67,9 +67,9 @@ private:
   {
     // apply the offset matrix (row vector · matrix, like gyro.py)
     const Eigen::Vector3d arr = offset_matrix_.transpose() * reading.delta;
-    const double delta_yaw = arr[0];
+    double delta_yaw = arr[0];
     const double delta_pitch = arr[1];
-    double delta_roll = arr[2];
+    const double delta_roll = arr[2];
 
     // Subtract the rotation of the earth over the MEASURED sample interval.
     // The nominal 1/sensor_rate made the compensation scale with message
@@ -88,10 +88,24 @@ private:
             "gyro sample gap %.1f ms (nominal %.1f ms): delta angles were "
             "dropped and their rotation is lost",
             measured * 1e3, 1e3 / sensor_rate_);
+      } else if (measured >= 1.0) {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "gyro stream gap %.2f s (nominal %.1f ms): every delta angle in "
+          "the gap is lost — heading is now biased by any rotation during it",
+          measured, 1e3 / sensor_rate_);
       }
     }
     last_stamp_ = t_now;
-    delta_roll += earth_rate_ * dt;
+    // Earth-rate compensation must land on the CONSUMED heading axis. arr[0]
+    // (yaw) is the only component read downstream (dead_reckoning takes only
+    // rotation().yaw()); the previous code added it to delta_roll, which is
+    // published but discarded, so the compensation had no effect on heading. A
+    // vertically-mounted heading FOG sees Earth's rotation on its yaw axis.
+    // NOTE: the SIGN depends on the KVH mount geometry — validate on a bench
+    // Earth-rate test before trusting absolute heading (the gyro node is not
+    // launched in the deployed EKF-relay stack, so this is latent today).
+    delta_yaw += earth_rate_ * dt;
 
     pitch_ += delta_pitch;
     yaw_ += delta_yaw;
@@ -126,8 +140,5 @@ private:
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::GyroNode>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::GyroNode>(argc, argv);
 }

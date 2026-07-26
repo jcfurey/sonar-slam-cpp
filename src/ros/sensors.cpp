@@ -281,6 +281,12 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_depth(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const DepthReading&)> cb)
 {
+  // same non-finite choke as the DVL adapter: one NaN depth permanently
+  // corrupts the Kalman state through the gain
+  cb = [inner = std::move(cb)](const DepthReading& r) {
+    if (!std::isfinite(r.depth)) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "depth", std::move(cb));
   if (driver == "bar30") {
 #ifdef HAVE_BAR30_DEPTH
@@ -344,6 +350,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_gyro(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const GyroReading&)> cb)
 {
+  // one non-finite delta angle would NaN the cumulative FOG integration
+  cb = [inner = std::move(cb)](const GyroReading& r) {
+    if (!r.delta.allFinite()) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "gyro", std::move(cb));
   if (driver == "kvh_gyro") {
 #ifdef HAVE_KVH_GYRO
@@ -377,6 +388,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_imu(
   rclcpp::Node* node, const std::string& driver, const std::string& topic,
   const rclcpp::QoS& qos, std::function<void(const ImuReading&)> cb)
 {
+  // a non-finite quaternion would NaN every attitude consumer
+  cb = [inner = std::move(cb)](const ImuReading& r) {
+    if (!r.orientation.coeffs().allFinite()) return;
+    inner(r);
+  };
   cb = with_stamp_offset(node, "imu", std::move(cb));
   const bool enu =
     driver == "enu" || driver == "3dm_gx5" || driver == "microstrain";
@@ -415,9 +431,23 @@ std::string default_sonar_topic(const std::string& driver)
 }
 
 rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
-  rclcpp::Node* node, const std::string& driver, const std::string& topic,
+  rclcpp::Node* node, const std::string& driver_in, const std::string& topic_in,
   const rclcpp::QoS& qos, std::function<void(const SonarPing&)> cb)
 {
+  // Blank driver = auto-select the Oculus adapter from compressed_images, for
+  // EVERY consumer — slam/mapping subscribe to the same ping as the feature
+  // node, and previously only feature_extraction implemented this fallback,
+  // so a blank driver killed the other nodes at startup. A topic left blank
+  // alongside a blank driver resolves to the selected driver's default
+  // (callers that resolved it against the unresolved "" got "" back).
+  const std::string driver =
+    !driver_in.empty()
+      ? driver_in
+      : (get_bool_param(node, "compressed_images", false)
+           ? std::string("oculus_compressed")
+           : std::string("oculus_uncompressed"));
+  const std::string topic =
+    !topic_in.empty() ? topic_in : default_sonar_topic(driver);
   cb = with_stamp_offset(node, "sonar", std::move(cb));
   if (driver == "oculus_compressed") {
 #ifdef HAVE_SONAR_OCULUS
@@ -504,9 +534,11 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
   }
   if (driver == "projected_sonar") {
     auto count = std::make_shared<int>(0);
+    auto checked = std::make_shared<bool>(false);  // one-shot convention guard
     return node->create_subscription<marine_acoustic_msgs::msg::ProjectedSonarImage>(
       topic, qos,
-      [node, cb, count](const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
+      [node, cb, count, checked](
+        const marine_acoustic_msgs::msg::ProjectedSonarImage& msg) {
         // 8-bit images only (this vehicle's config)
         if (msg.image.dtype != 0) {  // SonarImageData::DTYPE_UINT8
           RCLCPP_WARN(node->get_logger(),
@@ -565,10 +597,64 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
         ping.image.create(num_ranges, num_beams, CV_8UC1);
         std::memcpy(ping.image.ptr(), msg.image.data.data(),
                     static_cast<std::size_t>(num_ranges) * num_beams);
-        // bearing = atan2(-y, z), the driver's declared convention
+        // bearing = atan2(-y, z), the driver's declared convention: the
+        // optical frame is x=down, y=left, z=forward, so -y is the
+        // starboard-positive lateral component. (The extraction step in
+        // feature_extraction_node negates lateral again, which is what
+        // finally yields ROS FLU left-positive — two negations that cancel.)
         ping.bearings.reserve(msg.beam_directions.size());
         for (const auto& d : msg.beam_directions)
           ping.bearings.push_back(static_cast<float>(std::atan2(-d.y, d.z)));
+
+        // Convention guard, once per run. This expression is HARDCODED while
+        // sonar_proc derives the same rotation from TF (base_link <-
+        // frame_id, SonarProcessingNode.cpp), so a change to the Oculus
+        // xacro's optical_joint rpy would silently move sonar_proc and leave
+        // this behind — every feature mis-bearing'd with no error anywhere.
+        //
+        // Checked against the DATA rather than TF, so it needs no listener:
+        // a forward-looking fan sweeps in the LATERAL axis, so under the
+        // assumed convention beam_directions must spread in y while x (the
+        // out-of-fan-plane axis) stays ~constant. If the spread is in x
+        // instead, the axes have been swapped and the bearings are wrong.
+        if (!*checked) {
+          *checked = true;
+          double xlo = 1e9, xhi = -1e9, ylo = 1e9, yhi = -1e9;
+          for (const auto& d : msg.beam_directions) {
+            xlo = std::min(xlo, static_cast<double>(d.x));
+            xhi = std::max(xhi, static_cast<double>(d.x));
+            ylo = std::min(ylo, static_cast<double>(d.y));
+            yhi = std::max(yhi, static_cast<double>(d.y));
+          }
+          // Bearings must be strictly ascending in column order: Interp1d
+          // binary-searches on them (bearing -> beam column, in both
+          // generate_map_xy and mapping's b2c_) and normalize_bearing_order
+          // only compares front() against back(), so a non-monotonic array
+          // passes that check and then mis-maps every beam silently.
+          std::size_t bad = 0;
+          for (std::size_t i = 1; i < ping.bearings.size(); ++i)
+            if (!(ping.bearings[i] > ping.bearings[i - 1])) ++bad;
+          if (bad)
+            RCLCPP_ERROR(
+              node->get_logger(),
+              "Sonar bearings are not strictly ascending after normalisation "
+              "(%zu of %zu steps non-increasing). Every bearing->column "
+              "lookup binary-searches this array, so features will be placed "
+              "at the wrong beams. Check the driver's beam_directions order.",
+              bad, ping.bearings.size() - 1);
+
+          const double xspread = xhi - xlo, yspread = yhi - ylo;
+          if (xspread > yspread)
+            RCLCPP_ERROR(
+              node->get_logger(),
+              "Sonar beam_directions spread in x (%.3f) more than y (%.3f). "
+              "This adapter assumes the optical convention x=down, y=left, "
+              "z=forward and computes bearing as atan2(-y, z); that spread "
+              "says the lateral axis is x instead, so EVERY feature bearing "
+              "is wrong. Check the sonar xacro's optical_joint rpy against "
+              "sonar_proc's TF-derived mount rotation.",
+              xspread, yspread);
+        }
         ping.num_ranges = num_ranges;
         ping.range_resolution = res;
         // range of image row 0: for a multibeam whose first sample is at a

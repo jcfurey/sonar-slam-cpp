@@ -49,10 +49,15 @@
 
 
   <depend>libpointmatcher</depend>
+  <!-- libpointmatcher's exported target references yaml-cpp but rosdep must
+       install it explicitly for source-built libpointmatcher workspaces -->
+  <depend>yaml-cpp</depend>
   <depend>gtsam</depend>
   <depend>libpcl-all-dev</depend>
   <depend>eigen</depend>
   <depend>libopencv-dev</depend>
+
+  <test_depend>ament_cmake_test</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

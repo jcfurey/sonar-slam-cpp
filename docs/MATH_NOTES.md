@@ -217,5 +217,5 @@ Standard weighted-least-squares variance result; extend
 | Realized P_FA = design P_FA for the actual detector statistics | §1–5 | `cfar_math_test` [2] |
 | Prefix path bit-identical on uint8 | §8 | `cfar_math_test` [3], 0/30 mismatches |
 | 11× CPU speedup | §8 | `cfar_math_test` [4] |
-| Censi covariance constant `2σ²` | RESEARCH.md §3 | `censi_covariance_test`, ~1.5% |
+| Retained point-to-point covariance constant `2σ²` | RESEARCH.md §3 | `censi_covariance_test`, ~1.5% |
 | Not-a-knot spline ≡ scipy | DIVERGENCES.md | `interp_spline_test`, ~1e-15 |

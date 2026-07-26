@@ -15,6 +15,18 @@
     # is the SLAM back-end enabled (vs. pure dead reckoning); overridden from launch
     enable_slam: true
 
+    # World convention of the published pose/TF/trajectory: true = ENU
+    # (REP-105), false = the legacy z-down graph convention. MUST match
+    # mapping.yaml's enu_world (mapping reconstructs the sonar fan in this
+    # chirality); the bluerov_legacy payload overlay flips BOTH to false.
+    enu_world: true
+    # false when an external node (e.g. a robot_localization map EKF fusing
+    # the SLAM pose) owns the map->odom transform
+    publish_tf: true
+    # min seconds between rebuilds of the O(history) viz outputs (constraint
+    # markers + aggregated map cloud); <= 0 rebuilds every keyframe
+    viz_min_period: 2.0
+
     # define the noise models
     # x, y, theta in m, m, rad
     prior_sigmas: [0.1, 0.1, 0.01]
@@ -36,8 +48,9 @@
     point_resolution: 0.5
     # noise radius (m) used by the overlap tests and the global-init occupancy grid
     point_noise: 0.5
-    # per-point sonar coordinate noise std (m) for the Censi ICP-covariance path
-    # (only used when a scan matcher sets cov_method: censi)
+    # Sensor noise used by the point-to-point Censi closed-form helper. Only
+    # read when cov_method: censi, which Slam::configure() gates on the LOADED
+    # ICP chain (see the cov_method notes below) — not on a fixed assumption.
     censi_sensor_noise: 0.1
     # run the "sampled" method's cov_samples registrations across an OpenMP
     # per-thread ICP engine pool instead of one core sequentially (per-guess
@@ -60,31 +73,108 @@
       max_translation: 3.0    # the max translation allowed
       max_rotation: 0.5235987755982988   # deg(30)
       target_frames: 3        # the number of frames we compare the current frame to
+      # overlap must also reach this fraction of the source cloud, not just the
+      # absolute min_points count above (see the nssm block). 0 disables.
+      min_overlap_ratio: 0.0
       initialization: true    # global scan-match init before ICP
       initialization_params: [50.0, 1.0, 0.01]   # [sobol n per iter, iters, refine ftol]
       cov_samples: 0          # >0 -> covariance-estimating ICP over the best init samples
-      cov_method: sampled     # sampled (many ICPs + FAST-MCD) | censi (1 ICP + closed-form)
+      # sampled = many ICPs + FAST-MCD (default, and the recommended path).
+      # `censi` is the point-to-point closed form; Slam::configure() gates it
+      # on the LOADED ICP chain via ICP::error_minimizer_name(), so it is
+      # accepted against a PointToPoint minimizer and rejected against
+      # PointToPlane. This package's config/icp.yaml ships point-to-plane, so
+      # censi is rejected by default; a point-to-point override accepts it.
+      # Even when the objectives match, Bonnabel et al. (ACC 2016) show the
+      # closed form is optimistic for point-to-point ICP because it ignores
+      # rematching — so censi is selectable, not validated
+      # (docs/LITERATURE_REVIEW_2026.md Part 2.6).
+      cov_method: sampled
 
     # Non-sequential scan matching
     nssm:
       enable: true            # is this module enabled?
-      min_st_sep: 8           # the size of the exclusion zone around the most recent keyframe
+      # Exclusion zone around the most recent keyframe. NOTE: with the shipped
+      # min_revisit_sep (10, below) this no longer affects which frame becomes
+      # the loop-closure TARGET — the revisit floor already excludes more. It
+      # still gates when NSSM starts and bounds source_frames. See the
+      # min_revisit_sep note; the node warns about this at startup.
+      min_st_sep: 8
       min_points: 50          # min number of points
       max_translation: 10.0   # max translation allowed
       max_rotation: 1.0471975511965976   # deg(60)
       source_frames: 5        # the number of frames to aggregate when trying a loop closure
+      # Candidate-fan padding inflates the anchor keyframe's fresh covariance by
+      # (rate * frame_age_s)^2, since older source frames' stored covariances are
+      # stale/over-confident. Only affects pre-selection padding; larger = wider
+      # fan (safer, slightly more ICP work).
+      fan_drift_trans: 0.01   # m/s  translational drift assumed per second of age
+      fan_drift_rot: 0.0017   # rad/s (~0.1 deg/s) rotational drift per second of age
       initialization: true    # global scan-match init before ICP
       initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30
-      cov_method: sampled     # sampled (many ICPs + FAST-MCD) | censi (1 ICP + closed-form)
+      # sampled = many ICPs + FAST-MCD (default, and the recommended path).
+      # `censi` is the point-to-point closed form; Slam::configure() gates it
+      # on the LOADED ICP chain via ICP::error_minimizer_name(), so it is
+      # accepted against a PointToPoint minimizer and rejected against
+      # PointToPlane. This package's config/icp.yaml ships point-to-plane, so
+      # censi is rejected by default; a point-to-point override accepts it.
+      # Even when the objectives match, Bonnabel et al. (ACC 2016) show the
+      # closed form is optimistic for point-to-point ICP because it ignores
+      # rematching — so censi is selectable, not validated
+      # (docs/LITERATURE_REVIEW_2026.md Part 2.6).
+      cov_method: sampled
       # -- loop-closure defense gates (see MAP_DOUBLING_FIX_PLAN.md) --
       # covariance degeneracy gate: reject closures whose sampled/Censi
       # covariance is too large or too elongated (wall-sliding signature)
       max_sigma: 0.5          # max sqrt(largest translation eigenvalue), m
       max_anisotropy: 8.0     # max sigma_max / sigma_min
+      # Evaluate the degeneracy gate on the PRE-floor covariance. The
+      # per-eigenvalue floor in compute_icp_with_cov raises the collapsed axis
+      # up to the ICP-model sigma before this gate reads it, which caps the
+      # observable anisotropy and lets elongated wall-slide covariances
+      # through. The in-tree e2e measures false -> 6 closures accepted, 0
+      # degenerate rejects, 0.32 m final error; true -> 25 accepted, 16
+      # degenerate rejects, 0.01 m. Off by default (a behaviour change on real
+      # data) but this is the first knob to try on a doubling bag.
+      degeneracy_prefloor: false
+      # Overlap must ALSO reach this fraction of the source cloud, not just the
+      # absolute min_points count above (rtabmap Icp/CorrespondenceRatio). The
+      # count is venue-coupled — 50 points is a lot in a sparse pool and
+      # nothing in a cluttered harbour — while the ratio is not. 0 disables.
+      min_overlap_ratio: 0.0
+      # Revisit FLOOR: a loop-closure target must be at least this many
+      # keyframes older than the source, which excludes the current pass's own
+      # trail. This is the primary half of the clustered-revisit fix
+      # (docs/DIVERGENCES.md #9); the contiguous-run clustering refines it, but
+      # the floor is what works when the sonar sees the whole venue and the
+      # candidates form one unbroken run (a small pool).
+      # COUPLED TO min_st_sep above: the exclusion zone builds the candidate
+      # pool and this floor then filters it, so once min_revisit_sep >=
+      # min_st_sep the floor already excludes everything the zone would have
+      # and min_st_sep stops affecting TARGET SELECTION entirely (it still
+      # gates when NSSM starts, and still bounds source_frames). The shipped
+      # 10 vs 8 is exactly that state, so the node logs a warning at startup —
+      # it is legal, just means tuning min_st_sep for doubling will do nothing.
+      # Raise min_st_sep above this value to make it bind again.
+      min_revisit_sep: 10
       # absolute compass gate AND (fix 3a) the clamp on the global-init yaw
       # search window — candidates beyond this band can only be rejected
       max_yaw_vs_compass: 0.15   # rad (~8.6 deg, above compass noise)
+      # translational analog of the compass gate, for parallel-wall aliasing
+      # on symmetric venues: bounds the global-init x/y window AND rejects a
+      # final ICP result further than this from the predicted relative pose
+      # (ICP can otherwise walk out of a bounded seed into an alias basin).
+      # Set just above the real revisit-drift scale; ~1.0 on CHL_Pool.
+      # 0 disables both checks — the shipped default, so the lever stays
+      # inert until a replay confirms aliasing.
+      # Cross-session: after load_map the predictor is the GRAPH estimate, not
+      # DR (the two missions' dr_pose values are different epochs and their
+      # difference is meaningless). So on a return visit this bound is
+      # measured against the relocalized alignment: it must be wide enough to
+      # admit the residual relocalization error or no closure onto the loaded
+      # map can ever be accepted.
+      max_translation_vs_dr: 0.0   # m; 0 disables
       # DCS robust kernel on loop factors — default OFF: it scaled a genuine
       # closure correcting drift D to ~2*phi/(D/sigma)^2 of its weight (0.5%
       # at D=1 m, sigma=5 cm), muting exactly the corrections SLAM exists to
@@ -100,7 +190,7 @@
     # away from the compass-anchored DR (worst sliding-window yaw RMS) or
     # tears a consecutive keyframe link vs its DR link (0 disables)
     post_loop_max_yaw_rms: 0.15        # rad
-    post_loop_max_translation_err: 1.0 # m
+    post_loop_max_link_error_sigma: 3.0 # sigma of the link's own noise model (rtabmap RGBD/OptimizeMaxError)
     # extra ISAM2 iterations after inserting loop factors, BEFORE the checks
     # above judge the graph (one Gauss-Newton pass under-converges a large
     # correction and the transient would read as a fold)

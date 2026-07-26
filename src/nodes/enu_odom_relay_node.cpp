@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "sonar_slam_cpp/common.hpp"
+#include "sonar_slam_cpp/node_base.hpp"
 
 namespace sonar_slam {
 
@@ -71,8 +72,5 @@ private:
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::EnuOdomRelay>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::EnuOdomRelay>(argc, argv);
 }

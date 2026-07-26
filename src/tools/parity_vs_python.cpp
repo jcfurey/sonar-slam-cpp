@@ -26,6 +26,9 @@ using sonar_slam::Matrix;
 
 namespace {
 
+int g_failures = 0;
+
+
 // no intensity gate in the parity harness — keep every CFAR hit
 constexpr float kNoGate = -std::numeric_limits<float>::infinity();
 
@@ -51,6 +54,18 @@ void write_mat(const std::string& path, const Eigen::MatrixBase<Derived>& m)
   using T = typename Derived::Scalar;
   Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m;
   std::ofstream f(path, std::ios::binary);
+  struct Check {
+    std::ofstream& f;
+    const std::string& p;
+    ~Check()
+    {
+      f.flush();
+      if (!f) {
+        std::printf("WRITE FAILED: %s\n", p.c_str());
+        ++g_failures;
+      }
+    }
+  } check{f, path};
   const std::int32_t rows = static_cast<std::int32_t>(rm.rows());
   const std::int32_t cols = static_cast<std::int32_t>(rm.cols());
   f.write(reinterpret_cast<const char*>(&rows), 4);
@@ -175,5 +190,9 @@ int main(int argc, char** argv)
   }
 
   std::printf("cpp outputs written to %s\n", dir.c_str());
+  if (g_failures) {
+    std::printf("%d stage/write failure(s)\n", g_failures);
+    return 1;
+  }
   return 0;
 }

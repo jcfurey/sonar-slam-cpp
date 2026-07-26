@@ -164,6 +164,20 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // 1. Calculate measured dt FIRST
+    double dt = dt_imu_;
+    const double t_now = to_sec(imu.stamp);
+    if (last_imu_stamp_ > 0.0) {
+      const double measured = t_now - last_imu_stamp_;
+      if (measured >= 0.0 && measured < 10.0 * dt_imu_) dt = measured;
+    }
+    last_imu_stamp_ = t_now;
+
+    // 2. Update the transition matrix dynamically
+    A_imu_(0, 6) = dt; A_imu_(1, 7) = dt; A_imu_(2, 8) = dt; // Pos = Pos + Vel*dt
+    A_imu_(3, 9) = dt; A_imu_(4, 10) = dt; A_imu_(5, 11) = dt; // Ang = Ang + Rate*dt
+
+    // 3. Now run the prediction
     Vec12 predicted_x;
     Mat12 predicted_P;
     kalman_predict(state_vector_, cov_matrix_, A_imu_, predicted_x, predicted_P);
@@ -181,6 +195,17 @@ private:
     if (!imu_yaw0_) imu_yaw0_ = yaw_z;
     euler_angle[2] -= *imu_yaw0_;
 
+    // Wrap the ANGLE innovations: when the vehicle's yaw (or a legacy-frame
+    // roll) crosses +-pi the raw measurement jumps by 2*pi against the
+    // continuous filtered state, and the unwrapped residual would slew every
+    // state through the gain for the whole convergence window (inherited
+    // from kalman.py; fixed by decision — correctness over parity).
+    const Eigen::Vector3d predicted_euler = H_imu_ * predicted_x;
+    for (int i : {0, 2})
+      euler_angle[i] = predicted_euler[i] +
+                       std::remainder(euler_angle[i] - predicted_euler[i],
+                                      2.0 * M_PI);
+
     kalman_correct(predicted_x, predicted_P, euler_angle, H_imu_, R_imu_,
                    state_vector_, cov_matrix_);
 
@@ -192,13 +217,8 @@ private:
     // second-order; the position integration here is where it accumulates
     // linearly. Clamped: a gap (dropout/bag jump) must not integrate stale
     // velocity into a jump; negative dt (bag loop) re-anchors the timebase.
-    double dt = dt_imu_;
-    const double t_now = to_sec(imu.stamp);
-    if (last_imu_stamp_ > 0.0) {
-      const double measured = t_now - last_imu_stamp_;
-      if (measured >= 0.0 && measured < 10.0 * dt_imu_) dt = measured;
-    }
-    last_imu_stamp_ = t_now;
+    // dt was measured at the top of the callback (shared with the A_imu_
+    // transition matrix) and last_imu_stamp_ already advanced there.
     const double trans_x = state_vector_[6] * dt;
     const double trans_y = state_vector_[7] * dt;
     const gtsam::Point2 local_point(trans_x, trans_y);
@@ -259,8 +279,5 @@ private:
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::KalmanNode>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::KalmanNode>(argc, argv);
 }

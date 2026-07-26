@@ -1,7 +1,9 @@
 #include "sonar_slam_cpp/slam_core.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/global_init.hpp"
 #include "sonar_slam_cpp/icp_covariance.hpp"
@@ -40,7 +42,7 @@ gtsam::ISAM2Params make_isam2_params()
   return p;
 }
 
-// SE3 graph chart (FULL_3D_ROADMAP.md Phase 4): states are HORIZON poses
+// SE3 graph chart: states are HORIZON poses
 // (yaw-only rotation, live z). Sonar ICP observes (x, y, yaw); depth is an
 // absolute measurement; roll/pitch are 0 BY CONSTRUCTION in this chart (the
 // clouds are attitude-rotated at ingestion). Sigma constants for the
@@ -105,12 +107,35 @@ Slam::Slam() : isam_(make_isam2_params())
   nssm_params.max_rotation = M_PI / 2.0;
   nssm_params.source_frames = 5;
   nssm_params.cov_samples = 30;
+  nssm_params.fan_drift_trans = 0.01;
+  nssm_params.fan_drift_rot = 0.0017;
 }
 
 void Slam::configure()
 {
   // config sanity (slam.py used asserts; these must also fire in NDEBUG
   // builds — the default build type disables assert())
+  // The Censi helper builds a point-to-point J'J Hessian and does not consume
+  // the surface normals a point-to-plane objective minimises, so it may only
+  // be used with a point-to-point ICP chain. Test the chain ACTUALLY LOADED
+  // rather than asserting a constant: the package default
+  // (config/icp.yaml) is PointToPlaneErrorMinimizer, but the deployed
+  // settings_erdc override is PointToPointErrorMinimizer — the old hard
+  // rejection claimed "the runtime ICP is point-to-plane", which was false
+  // for the deployed configuration and foreclosed a valid option on a wrong
+  // premise. (icp.load_from_yaml runs before configure(), so this is known.)
+  if (ssm_params.cov_method == SMParams::CENSI ||
+      nssm_params.cov_method == SMParams::CENSI) {
+    const std::string em = icp.error_minimizer_name();
+    if (em.find("PointToPoint") == std::string::npos)
+      throw std::invalid_argument(
+        "cov_method 'censi' requires a point-to-point ICP chain: the Censi "
+        "covariance Hessian is point-to-point and does not consume the "
+        "surface normals a point-to-plane objective minimises. The loaded "
+        "icp_config uses '" + em +
+        "'. Use cov_method 'sampled', or configure "
+        "PointToPointErrorMinimizer in icp_config.");
+  }
   if (nssm_params.cov_samples > 0 &&
       nssm_params.cov_samples >= nssm_params.init_n * nssm_params.init_iters)
     throw std::invalid_argument(
@@ -122,7 +147,6 @@ void Slam::configure()
   if (nssm_params.source_frames >= nssm_params.min_st_sep)
     throw std::invalid_argument(
       "nssm/source_frames must be < nssm/min_st_sep");
-
   // 6D lifts of the configured planar sigmas (see the chart note above):
   // prior/odometry constrain chart roll/pitch (0) and depth (absolute for the
   // prior, DR delta for odometry); ICP factors are wide in everything the
@@ -147,6 +171,53 @@ gtsam::SharedNoiseModel Slam::create_full_noise_model(const Eigen::Matrix3d& cov
   return gtsam::noiseModel::Gaussian::Covariance(cov);
 }
 
+gtsam::SharedNoiseModel Slam::scaled_odom_model(const gtsam::Pose2& delta,
+                                                double& trans_sigma,
+                                                double& rot_sigma) const
+{
+  const double d = std::hypot(delta.x(), delta.y());
+  const double a = std::abs(delta.theta());
+  const double kt = std::max(keyframe_translation, 1e-3);
+  const double kr = std::max(keyframe_rotation, 1e-3);
+  // Floor at 1: a SHORT link is not more trustworthy than the configured
+  // nominal step (odom_sigmas already includes a constant per-fix error
+  // floor), but a LONG one is genuinely worse. Same form as the published
+  // covariance inflation in publish_pose.
+  const double st = std::max(1.0, d / kt);
+  const double sr = std::max(1.0, a / kr);
+  trans_sigma = std::max(odom_sigmas[0], odom_sigmas[1]) * st;
+  rot_sigma = odom_sigmas[2] * sr;
+  const Eigen::Vector3d s(odom_sigmas[0] * st, odom_sigmas[1] * st,
+                          odom_sigmas[2] * sr);
+  return lift_sigmas(s, kSigmaTightRP, kSigmaDepthDelta * st);
+}
+
+void Slam::record_consecutive_link(int key, const gtsam::Pose2& measured,
+                                   double trans_sigma, double rot_sigma)
+{
+  if (key < 0) return;
+  if (static_cast<int>(consecutive_links_.size()) <= key)
+    consecutive_links_.resize(key + 1);
+  consecutive_links_[key] = {true, measured, std::max(trans_sigma, 1e-6),
+                             std::max(rot_sigma, 1e-6)};
+}
+
+bool Slam::same_dr_epoch(int key_a, int key_b) const
+{
+  if (loaded_key_count_ <= 0) return true;
+  return (key_a < loaded_key_count_) == (key_b < loaded_key_count_);
+}
+
+gtsam::Pose2 Slam::predicted_relative_pose(int target_key, int source_key,
+                                           bool* dr_backed) const
+{
+  const bool dr = same_dr_epoch(target_key, source_key);
+  if (dr_backed) *dr_backed = dr;
+  return dr ? keyframes[target_key]->dr_pose.between(
+                keyframes[source_key]->dr_pose)
+            : keyframes[target_key]->pose.between(keyframes[source_key]->pose);
+}
+
 // ---------------------------------------------------------------------------
 // point accumulation
 // ---------------------------------------------------------------------------
@@ -162,15 +233,16 @@ Matrix Slam::get_points(const std::vector<int>& frames, int ref_key) const
 
   long at = 0;
   for (int key : frames) {
-    Matrix transf;
     if (use_ref) {
       const gtsam::Pose2 transf_pose = ref_pose.between(keyframes[key]->pose);
-      transf = Keyframe::transform_points(keyframes[key]->points, transf_pose);
+      const Matrix transf = Keyframe::transform_points(keyframes[key]->points, transf_pose);
+      all_points.middleRows(at, transf.rows()) = transf;
+      at += transf.rows();
     } else {
-      transf = keyframes[key]->transf_points;
+      const Matrix& transf = keyframes[key]->transf_points;  // reference, no copy
+      all_points.middleRows(at, transf.rows()) = transf;
+      at += transf.rows();
     }
-    all_points.middleRows(at, transf.rows()) = transf;
-    at += transf.rows();
   }
 
   return downsample(all_points, static_cast<float>(point_resolution));
@@ -285,6 +357,9 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   // variance up to the default's floors keeps the collapsed axis honest while
   // preserving the elongation (sigma_max survives for the gates). Raising a
   // diagonal block's eigenvalues adds a PSD term, so the matrix stays PSD.
+  // Capture the pre-floor covariance for the degeneracy gate (it needs the
+  // elongation the floor below erases — see nssm_degeneracy_prefloor).
+  const Eigen::Matrix3d cov_raw = cov;
   const Eigen::Vector3d floor_var = icp_odom_sigmas.array().square().matrix();
   {
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
@@ -298,6 +373,7 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   result.message = "success";
   result.odom = m;
   result.cov = cov;
+  result.cov_raw = cov_raw;
   result.n_samples = static_cast<int>(sample_transforms.size());
   return result;
 }
@@ -306,8 +382,15 @@ int Slam::get_overlap(const Matrix& source_points, const Matrix& target_points,
                       const gtsam::Pose2* source_pose,
                       std::vector<int>* indices_out) const
 {
-  Matrix src = source_points;
-  if (source_pose) src = Keyframe::transform_points(src, *source_pose);
+  // Avoid copying the full source cloud when no pose transform is needed
+  // (the loop-refine overlap call passes source_pose == nullptr).
+  Matrix src_storage;
+  const Matrix* src_ptr = &source_points;
+  if (source_pose) {
+    src_storage = Keyframe::transform_points(source_points, *source_pose);
+    src_ptr = &src_storage;
+  }
+  const Matrix& src = *src_ptr;
 
   auto [ids, dists] = match(target_points.leftCols(2), src.leftCols(2), 1,
                             static_cast<float>(point_noise));
@@ -353,10 +436,20 @@ void Slam::add_odometry(const KeyframePtr& keyframe)
   // horizon-chart DR delta: planar odometry + the measured depth change
   const gtsam::Pose3 dr_odom =
     keyframes.back()->horizon_pose3().between(keyframe->horizon_pose3());
+  // Noise scaled to what this link actually spans, not to the nominal
+  // keyframe step. The head-pitch gate (feature.yaml max_head_pitch) forces
+  // status=false for a whole +/-54 deg sweep, during which NO keyframe is
+  // created — so the link that closes the sweep can span many metres and
+  // must not carry the same 0.2 m sigma as a 0.75 m step.
+  const gtsam::Pose2 dr_planar =
+    keyframes.back()->dr_pose.between(keyframe->dr_pose);
+  double ts = 0.0, rs = 0.0;
+  const gtsam::SharedNoiseModel model = scaled_odom_model(dr_planar, ts, rs);
   graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-    X(current_key() - 1), X(current_key()), dr_odom, odom_model_));
+    X(current_key() - 1), X(current_key()), dr_odom, model));
   values_.insert(X(current_key()), keyframe->horizon_pose3());
   add_state_unary(current_key(), keyframe);
+  record_consecutive_link(current_key(), dr_planar, ts, rs);
 }
 
 void Slam::add_state_unary(int key, const KeyframePtr& keyframe)
@@ -459,6 +552,7 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
       ret2.estimated_transform = icp_ret.odom;
       ret2.has_estimated_transform = true;
       ret2.cov = icp_ret.cov;
+      ret2.cov_raw = icp_ret.cov_raw;
       ret2.has_cov = true;
       ret2.n_sample_transforms = icp_ret.n_samples;
       ret2.status.description = std::to_string(icp_ret.n_samples) + " samples";
@@ -499,6 +593,10 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
         icp_odom_sigmas.array().square().matrix().asDiagonal();
       if (cov.determinant() < default_cov.determinant()) cov = default_cov;
       ret2.cov = cov;
+      // Censi path keeps the whole-matrix det swap (separate known issue), so
+      // there is no distinct pre-floor cov here — mirror cov (the prefloor gate
+      // is a no-op on the Censi path).
+      ret2.cov_raw = cov;
       ret2.has_cov = true;
       ret2.n_sample_transforms = c.n_correspondences;
       ret2.status.description = "censi " + std::to_string(c.n_correspondences);
@@ -544,11 +642,18 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
   if (ret2.status) {
     const int overlap = get_overlap(ret2.source_points, ret2.target_points,
                                     &ret2.estimated_transform);
-    if (overlap < ssm_params.min_points)
+    // Absolute count AND fraction-of-source (rtabmap Icp/CorrespondenceRatio).
+    // The count is venue-coupled; the ratio is not — see SMParams.
+    const long src_n = ret2.source_points.rows();
+    const double ratio = src_n > 0 ? static_cast<double>(overlap) / static_cast<double>(src_n) : 0.0;
+    if (overlap < ssm_params.min_points ||
+        (ssm_params.min_overlap_ratio > 0.0 &&
+         ratio < ssm_params.min_overlap_ratio))
       ret2.status = Status(Status::NOT_ENOUGH_OVERLAP);
     // append — don't clobber the success path's "N samples" diagnostic
     if (!ret2.status.description.empty()) ret2.status.description += ", ";
-    ret2.status.description += "overlap " + std::to_string(overlap);
+    ret2.status.description += "overlap " + std::to_string(overlap) +
+                              " (" + std::to_string(ratio) + " of source)";
   }
 
   if (ret2.status) {
@@ -567,6 +672,23 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
                                 gtsam::Point3(init2.x(), init2.y(),
                                               keyframe->dr_pose3.z())));
     add_state_unary(ret2.source_key, keyframe);
+    // This consecutive link measures ICP, NOT dead reckoning — record what
+    // the factor actually claimed so the post-loop check judges the graph
+    // against it (see ConsecutiveLink).
+    {
+      double ts = std::max(icp_odom_sigmas[0], icp_odom_sigmas[1]);
+      double rs = icp_odom_sigmas[2];
+      if (ret2.has_cov) {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
+          ret2.cov.topLeftCorner<2, 2>());
+        const double ev = es.eigenvalues().maxCoeff();
+        // NaN-safe: std::max launders NaN to its other argument
+        if (std::isfinite(ev) && ev > 0.0) ts = std::sqrt(ev);
+        if (std::isfinite(ret2.cov(2, 2)) && ret2.cov(2, 2) > 0.0)
+          rs = std::sqrt(ret2.cov(2, 2));
+      }
+      record_consecutive_link(ret2.source_key, ret2.estimated_transform, ts, rs);
+    }
     ret2.inserted = true;
     ++ssm_accepted;
     last_ssm_status = "accepted (" + ret2.status.description + ")";
@@ -620,15 +742,27 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // padded by the pose uncertainty.
   // NOTE: update_factor_graph only refreshes the newest keyframe's covariance
   // (carried from slam.py; see docs/DIVERGENCES.md), so the older source
-  // frames' covariances here are stale. This only widens/narrows the fan
-  // PADDING for candidate pre-selection, a second-order effect, so it is left
-  // as-is; the high-impact consumer (the global-init search bounds below) now
-  // uses the freshly refreshed anchor-keyframe covariance.
+  // frames' stored covariances are stale — and typically over-confident, which
+  // would UNDER-pad the fan and drop overlapping target points (missed
+  // closures). Instead of the stale per-frame cov we take the freshly
+  // refreshed anchor covariance and inflate it by the source frame's age at
+  // bounded drift rates (fan_drift_trans/rot). This only sets the candidate
+  // pre-selection PADDING, and inflation can only widen the fan, so it errs
+  // toward over-selection (a bit more ICP work, never a missed overlap).
+  // Intentional divergence from bruce_slam — see docs/DIVERGENCES.md.
   std::vector<char> sel(target_points_all.rows(), 0);
-  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d cov;
+  const Eigen::Matrix3d fresh_cov = keyframes[ret.source_key]->cov;
+  const double anchor_time = to_sec(keyframes[ret.source_key]->time);
   for (int source_frame : source_frames) {
     const gtsam::Pose2& pose = keyframes[source_frame]->pose;
-    cov = keyframes[source_frame]->cov;
+
+    // age >= 0: source_frames descend from the anchor (newest) keyframe.
+    const double age_s = anchor_time - to_sec(keyframes[source_frame]->time);
+    cov = fresh_cov;
+    cov(0, 0) += std::pow(nssm_params.fan_drift_trans * age_s, 2);
+    cov(1, 1) += std::pow(nssm_params.fan_drift_trans * age_s, 2);
+    cov(2, 2) += std::pow(nssm_params.fan_drift_rot * age_s, 2);
 
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
     const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());
@@ -661,28 +795,134 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // find candidate frames with enough nearby points
   std::map<int, int> counts;
   for (int k : target_keys) counts[k]++;
-  int best_frame = -1, best_count = 0;
-  bool any = false;
   // the keyframes that survive the fan/covariance gate (>10 nearby points):
   // this is the LOCAL overlapping submap, not the whole map. Used below to
   // build the final target cloud, matching slam.py's reassignment of
   // target_frames = target_frames[counts > 10] (std::map keeps ascending order,
   // matching np.unique). Without this the loop-closure ICP/overlap/covariance
   // would register against the entire explored trajectory.
-  std::vector<int> candidate_frames;
-  for (const auto& [frame, count] : counts) {
-    if (count > 10) {
-      any = true;
-      candidate_frames.push_back(frame);
-      if (count > best_count) { best_count = count; best_frame = frame; }
-    }
-  }
+  std::vector<int> candidate_frames;  // ascending (std::map order)
+  for (const auto& [frame, count] : counts)
+    if (count > 10) candidate_frames.push_back(frame);
 
-  if (!any || target_points.rows() < nssm_params.min_points) {
+  if (candidate_frames.empty() ||
+      target_points.rows() < nssm_params.min_points) {
     ret.status = Status(Status::NOT_ENOUGH_POINTS);
     ret.status.description =
       "target points " + std::to_string(target_points.rows());
     return ret;
+  }
+
+  // Revisit selection (intentional divergence from bruce_slam, which took the
+  // raw argmax-overlap frame as the target — see docs/DIVERGENCES.md). The
+  // in-fan candidates include the current pass's own recent trail (the
+  // keyframes just outside the min_st_sep exclusion), which carry the most
+  // overlap. argmax therefore anchors the loop factor to a near-sequential
+  // trailing frame ("same area, same time") and never to a genuine revisit, so
+  // out-and-back passes are never tied together and walls render doubled.
+  //
+  // Two-stage fix, floor-primary so it is robust when the sonar range covers
+  // the whole environment (candidates then form one unbroken index run with no
+  // gap to cluster on — e.g. a small pool):
+  //   (1) FLOOR: a revisit target must be at least min_revisit_sep keyframes
+  //       older than the source. This alone excludes the recent trail.
+  //   (2) CLUSTER (refinement): if the survivors still split into multiple
+  //       contiguous index runs, the highest-index run is the far tail of the
+  //       current pass's trail; drop it so the target is a distinct episode.
+  //       A single run means the floor already isolated the revisit — keep it
+  //       (never over-drop to empty).
+  std::vector<int> revisit_frames;  // stays ascending (candidate_frames is)
+  for (int f : candidate_frames)
+    if (ret.source_key - f >= nssm_params.min_revisit_sep)
+      revisit_frames.push_back(f);
+
+  if (revisit_frames.empty()) {
+    ret.status = Status(Status::NOT_ENOUGH_OVERLAP);
+    ret.status.description =
+      "no-revisit (candidates " + std::to_string(candidate_frames.size()) +
+      ", none older than min_revisit_sep " +
+      std::to_string(nssm_params.min_revisit_sep) + ")";
+    return ret;
+  }
+
+  // Segment the surviving candidates into contiguous index RUNS — one run per
+  // distinct visiting episode — and keep exactly ONE.
+  //
+  // The earlier form dropped only the TRAILING run, so with three or more runs
+  // (two genuine earlier visits plus the trail tail) two distinct episodes
+  // survived together and were aggregated into a single target cloud by
+  // get_points() below — which transforms each keyframe's points by the
+  // CURRENT graph estimate. If those episodes are mis-aligned in the graph,
+  // which is exactly the situation the closure exists to fix, the target is
+  // smeared by that misalignment and ICP registers against a doubled cloud.
+  // That is the wall-doubling failure this whole revisit path was built to
+  // prevent, reintroduced one step later at target construction.
+  //
+  // rtabmap has no such exposure: getPaths() segments candidates into
+  // neighbour-link-connected runs and attempts ONE detection per path
+  // (Rtabmap.cpp — "segment poses by paths, only one detection per path"),
+  // comparing up to RGBD/ProximityMaxPaths of them SEPARATELY, never merging
+  // clouds across paths.
+  const int kRevisitGap = 3;  // index gap that splits one episode from the next
+  std::vector<std::pair<std::size_t, std::size_t>> runs;  // [begin, end)
+  {
+    std::size_t begin = 0;
+    for (std::size_t i = 1; i <= revisit_frames.size(); ++i)
+      if (i == revisit_frames.size() ||
+          revisit_frames[i] - revisit_frames[i - 1] > kRevisitGap) {
+        runs.emplace_back(begin, i);
+        begin = i;
+      }
+  }
+  // >1 run: the highest-index run is the current pass's own trailing tail
+  // (the same assumption as before). Never drop to empty.
+  if (runs.size() > 1) runs.pop_back();
+  // Among the remaining episodes take the one carrying the most in-fan
+  // points — the visit that actually saw this structure best.
+  std::size_t best_run = 0;
+  long best_run_points = -1;
+  for (std::size_t r = 0; r < runs.size(); ++r) {
+    long n = 0;
+    for (std::size_t i = runs[r].first; i < runs[r].second; ++i)
+      n += counts[revisit_frames[i]];
+    if (n > best_run_points) { best_run_points = n; best_run = r; }
+  }
+  candidate_frames.assign(revisit_frames.begin() + runs[best_run].first,
+                          revisit_frames.begin() + runs[best_run].second);
+
+  // Restrict the target cloud to the revisit frames so the Sobol init, the
+  // post-init refine (which recomputes counts from target_keys), and the final
+  // submap all register against the OLD pass, not the trail.
+  const std::set<int> revisit_set(candidate_frames.begin(),
+                                  candidate_frames.end());
+  {
+    long n_keep = 0;
+    for (int k : target_keys) n_keep += revisit_set.count(k);
+    Matrix kept_points(n_keep, 2);
+    std::vector<int> kept_keys(n_keep);
+    long at = 0;
+    for (int i = 0; i < target_points.rows(); ++i) {
+      if (!revisit_set.count(target_keys[i])) continue;
+      kept_points.row(at) = target_points.row(i);
+      kept_keys[at] = target_keys[i];
+      ++at;
+    }
+    target_points = std::move(kept_points);
+    target_keys = std::move(kept_keys);
+  }
+
+  if (target_points.rows() < nssm_params.min_points) {
+    ret.status = Status(Status::NOT_ENOUGH_POINTS);
+    ret.status.description =
+      "target points " + std::to_string(target_points.rows());
+    return ret;
+  }
+
+  // best target = max overlap among revisit frames only
+  int best_frame = candidate_frames.front(), best_count = -1;
+  for (int frame : candidate_frames) {
+    const int count = counts[frame];
+    if (count > best_count) { best_count = count; best_frame = frame; }
   }
 
   ret.target_key = best_frame;
@@ -715,9 +955,16 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
     nssm_max_yaw_vs_compass > 0.0
       ? std::min(5.0 * rotation_std, nssm_max_yaw_vs_compass)
       : 5.0 * rotation_std;
+  // Optional TRANSLATION clamp (parallel-wall aliasing lever, default off): cap
+  // the Sobol init x/y search so it cannot reach a parallel-wall basin many
+  // metres off the DR-predicted overlap. 0 keeps the full ±5σ freedom.
+  const double trans_bound =
+    nssm_max_translation_vs_dr > 0.0
+      ? std::min(5.0 * translation_std, nssm_max_translation_vs_dr)
+      : 5.0 * translation_std;
   Eigen::Matrix<double, 3, 2> bounds;
-  bounds << -5.0 * translation_std, 5.0 * translation_std,
-            -5.0 * translation_std, 5.0 * translation_std,
+  bounds << -trans_bound, trans_bound,
+            -trans_bound, trans_bound,
             -yaw_bound, yaw_bound;
 
   const GlobalInitResult init = global_scan_match_init(
@@ -775,13 +1022,17 @@ std::string nssm_hist_key(const Status& s)
   std::string key = s.name();
   const std::string& d = s.description;
   if (d.rfind("compass-inconsistent", 0) == 0) key += " (compass)";
+  else if (d.rfind("DR-translation-inconsistent", 0) == 0)
+    key += " (DR translation)";
   else if (d.rfind("degenerate", 0) == 0) key += " (degenerate)";
+  else if (d.rfind("no-revisit", 0) == 0) key += " (no-revisit)";
   return key;
 }
 }  // namespace
 
 bool Slam::add_nonsequential_scan_matching()
 {
+  last_nssm_inserted_geom.clear();
   // current_frame is assigned at the END of the SLAM callback, so it is null
   // until the second callback
   if (!current_frame || current_key() < nssm_params.min_st_sep) return false;
@@ -817,11 +1068,51 @@ bool Slam::add_nonsequential_scan_matching()
   if (ret2.status) {
     const int overlap = get_overlap(ret2.source_points, ret2.target_points,
                                     &ret2.estimated_transform);
-    if (overlap < nssm_params.min_points)
+    const long src_n = ret2.source_points.rows();
+    const double ratio = src_n > 0 ? static_cast<double>(overlap) / static_cast<double>(src_n) : 0.0;
+    if (overlap < nssm_params.min_points ||
+        (nssm_params.min_overlap_ratio > 0.0 &&
+         ratio < nssm_params.min_overlap_ratio))
       ret2.status = Status(Status::NOT_ENOUGH_OVERLAP);
     // append — don't clobber the success path's "N samples" diagnostic
     if (!ret2.status.description.empty()) ret2.status.description += ", ";
-    ret2.status.description += "overlap " + std::to_string(overlap);
+    ret2.status.description += "overlap " + std::to_string(overlap) +
+                              " (" + std::to_string(ratio) + " of source)";
+  }
+
+  // Absolute translation-consistency gate, paired with the Sobol bound in
+  // initialize_nonsequential_scan_matching(). The initialization clamp alone
+  // is not a final bound: ICP may refine as far as nssm/max_translation from
+  // that seed. On CHL_Pool, max_translation_vs_dr=1.0 still admitted
+  // parallel-wall aliases demanding 2-5 m corrections because ICP walked
+  // from the edge of the 1 m initialization window into the alias basin.
+  // Judge the final target->source transform against the predicted one,
+  // matching the absolute compass check below. 0 disables.
+  //
+  // CROSS-SESSION (2026-07-26): the predictor comes from
+  // predicted_relative_pose, NOT from dr_pose directly. A closure onto a
+  // LOADED map spans two dead-reckoning epochs, whose dr_pose difference is
+  // an arbitrary offset — typically the whole distance between the two
+  // missions' DR origins, so every such closure failed this gate and map
+  // persistence silently produced no loop closures at all (measured: 0
+  // accepted post-load with the gate at 1.0 m, 10 with it disabled). Across
+  // the boundary the graph estimate is the common frame and becomes the
+  // reference; within one epoch DR still is, unchanged. The chain-tear check
+  // skips the same boundary for the same reason (loaded_key_count_ below).
+  if (ret2.status && nssm_max_translation_vs_dr > 0.0) {
+    bool dr_backed = true;
+    const gtsam::Pose2 rel =
+      predicted_relative_pose(ret2.target_key, ret2.source_key, &dr_backed);
+    const gtsam::Pose2 corr = rel.between(ret2.estimated_transform);
+    const double trans_err = std::hypot(corr.x(), corr.y());
+    // Inverted comparison makes a non-finite transform fail closed.
+    if (!(trans_err <= nssm_max_translation_vs_dr)) {
+      ret2.status = Status(Status::LARGE_TRANSFORMATION);
+      ret2.status.description =
+        std::string("DR-translation-inconsistent (closure translation vs ") +
+        (dr_backed ? "DR" : "graph estimate, cross-session") +
+        " differs by " + std::to_string(trans_err) + " m)";
+    }
   }
 
   // Compass-consistency gate (ABSOLUTE, added 2026-07-15 night after two
@@ -832,6 +1123,12 @@ bool Slam::add_nonsequential_scan_matching()
   // compass cannot be aliased: both keyframes' DR yaws are compass-anchored
   // and drift-free, so the closure's measured relative yaw must match the
   // DR relative yaw within compass noise.
+  //
+  // Deliberately reads dr_pose directly rather than going through
+  // predicted_relative_pose: compass-anchored yaw is ABSOLUTE, so it is the
+  // one DR quantity that survives a map-load epoch change intact, and the
+  // graph yaw this gate is meant to police must never become its own
+  // reference. Only translation needs the cross-session treatment above.
   if (ret2.status) {
     const double dr_rel_yaw = keyframes[ret2.target_key]
                                 ->dr_pose.between(keyframes[ret2.source_key]->dr_pose)
@@ -846,7 +1143,7 @@ bool Slam::add_nonsequential_scan_matching()
     }
   }
 
-  // Degeneracy gate (FULL_3D_ROADMAP.md "Path to survey-grade" item 1):
+  // Degeneracy gate:
   // pool/wall aliasing produced self-consistent-but-wrong closures that PCM
   // could not reject (2026-07 CHL_Pool: 9 accepted closures demanding 21 deg
   // RMS yaw correction — why NSSM was turned off). Sliding along featureless
@@ -855,8 +1152,13 @@ bool Slam::add_nonsequential_scan_matching()
   // or too anisotropic. The yaw half of the gate is nssm/max_rotation,
   // tightened in slam.yaml to the compass-anchored bound.
   if (ret2.status && ret2.has_cov) {
+    // Gate on the pre-floor covariance when enabled: the per-eigenvalue floor in
+    // compute_icp_with_cov otherwise caps the observable anisotropy and lets
+    // elongated wall-slide covariances pass this gate.
+    const Eigen::Matrix3d& gate_cov =
+      nssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
-      ret2.cov.topLeftCorner<2, 2>());
+      gate_cov.topLeftCorner<2, 2>());
     const double ev_lo = es.eigenvalues()[0];
     const double ev_hi = es.eigenvalues()[1];
     const double sig_max = std::sqrt(std::max(0.0, ev_hi));
@@ -916,6 +1218,34 @@ bool Slam::add_nonsequential_scan_matching()
       keyframes[loop.source_key]->constraints.emplace_back(
         loop.target_key, loop.estimated_transform);
       loop.inserted = true;
+      // Diagnostic: the correction this closure demands, ICP relative pose vs
+      // the predicted relative pose (same target->source convention as the
+      // factor above). Legit ~1 m drift fix => trans ~drift, yaw ~0; a
+      // parallel-wall alias => large trans and/or non-zero yaw. Logged by the
+      // node so it lands right before any post-loop revert message.
+      // Uses the same predictor as the translation gate, so a cross-session
+      // closure reports against the graph estimate instead of printing the
+      // meaningless difference of two DR epochs (labelled in the text).
+      {
+        bool dr_backed = true;
+        const gtsam::Pose2 dr_rel = predicted_relative_pose(
+          loop.target_key, loop.source_key, &dr_backed);
+        const gtsam::Pose2 corr = dr_rel.between(loop.estimated_transform);
+        last_nssm_inserted_geom.push_back(
+          "closure src=" + std::to_string(loop.source_key) + " tgt=" +
+          std::to_string(loop.target_key) + " gap=" +
+          std::to_string(loop.source_key - loop.target_key) +
+          (dr_backed ? "" : " [cross-session: ref=graph]") +
+          " | ICP-vs-DR corr trans=" +
+          std::to_string(std::hypot(corr.x(), corr.y())) + "m yaw=" +
+          std::to_string(corr.theta()) + "rad | DR rel=(" +
+          std::to_string(dr_rel.x()) + "," + std::to_string(dr_rel.y()) + "," +
+          std::to_string(dr_rel.theta()) + ") ICP rel=(" +
+          std::to_string(loop.estimated_transform.x()) + "," +
+          std::to_string(loop.estimated_transform.y()) + "," +
+          std::to_string(loop.estimated_transform.theta()) + ") | " +
+          loop.status.description);
+      }
       // tentative until the next update_factor_graph succeeds; rolled back
       // (inserted flag, constraints entry, counter) if the solve throws
       pending_loops_.push_back(m);
@@ -978,13 +1308,15 @@ bool Slam::undo_manual_correction()
     return false;
   }
   const std::size_t idx = manual_prior_indices_.back();
-  manual_prior_indices_.pop_back();
   // Null-hole removal (FactorGraph::remove) keeps every other recorded index
   // valid; rebuild_isam skips the holes when feeding the fresh estimator.
   // The index is always live: verification/failure truncations only drop
   // factors of rounds that were never recorded here.
-  if (idx < committed_graph_.size() && committed_graph_[idx])
+  gtsam::NonlinearFactor::shared_ptr removed;
+  if (idx < committed_graph_.size() && committed_graph_[idx]) {
+    removed = committed_graph_[idx];
     committed_graph_.remove(idx);
+  }
   rebuild_isam();
   // The rebuild relinearizes AT the corrected poses, which are no longer the
   // optimum without the prior — relax the trajectory back and sweep the new
@@ -992,7 +1324,16 @@ bool Slam::undo_manual_correction()
   // buffer is empty; converge hard, mirroring the correction round this
   // undoes; pending_loops_ is empty so no verification runs).
   force_converge_ = true;
-  if (!update_factor_graph()) return false;
+  if (!update_factor_graph()) {
+    // the undo did NOT apply — restore the factor and the estimator, or a
+    // retried "undo failed" would peel the PREVIOUS correction instead
+    if (removed) {
+      committed_graph_.replace(idx, removed);
+      rebuild_isam();
+    }
+    return false;
+  }
+  manual_prior_indices_.pop_back();
   ++manual_corrections_undone;
   return true;
 }
@@ -1024,9 +1365,20 @@ gtsam::Pose3 get_pose3(std::ifstream& f)
 
 bool Slam::save_map(const std::string& path)
 {
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  // Write to a sibling temp file and rename into place.
+  //
+  // Opening `path` directly with trunc destroyed the existing map the moment
+  // the save STARTED, so a full disk, a crash, or a kill mid-write left
+  // neither the old map nor a valid new one — and this file can represent
+  // hours of survey. The short-write check below already existed, but by the
+  // time it fires the previous map is long gone.
+  //
+  // rename(2) within a directory is atomic, so any reader (including a later
+  // load_map) sees either the untouched old map or the complete new one.
+  const std::string tmp = path + ".tmp";
+  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
   if (!f) {
-    last_error_ = "cannot open '" + path + "' for writing";
+    last_error_ = "cannot open '" + tmp + "' for writing";
     return false;
   }
   f.write(kMapMagic, 8);
@@ -1054,8 +1406,19 @@ bool Slam::save_map(const std::string& path)
               static_cast<std::streamsize>(buf.size() * sizeof(float)));
     }
   }
-  if (!f) {
-    last_error_ = "short write to '" + path + "'";
+  // the buffered stream only surfaces ENOSPC at flush — close BEFORE the
+  // verdict or a truncated save reports success
+  f.close();
+  std::error_code ec;
+  if (f.fail()) {
+    last_error_ = "short write to '" + tmp + "'";
+    std::filesystem::remove(tmp, ec);  // leave no partial file behind
+    return false;
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    last_error_ = "cannot move '" + tmp + "' into place: " + ec.message();
+    std::filesystem::remove(tmp, ec);
     return false;
   }
   return true;
@@ -1113,6 +1476,13 @@ bool Slam::load_map(const std::string& path)
       std::vector<float> buf(static_cast<std::size_t>(rows) * 3);
       f.read(reinterpret_cast<char*>(buf.data()),
              static_cast<std::streamsize>(buf.size() * sizeof(float)));
+      // a truncation INSIDE the last keyframe's payload would otherwise load
+      // "successfully" with the missing tail as (0,0,0) phantom points
+      if (!f) {
+        last_error_ = "truncated point payload at keyframe " + std::to_string(k);
+        keyframes.clear();
+        return false;
+      }
       for (long r = 0; r < rows; ++r)
         for (int c = 0; c < 3; ++c)
           kf->points(r, c) = buf[static_cast<std::size_t>(r) * 3 + c];
@@ -1144,6 +1514,12 @@ bool Slam::load_map(const std::string& path)
     v.insert(X(key), kf->horizon_pose3());
   }
 
+  if (f.peek() != std::ifstream::traits_type::eof()) {
+    last_error_ = "trailing data after the last keyframe — corrupt map file";
+    keyframes.clear();
+    return false;
+  }
+
   try {
     isam_.update(g, v);
   } catch (const std::exception& e) {
@@ -1154,6 +1530,11 @@ bool Slam::load_map(const std::string& path)
   }
   committed_graph_ = g;
   loaded_key_count_ = static_cast<int>(n);
+  // A restored map carries poses and clouds but not the per-link factor
+  // measurements, so every loaded link is marked invalid and skipped by the
+  // post-loop chain-tear check. Sizing the vector here keeps it aligned with
+  // `keyframes` so links added this session land at the right index.
+  consecutive_links_.assign(keyframes.size(), ConsecutiveLink{});
   awaiting_relocalization_ = true;
   return true;
 }
@@ -1186,12 +1567,17 @@ bool Slam::relocalize(const KeyframePtr& frame)
     min_y = std::min(min_y, target(r, 1));
     max_y = std::max(max_y, target(r, 1));
   }
-  const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y),
-                            frame->dr_pose.theta());
+  // yaw-0 center: global_scan_match_init composes delta in the CENTER's
+  // body frame, so a heading-carrying center would rotate the translation
+  // search box with the vehicle and miss parts of an elongated map. With
+  // theta = 0 the delta x/y live in world axes and the delta yaw IS the
+  // absolute yaw, bounded around the compass-anchored DR heading.
+  const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.0);
+  const double dr_yaw = frame->dr_pose.theta();
   Eigen::Matrix<double, 3, 2> bounds;
   bounds << -(0.5 * (max_x - min_x) + 5.0), 0.5 * (max_x - min_x) + 5.0,
             -(0.5 * (max_y - min_y) + 5.0), 0.5 * (max_y - min_y) + 5.0,
-            -0.35, 0.35;
+            dr_yaw - 0.35, dr_yaw + 0.35;
 
   const GlobalInitResult init = global_scan_match_init(
     frame->points, center, target, gtsam::Pose2(), point_noise, bounds,
@@ -1252,23 +1638,34 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
   if (keyframe) keyframes.push_back(keyframe);
 
-  // Optimized-vs-DR discrepancy for one consecutive keyframe link. DR is
-  // drift-free over a single ~0.75 m keyframe interval, so a deviation here is
-  // the optimizer having torn the chain to satisfy a loop closure. Each
-  // chart's link vector is rotated into its own keyframe-k heading: the two
-  // charts share compass-anchored yaw, so the BODY-frame vectors are directly
-  // comparable — and direction-sensitive, unlike the earlier length-only
-  // |d_opt| - |d_dr| form, which reads exactly 0 for the classic fold-back
-  // that REVERSES a link while preserving its length.
-  const auto link_tear = [this](std::size_t k) {
-    const auto body_link = [](const gtsam::Pose2& a, const gtsam::Pose2& b) {
-      const double c = std::cos(a.theta()), s = std::sin(a.theta());
-      const double dx = b.x() - a.x(), dy = b.y() - a.y();
-      return Eigen::Vector2d(c * dx + s * dy, -s * dx + c * dy);  // R(θ)ᵀ·d
-    };
-    return (body_link(keyframes[k]->pose, keyframes[k + 1]->pose) -
-            body_link(keyframes[k]->dr_pose, keyframes[k + 1]->dr_pose))
-      .norm();
+  // Optimized-vs-MEASURED discrepancy for one consecutive keyframe link, in
+  // SIGMA of that link's own noise model. Port of rtabmap
+  // Graph.cpp:computeMaxGraphErrors (linearErrorRatio): the optimizer having
+  // torn the chain to satisfy a loop closure shows up as the graph walking
+  // away from what the link's factor actually measured.
+  //
+  // Two changes from the earlier form (2026-07-25):
+  //   * compares against the LINK, not dead reckoning. DR is the measurement
+  //     only for add_odometry links; an SSM-accepted link measures ICP, so
+  //     the old DR comparison charged a healthy graph a standing offset (up
+  //     to ssm/max_translation = 0.3 m) for agreeing with its own factor.
+  //   * normalised by the link's sigma, which now scales with span
+  //     (add_odometry) — so a link bridging a long DR-only gap through a
+  //     head-pitch-gated sweep is no longer convicted for being long.
+  // Componentwise max, matching rtabmap, and direction-sensitive: it reads
+  // large for the classic fold-back that REVERSES a link while preserving
+  // its length. Links with no recorded measurement (a loaded map's
+  // keyframes) return 0 and are skipped.
+  const auto link_error_ratio = [this](std::size_t k) -> double {
+    const std::size_t li = k + 1;  // links are indexed by their newer endpoint
+    if (li >= consecutive_links_.size() || !consecutive_links_[li].valid)
+      return 0.0;
+    const ConsecutiveLink& L = consecutive_links_[li];
+    const gtsam::Pose2 opt =
+      keyframes[k]->pose.between(keyframes[k + 1]->pose);
+    const double lin = std::max(std::abs(L.measured.x() - opt.x()),
+                                std::abs(L.measured.y() - opt.y()));
+    return lin / L.trans_sigma;
   };
 
   // Pre-round snapshot, loop rounds only (add_nonsequential_scan_matching
@@ -1282,10 +1679,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     pre_round_poses.reserve(keyframes.size());
     for (const auto& kf : keyframes)
       pre_round_poses.push_back(kf->horizon_pose3());
-    if (post_loop_max_translation_err > 0.0 && keyframes.size() > 1) {
+    if (post_loop_max_link_error_sigma > 0.0 && keyframes.size() > 1) {
       pre_tear.resize(keyframes.size() - 1);
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k)
-        pre_tear[k] = link_tear(k);
+        pre_tear[k] = link_error_ratio(k);
     }
   }
 
@@ -1305,7 +1702,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     // a discarded manual-correction prior must not make the NEXT round
     // converge hard on its behalf
     force_converge_ = false;
-    if (keyframe) keyframes.pop_back();
+    if (keyframe) { keyframes.pop_back(); consecutive_links_.resize(keyframes.size()); }
     // solver failure says nothing about the loops themselves — no quarantine
     rollback_pending_loops(/*quarantine=*/false);
     rebuild_isam();
@@ -1406,18 +1803,51 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     // elsewhere in the chain — exactly the fold this check exists to catch.
     double worst_tear = 0.0;
     bool tear_bad = false;
-    if (post_loop_max_translation_err > 0.0) {
+    // Index of the consecutive link this round tore worst — the handle for
+    // the surgical quarantine below (rtabmap keeps the equivalent as
+    // MaxGraphErrors::linearLink so repairGraph can drop exactly that edge).
+    long worst_tear_link = -1;
+    if (post_loop_max_link_error_sigma > 0.0) {
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
-        const double tear = link_tear(k);
+        // The link joining a LOADED map to the new session has no recorded
+        // measurement (link_error_ratio returns 0 for it), but skip it
+        // explicitly too: the two sides come from different DR epochs, so
+        // nothing about it is meaningful to this check.
+        if (loaded_key_count_ > 0 &&
+            k + 1 == static_cast<std::size_t>(loaded_key_count_))
+          continue;
+        const double tear = link_error_ratio(k);
         const double before = k < pre_tear.size() ? pre_tear[k] : 0.0;
-        // covers re-solve jitter on a link this round never touched (~5 mm
-        // observed), and sits orders below any real fold — a numerical guard,
-        // not a tuning lever, so it stays out of the config
-        constexpr double tear_jitter_eps = 0.01;  // m
-        if (tear > post_loop_max_translation_err &&
-            tear > before + tear_jitter_eps) {
+        // Re-solve jitter on a link this round never touched, in SIGMA.
+        // A numerical guard, not a tuning lever, so it stays out of the
+        // config. (Was 0.01 m; 0.05 sigma is the same order against the
+        // 0.1-0.2 m sigmas these links carry.)
+        constexpr double tear_jitter_eps = 0.05;  // sigma
+        // A link legitimately stretched past the bound by an ACCEPTED
+        // absolute fix (USBL / manual) absorbs every later loop correction
+        // too — it moves well beyond the numeric epsilon on genuine rounds.
+        // Judged against the epsilon it would coin-flip vetoes forever, so
+        // an already-over-bound link must grow by a material fraction of
+        // the bound to convict a new round.
+        // Judge growth against the PERSISTENT baseline recorded when the
+        // link first exceeded the bound (an accepted absolute fix), not the
+        // previous round's snapshot — per-round references let repeated
+        // sub-gate aliases ratchet the graph a fraction of the bound at a
+        // time. NOTE this delta/baseline machinery survives the switch to a
+        // sigma ratio: normalising fixes long-link false positives, it does
+        // NOT fix latching, which is a separate failure mode.
+        double ref = before;
+        if (k < tear_baseline_.size() && tear_baseline_[k] >= 0.0)
+          ref = tear_baseline_[k];
+        const double growth_gate = ref > post_loop_max_link_error_sigma
+                                     ? 0.25 * post_loop_max_link_error_sigma
+                                     : tear_jitter_eps;
+        if (tear > post_loop_max_link_error_sigma && tear > ref + growth_gate) {
           tear_bad = true;
-          worst_tear = std::max(worst_tear, tear);
+          if (tear > worst_tear) {
+            worst_tear = tear;
+            worst_tear_link = static_cast<long>(k);
+          }
         }
       }
     }
@@ -1427,9 +1857,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
         ? ("post-loop compass check failed: optimized-vs-DR windowed yaw RMS " +
            std::to_string(rms) + " rad > " +
            std::to_string(post_loop_max_yaw_rms))
-        : ("post-loop chain-tear check failed: this round tore a consecutive "
-           "keyframe link to " + std::to_string(worst_tear) +
-           " m from DR > " + std::to_string(post_loop_max_translation_err));
+        : ("post-loop chain-tear check failed: this round pulled a consecutive "
+           "keyframe link " + std::to_string(worst_tear) +
+           " sigma away from what its own factor measured > " +
+           std::to_string(post_loop_max_link_error_sigma));
       last_nssm_status = "REVERTED (" + last_error_ + ")";
       ++nssm_reverted;
       // un-mirror this round's factors so the rebuild excludes them, and
@@ -1437,7 +1868,15 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       // must not re-form and re-fail (accept/revert/rebuild churn) on the
       // next candidate.
       committed_graph_.resize(committed_before);
-      rollback_pending_loops(/*quarantine=*/true);
+      // Surgical quarantine: the yaw check is GLOBAL so it convicts the whole
+      // round (-1), but a chain tear names one link, and only the closures
+      // that actually span it can have stretched it. The rest are un-inserted
+      // (their factors were just truncated away) but stay eligible — a clique
+      // of 3 used to be blacklisted wholesale because one member was an
+      // alias, and with min_pcm 2 losing the honest ones makes every later
+      // clique harder to form.
+      rollback_pending_loops(/*quarantine=*/true,
+                             yaw_bad ? -1 : worst_tear_link);
       // Restore the pre-round poses EXACTLY, then rebuild from them. They are
       // the converged optimum of committed_graph_ (truncated back above, so
       // nothing it constrains has changed) — which means the rebuilt
@@ -1459,6 +1898,26 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // round's loop-closure marks become permanent
   pending_loops_.clear();
 
+  // Maintain the per-link over-bound baseline the chain-tear growth gate
+  // compares against: record the tear when a link FIRST ends a correction
+  // round beyond the bound (typically stretched by an accepted USBL/manual
+  // fix), clear it when the link heals back under the bound.
+  if (converge_hard && post_loop_max_link_error_sigma > 0.0 &&
+      keyframes.size() > 1) {
+    tear_baseline_.resize(keyframes.size() - 1, -1.0);
+    for (std::size_t k = 0; k + 1 < keyframes.size(); ++k) {
+      if (loaded_key_count_ > 0 &&
+          k + 1 == static_cast<std::size_t>(loaded_key_count_))
+        continue;
+      const double t = link_error_ratio(k);
+      if (t > post_loop_max_link_error_sigma) {
+        if (tear_baseline_[k] < 0.0) tear_baseline_[k] = t;
+      } else {
+        tear_baseline_[k] = -1.0;
+      }
+    }
+  }
+
   // Only the latest keyframe's covariance is refreshed — a known limitation
   // carried from slam.py (its own "TODO propagate cov from previous keyframe"),
   // so older keyframes keep stale marginals. Recomputing every keyframe's
@@ -1475,7 +1934,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     Eigen::Matrix3d cov;
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) cov(i, j) = cov6(map[i], map[j]);
-    keyframes.back()->update(pose, cov);
+    keyframes.back()->set_cov(cov);
   } catch (const std::exception&) {
     keyframes.back()->update(pose);
   }
@@ -1494,7 +1953,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
         Eigen::Matrix3d c;
         for (int i = 0; i < 3; ++i)
           for (int j = 0; j < 3; ++j) c(i, j) = c6(map[i], map[j]);
-        keyframes[k]->update(keyframes[k]->horizon_pose3(), c);
+        keyframes[k]->set_cov(c);
       } catch (const std::exception&) {
         // weakly constrained variable: keep the stale marginal
       }
@@ -1518,7 +1977,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     // quarantine, since the loops themselves were never judged.
     last_error_ = std::string("post-solve failure: ") + e.what();
     committed_graph_.resize(committed_before);
-    if (keyframe) keyframes.pop_back();
+    if (keyframe) { keyframes.pop_back(); consecutive_links_.resize(keyframes.size()); }
     rollback_pending_loops(/*quarantine=*/false);
     const std::size_t n = std::min(pre_round_poses.size(), keyframes.size());
     for (std::size_t x = 0; x < n; ++x) keyframes[x]->update(pre_round_poses[x]);
@@ -1527,20 +1986,43 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   }
 }
 
-void Slam::rollback_pending_loops(bool quarantine)
+void Slam::rollback_pending_loops(bool quarantine, long culprit_link)
 {
   // Loops are marked inserted (and appended to their keyframe's constraints)
   // in add_nonsequential_scan_matching, BEFORE the update that actually
   // incorporates their factors. If that update failed, the factors were
   // discarded — un-mark them; with quarantine=true (a verification revert)
-  // they are additionally flagged rejected so the same demonstrably-bad
-  // clique can neither re-insert nor vote in future PCM cliques.
+  // they are additionally flagged rejected so the demonstrably-bad closure
+  // can neither re-insert nor vote in future PCM cliques.
+  //
+  // culprit_link >= 0 narrows the quarantine to the closures that SPAN that
+  // consecutive link (target_key <= k and k+1 <= source_key) — only those can
+  // have stretched it. Everything else in the round is rolled back but stays
+  // eligible. -1 quarantines the whole round, which is right for the yaw
+  // check because that one is global and cannot attribute blame.
+  //
+  // Never quarantines nothing: if no pending loop spans the named link the
+  // attribution failed, so fall back to convicting the round.
+  bool any_spans = false;
+  if (quarantine && culprit_link >= 0)
+    for (int m : pending_loops_) {
+      if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
+      const ICPResult& l = nssm_queue_[m];
+      if (l.target_key <= culprit_link && culprit_link + 1 <= l.source_key) {
+        any_spans = true;
+        break;
+      }
+    }
+
   for (int m : pending_loops_) {
     if (m < 0 || m >= static_cast<int>(nssm_queue_.size())) continue;
     ICPResult& loop = nssm_queue_[m];
     if (!loop.inserted) continue;
     loop.inserted = false;
-    if (quarantine) loop.rejected = true;
+    const bool spans =
+      !any_spans || (loop.target_key <= culprit_link &&
+                     culprit_link + 1 <= loop.source_key);
+    if (quarantine && spans) loop.rejected = true;
     if (loop.source_key >= 0 &&
         loop.source_key < static_cast<int>(keyframes.size())) {
       auto& constraints = keyframes[loop.source_key]->constraints;

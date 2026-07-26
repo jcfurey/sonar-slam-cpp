@@ -2,6 +2,7 @@
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
+#include <algorithm>
 #include <cstring>
 
 namespace sonar_slam {
@@ -76,10 +77,18 @@ sensor_msgs::msg::PointCloud2 make_cloud(const std::vector<std::string>& fields,
   msg.row_step = msg.point_step * msg.width;
   msg.data.resize(static_cast<std::size_t>(msg.row_step));
 
+  // point_step is sized from fields.size(), so writing data.cols() floats
+  // overruns the stride — and the buffer itself on the last point — whenever a
+  // caller passes more columns than field names. Every in-tree caller matches
+  // today (xyz/3, xyzi/4, traj/8), but this is a raw pointer write in a shared
+  // helper, so bound it rather than rely on that staying true. Fewer columns
+  // than fields is harmless: resize() zero-filled the remainder.
+  const int ncols = std::min<int>(static_cast<int>(data.cols()),
+                                  static_cast<int>(fields.size()));
   for (int i = 0; i < data.rows(); ++i) {
     float* dst = reinterpret_cast<float*>(msg.data.data() +
                                           static_cast<std::size_t>(i) * msg.point_step);
-    for (int c = 0; c < data.cols(); ++c) dst[c] = data(i, c);
+    for (int c = 0; c < ncols; ++c) dst[c] = data(i, c);
   }
   return msg;
 }

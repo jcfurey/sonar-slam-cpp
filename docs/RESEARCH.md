@@ -113,9 +113,9 @@ sliding window).
   Accessible derivations of the CA/GOCA/SOCA/OS threshold factors with the
   primary-source trail (Hansen 1973 for GO; Weiss 1982 for SO/GO; Rohling 1983
   for OS), including the closed-form OS-CFAR P_FA product the repo's
-  `pfa_os()` implements. Notes that ranks near 3N/4–4N/5 are recommended —
-  worth comparing against the repo's default `rank: 10` of `Ntc: 40` (N/4)
-  when tuning.
+  `pfa_os()` implements. Notes that ranks near 3N/4–4N/5 are recommended,
+  which the shipped `rank: 30` of `Ntc: 40` now follows (see the resolved
+  open question below and `SONAR_FRONTEND_REVIEW.md` §3).
 
 ## 3. Scan matching: ICP, libpointmatcher, and ICP covariance
 
@@ -133,16 +133,16 @@ and `Slam::compute_icp_with_cov` in `src/core/slam_core.cpp`.
 - **A. Censi, "An accurate closed-form estimate of ICP's covariance,"
   ICRA 2007, pp. 3167–3172.** DOI: 10.1109/ROBOT.2007.363961
   The canonical closed-form ICP covariance estimator (Hessian of the
-  registration error, correlated correspondences). **Implemented as an opt-in
-  alternative** in `src/core/icp_covariance.cpp` (`censi_icp_covariance`) and
-  wired into the scan matchers via `ssm/cov_method: censi` / `nssm/cov_method:
-  censi` — one ICP plus the closed form instead of `cov_samples` ICP runs +
-  FAST-MCD (`compute_icp_with_cov` + `mcd.cpp`). Under an isotropic,
-  independent per-point noise model the estimate reduces to
+  registration error, correlated correspondences). The original
+  point-to-point helper remains in `src/core/icp_covariance.cpp`
+  (`censi_icp_covariance`) as reference math. Under an isotropic, independent
+  per-point noise model that estimate reduces to
   `cov = 2·σ²·(Σ Jᵢᵀ Jᵢ)⁻¹`, validated by Monte Carlo (predicted vs. empirical
-  spread agree to ~1.5%). The default remains `cov_method: sampled`, so shipped
-  configs are byte-for-byte unchanged; the FAST-MCD path stays the parity
-  reference.
+  spread agree to ~1.5%). It is no longer runtime-selectable: the shipped ICP
+  now uses a point-to-plane objective, and mixing it with this point-to-point
+  Hessian would attach invalid confidence to graph factors. `Slam::configure`
+  rejects `cov_method: censi`; sampled + FAST-MCD is the runtime path until a
+  covariance implementation consumes the same normals and objective.
 
 - **F. Pomerleau, F. Colas, R. Siegwart, "A Review of Point Cloud Registration
   Algorithms for Mobile Robotics," Foundations and Trends in Robotics, 2015.**
@@ -298,35 +298,36 @@ The research surfaced mostly **citations** (the bibliography above) plus a few
 behavioral parity with `bruce_slam`, extensions are added opt-in (default
 config → unchanged behavior) and only when their correctness can be validated.
 
-**Implemented (opt-in, parity-preserving):**
+**Retained as reference math, disabled at runtime:**
 
 - **Censi closed-form ICP covariance** (§3) — `src/core/icp_covariance.cpp`,
-  selectable via `ssm/cov_method` / `nssm/cov_method: censi`. Replaces up to
-  `cov_samples` ICP registrations + FAST-MCD with a single ICP + closed form.
-  The covariance formula is Monte-Carlo validated
+  contains the earlier point-to-point closed form. The covariance formula is
+  Monte-Carlo validated
   (`test/censi_covariance_test.cpp`; predicted vs. empirical spread within
-  ~1.5%). Default stays `sampled`, so shipped configs are unaffected.
+  ~1.5%), but this validates only the isolated known-correspondence math.
 
-  **Verified against the real stack** (ROS 2 Jazzy + GTSAM 4.2 +
-  libpointmatcher 1.4): `sonar_slam_core` — including this integration in
-  `slam_core.cpp` — compiles and links, and driving the real `Slam` class end
-  to end (real ISAM2 back-end, real libpointmatcher ICP) with
-  `cov_method: censi` accepts an SSM factor and yields a finite, positive
-  definite marginal covariance, matching the `sampled` path. On a
-  sparse/noisy scene the Censi covariance correctly exceeds the fixed
-  `icp_odom_sigmas` floor and drives the factor weight. All four CUDA kernels
-  additionally compile under `nvcc` 12 / `sm_86`. Not exercised here: live GPU
-  kernel execution (needs a device) and the ROS node layer (needs the vendor
-  driver-message packages).
+  An older integration check showed that the point-to-point implementation
+  produced finite graph marginals, but that does not validate it against the
+  current point-to-plane error minimizer. `Slam::configure` now rejects the
+  mode. Re-enabling it requires a point-to-plane covariance implementation and
+  an end-to-end degeneracy test using the configured surface normals.
 
 **Documented, not changed (would break `bruce_slam` parity):**
 
-- **OS-CFAR rank** (§2) — the literature favours k ≈ 3N/4–4N/5, whereas the
-  shipped `feature.yaml` uses `rank: 10` with `Ntc: 40` (N/4), inherited
-  verbatim from `bruce_slam`. Left as-is to preserve tuning parity; the value
-  is already a config knob (`CFAR/rank`) for anyone who wants to follow the
-  guidance. The code's negative-`rank` fallback stays at N/2 to match
-  `CFAR.py`'s `rank=None`.
+- **OS-CFAR rank** (§2) — the literature favours k ≈ 3N/4–4N/5, whereas
+  `bruce_slam` used `rank: 10` with `Ntc: 40` (N/4). This was left at the
+  inherited value for tuning parity, then **changed to `rank: 30` on
+  2026-07-26** once measurement showed the inherited value costs accuracy on
+  uint8 input (below). `alg: OS` is the only consumer and the shipped default
+  is `SOCA`, so parity of the default path is untouched. The code's
+  negative-`rank` fallback stays at N/2 to match `CFAR.py`'s `rank=None`.
+  **RESOLVED 2026-07-26** by measurement, see `SONAR_FRONTEND_REVIEW.md` §3:
+  on uint8 input `rank: 10` realizes 13% more false alarms than nominal while
+  Rohling's 3N/4 (`rank: 30`) tracks it to 0.4%, because the low-rank
+  statistic is a single-digit integer that the large τ then amplifies. The
+  recommendation is now to set `rank: 30` whenever `alg: OS` is selected;
+  parity is preserved for the shipped `alg: 'SOCA'` default, which never
+  reads it.
 
 **Deferred (new algorithms; correctness not verifiable in this environment):**
 

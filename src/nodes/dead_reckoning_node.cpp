@@ -327,9 +327,26 @@ private:
     // coast bookkeeping: a real pair re-anchors everything
     last_pair_arrival_ = now();
     if (prev_time_) {
-      const double dt = to_sec(dvl_time) - to_sec(*prev_time_);
-      if (dt > 0.0 && dt < 5.0)
-        dvl_period_ema_ = 0.9 * dvl_period_ema_ + 0.1 * dt;
+      const double dt0 = to_sec(dvl_time) - to_sec(*prev_time_);
+      if (dt0 > 0.0 && dt0 < 5.0)
+        dvl_period_ema_ = 0.9 * dvl_period_ema_ + 0.1 * dt0;
+      // ABSORB any pair at/behind the integrated-to time (small negative dt):
+      // the coast runs ahead on the attitude stream and sync delay can
+      // deliver SEVERAL such pairs after an outage; rewinding prev_time_
+      // would double-integrate the window, count fake gap events, and
+      // publish backwards stamps. Refresh velocity/attitude/depth and keep
+      // the clock. The reacquisition ping is exactly the one the spike gate
+      // exists for, so never absorb a garbage velocity. Large negative
+      // jumps (a bag rewind) still take the gap-gate reset below.
+      if (dt0 <= 0.0 && dt0 > -5.0) {
+        if (vel.cwiseAbs().maxCoeff() <= dvl_max_velocity_) prev_vel_ = vel;
+        if (pose_)
+          pose_ =
+            gtsam::Pose3(rot, gtsam::Point3(pose_->x(), pose_->y(), depth));
+        coast_elapsed_ = 0.0;
+        coasting_ = false;
+        return;
+      }
     }
     coast_elapsed_ = 0.0;
     coasting_ = false;
@@ -459,18 +476,13 @@ private:
     }
     if (since_pair < std::max(0.3, 2.5 * dvl_period_ema_)) return;
 
-    // data-domain dt from the attitude stream (falls back to a nominal tick
-    // in the DVL+depth-only mode, which has no attitude stream)
-    double stamp_s;
-    builtin_interfaces::msg::Time stamp;
-    if (last_att_stamp_) {
-      stamp = *last_att_stamp_;
-      stamp_s = to_sec(stamp);
-    } else {
-      stamp = now();
-      stamp_s = to_sec(stamp);
-    }
-    const double dt = stamp_s - to_sec(*prev_time_);
+    // data-domain dt from the attitude stream. The DVL+depth-only mode has
+    // no attitude stream to stamp from — differencing now() (node clock)
+    // against a sensor stamp would inject any driver clock offset into the
+    // first coast step, so that mode simply does not coast.
+    if (!last_att_stamp_) return;
+    const builtin_interfaces::msg::Time stamp = *last_att_stamp_;
+    const double dt = to_sec(stamp) - to_sec(*prev_time_);
     if (dt <= 0.0) return;
     if (coast_elapsed_ + dt > dvl_coast_) {
       RCLCPP_WARN_THROTTLE(
@@ -634,8 +646,5 @@ private:
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::DeadReckoningNode>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::DeadReckoningNode>(argc, argv);
 }

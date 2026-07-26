@@ -41,7 +41,7 @@ public:
 
   double point_resolution = 0.5;  // downsampling for ICP / publishing
   double point_noise = 0.5;       // noise radius in overlap estimation
-  // per-point sonar coordinate noise std (m) for the Censi covariance path
+  // Reserved by the disabled point-to-point Censi reference implementation.
   double censi_sensor_noise = 0.1;
   // run the sampled-covariance registrations (cov_samples per scan match)
   // across an OpenMP per-thread ICP engine pool instead of one core
@@ -63,6 +63,12 @@ public:
   // beyond compass noise are bogus by construction in this anchored frame.
   double nssm_max_sigma = 0.5;       // max sqrt(largest translation eigenvalue), m
   double nssm_max_anisotropy = 8.0;  // max sigma_max / sigma_min
+  // Evaluate the degeneracy gate on the PRE-floor covariance (opt-in). The
+  // per-eigenvalue floor in compute_icp_with_cov raises the collapsed axis up to
+  // the ICP-model sigma before this gate reads it, capping observable anisotropy
+  // and letting elongated wall-slide covariances pass. True => gate on the raw
+  // (pre-floor) covariance so the elongation the gate exists to catch survives.
+  bool nssm_degeneracy_prefloor = false;
   // Robust kernel on loop factors. Default OFF: DCS scales a factor's weight
   // by 2*phi/(phi+chi2), and a GENUINE closure correcting drift D with ICP
   // sigma s starts at chi2=(D/s)^2 — for D=1 m, s=5 cm that is 400, i.e. 0.5%
@@ -90,18 +96,33 @@ public:
   // Neither max_rotation (ICP-vs-Sobol refinement only) nor the covariance
   // gate (catches sliding, not confident-but-wrong locks) covers this mode.
   double nssm_max_yaw_vs_compass = 0.15;  // rad (~8.6°, > compass noise)
+  // OPTIONAL absolute TRANSLATION gate — the x/y analog of the yaw gate
+  // above, for parallel-wall translational aliasing on symmetric venues. When
+  // >0, it clamps the Sobol init search and rejects a final ICP relative pose
+  // outside the same radius from DR. The final check matters because ICP can
+  // otherwise walk from a bounded seed into a distant alias basin. Set just
+  // above the real revisit-drift scale. 0 disables both checks.
+  double nssm_max_translation_vs_dr = 0.0;  // m; 0 disables
   // optimize-then-verify (rtabmap RGBD/OptimizeMaxError analog): after a
   // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
   // under this bound or the loops are rolled back (see update_factor_graph)
   double post_loop_max_yaw_rms = 0.15;  // rad
-  // post-loop CHAIN-TEAR check: max allowed |optimized - DR| consecutive
-  // keyframe separation (m). Parallel-wall translational aliases pass every
-  // per-closure gate (compass agrees between parallel walls, wall-to-wall
-  // locks are compact, mutually-consistent aliases satisfy PCM) — but to
-  // win they must stretch weak sequential links by many meters. DR is
-  // drift-free over one ~0.75 m keyframe interval, so a large tear is
-  // unambiguous. 0 disables.
-  double post_loop_max_translation_err = 1.0;  // m
+  // Post-loop CHAIN-TEAR check, in SIGMA of the link's own noise model
+  // (rtabmap RGBD/OptimizeMaxError, Graph.cpp computeMaxGraphErrors; its
+  // default is 3.0). Parallel-wall translational aliases pass every
+  // per-closure gate — compass agrees between parallel walls, wall-to-wall
+  // locks are compact, mutually-consistent aliases satisfy PCM — but to win
+  // they must stretch consecutive links well beyond what those links'
+  // factors claimed.
+  //
+  // Replaced an ABSOLUTE metre bound (post_loop_max_translation_err) on
+  // 2026-07-25. The absolute form judged every link against one number
+  // regardless of how far it spanned, so a link bridging a long DR-only gap
+  // (the whole head-pitch-gated head sweep, during which no keyframe is
+  // created) read as a tear purely for being long. Normalising by the link's
+  // own sigma — which now scales with span, see add_odometry — removes that.
+  // 0 disables.
+  double post_loop_max_link_error_sigma = 3.0;  // sigma
 
   OculusProperty oculus;
 
@@ -138,6 +159,12 @@ public:
   int last_pcm_edges = 0;
   // loop rounds reverted by the post-loop verification (diagnostics)
   int nssm_reverted = 0;
+  // per-callback diagnostic: for each loop-closure factor inserted this round,
+  // its ICP-vs-DR correction geometry (keys + trans m / yaw rad). Distinguishes
+  // a legit drift fix (small trans, ~0 yaw) from a parallel-wall alias (large
+  // trans and/or non-zero yaw) when the round is later reverted. Cleared at the
+  // top of every add_nonsequential_scan_matching call; the node logs it.
+  std::vector<std::string> last_nssm_inserted_geom;
   // operator hand-corrections applied / undone over the run (diagnostics)
   int manual_corrections_applied = 0;
   int manual_corrections_undone = 0;
@@ -218,6 +245,7 @@ public:
     std::string message;
     gtsam::Pose2 odom;
     Eigen::Matrix3d cov;
+    Eigen::Matrix3d cov_raw = Eigen::Matrix3d::Zero();  // pre-floor (degeneracy gate)
     int n_samples = 0;
   };
   IcpCovResult compute_icp_with_cov(const Matrix& source_points,
@@ -246,14 +274,52 @@ private:
   gtsam::SharedNoiseModel create_noise_model(const Eigen::Vector3d& sigmas) const;
   gtsam::SharedNoiseModel create_full_noise_model(const Eigen::Matrix3d& cov) const;
 
+  // Odometry noise model scaled to the link's ACTUAL span. odom_sigmas
+  // describes one nominal keyframe step (keyframe_translation /
+  // keyframe_rotation); a link bridging a long DR-only gap accumulates
+  // proportionally more drift and must not be weighted as a nominal step.
+  // Mirrors the inflation publish_pose already applies to the PUBLISHED
+  // covariance. Scale is floored at 1 — never MORE confident than configured.
+  gtsam::SharedNoiseModel scaled_odom_model(const gtsam::Pose2& delta,
+                                            double& trans_sigma,
+                                            double& rot_sigma) const;
+
+  void record_consecutive_link(int key, const gtsam::Pose2& measured,
+                               double trans_sigma, double rot_sigma);
+
+  // True when both keyframes' dr_pose values were produced by the SAME
+  // dead-reckoning epoch, i.e. they are differenceable. A loaded map's
+  // keyframes carry the dr_pose they were serialized with in a PREVIOUS
+  // mission; this session's keyframes start from this mission's DR origin.
+  // Within either group `between` is meaningful; across the boundary it is
+  // an arbitrary offset. (loaded_key_count_ == 0 => one epoch, always true.)
+  bool same_dr_epoch(int key_a, int key_b) const;
+
+  // Predicted target->source relative pose used by the loop-closure
+  // consistency gates.
+  //
+  // Dead reckoning is the preferred predictor because it is INDEPENDENT of
+  // the pose graph: a graph already bent by an earlier bad closure cannot
+  // then excuse the next one. Across a map-load boundary DR cannot supply it
+  // (see same_dr_epoch), so the graph estimate does — after relocalization
+  // that IS the common frame tying the loaded chain to this session, and it
+  // is the same reference the Sobol init bounds are already centred on.
+  // dr_backed reports which was used, for the gate's diagnostic text.
+  gtsam::Pose2 predicted_relative_pose(int target_key, int source_key,
+                                       bool* dr_backed = nullptr) const;
+
   // failure recovery for update_factor_graph: undo loop-closure bookkeeping
   // written before a failed solve, and reconstruct ISAM2 from the committed
   // factor mirror (a thrown ISAM2::update leaves the estimator in an
   // undefined, partially-mutated state — GTSAM gives no exception guarantee)
-  // quarantine=true additionally marks the rolled-back loops rejected (a
-  // verification revert: the clique is demonstrably bad); false leaves them
-  // eligible for retry (a solver failure says nothing about the loops)
-  void rollback_pending_loops(bool quarantine);
+  // quarantine=true additionally marks rolled-back loops rejected (a
+  // verification revert); false leaves them eligible for retry (a solver
+  // failure says nothing about the loops).
+  // culprit_link >= 0 narrows the quarantine to the closures SPANNING that
+  // consecutive link — the chain-tear check names one, and only closures
+  // crossing it can have stretched it, so the rest of the round stays
+  // eligible. -1 convicts the whole round (the yaw check is global).
+  void rollback_pending_loops(bool quarantine, long culprit_link = -1);
   void rebuild_isam();
 
   gtsam::ISAM2 isam_;
@@ -273,6 +339,32 @@ private:
   // of FAILED rounds, which are never recorded here, and undo removal
   // null-holes the graph in place instead of shifting indices.
   std::vector<std::size_t> manual_prior_indices_;
+  // per-link tear RATIO recorded when the link first exceeded the chain-tear
+  // bound after an accepted correction round (-1 = under bound); the growth
+  // gate judges against this persistent baseline (see update_factor_graph).
+  // Still required after the switch to a sigma ratio: normalising fixes
+  // long-link false positives, but NOT latching — a link legitimately
+  // stretched past the bound by an accepted USBL/manual fix would otherwise
+  // veto every later round forever, and repeated sub-gate aliases could
+  // ratchet the graph a fraction of the bound at a time.
+  std::vector<double> tear_baseline_;
+
+  // What the factor between keyframes k-1 and k actually MEASURED, indexed
+  // by k (index 0 unused; invalid entries are skipped). The post-loop check
+  // judges the optimized relative pose against this — rtabmap
+  // Graph.cpp:computeMaxGraphErrors compares against the link transform —
+  // rather than against dead reckoning. DR is only the measurement for
+  // add_odometry links; an SSM-accepted link measures ICP, so a DR
+  // comparison charges a healthy graph a standing offset for agreeing with
+  // the very factor it was given (bounded by ssm/max_translation).
+  struct ConsecutiveLink
+  {
+    bool valid = false;
+    gtsam::Pose2 measured;      // (k-1) -> k, as the factor measured it
+    double trans_sigma = 1.0;   // m
+    double rot_sigma = 1.0;     // rad
+  };
+  std::vector<ConsecutiveLink> consecutive_links_;
   // map persistence / relocalization state (see load_map)
   int loaded_key_count_ = 0;
   bool awaiting_relocalization_ = false;

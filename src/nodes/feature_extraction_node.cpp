@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -34,7 +35,7 @@ namespace {
 // Map-stream cloud: 6 float fields packed in the PointXYZI 32-byte stride
 // (x@0 y@4 z@8 intensity@16 range@20 incidence@24). MUST stay byte-identical
 // to sonar_proc's map_points layout — the Accumulator's field-validating
-// concatenate is the enforcement point (SURVEY_RADIOMETRICS_PLAN.md).
+// concatenate is the enforcement point.
 // Features carry no incidence estimate -> -1 (unknown).
 sensor_msgs::msg::PointCloud2 make_map_cloud(const Matrix& xyz,
                                              const Eigen::VectorXf& intens,
@@ -87,6 +88,8 @@ public:
 
     // Live tuning at sea: the CFAR/filter knobs are dynamic —
     //   ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005
+    // (both launch files put this node at /bruce/slam/feature_extraction;
+    // run it bare with `ros2 run` and it is just /feature_extraction_node)
     // rebuilds the detector for the next ping, no relaunch. Safe under the
     // default single-threaded executor (the swap and detect() serialize).
     param_cb_ = add_on_set_parameters_callback(
@@ -98,34 +101,70 @@ public:
                    ? static_cast<double>(p.as_int())
                    : p.as_double();
         };
+        // stage into locals and commit ONLY after the CFAR constructor
+        // accepts them — a rejected set must not poison the cached values
+        // (rclcpp keeps the old parameter, so the members must match it)
+        int ntc = ntc_, ngc = ngc_, rank = rank_, threshold = threshold_;
+        double pfa = pfa_;
+        CFAR::Alg alg = alg_;
+        // stage the filter.* knobs too — same rule: a rejected set (any
+        // parameter in the same request) must not leave a member mutated
+        // while rclcpp keeps the old value
+        double resolution = resolution_, radius = outlier_filter_radius_;
+        int min_points = outlier_filter_min_points_, skip = skip_;
+        double min_range = feature_min_range_, max_range = feature_max_range_;
         bool rebuild = false;
         try {
           for (const auto& p : params) {
             const std::string& n = p.get_name();
             if (n == "CFAR.Ntc") {
-              ntc_ = static_cast<int>(as_num(p));
+              ntc = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.Ngc") {
-              ngc_ = static_cast<int>(as_num(p));
+              ngc = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.Pfa") {
-              pfa_ = as_num(p);
+              pfa = as_num(p);
               rebuild = true;
             } else if (n == "CFAR.rank") {
-              rank_ = static_cast<int>(as_num(p));
+              rank = static_cast<int>(as_num(p));
               rebuild = true;
             } else if (n == "CFAR.alg") {
-              alg_ = CFAR::alg_from_string(p.as_string());
+              alg = CFAR::alg_from_string(p.as_string());
             } else if (n == "filter.threshold") {
-              threshold_ = static_cast<int>(as_num(p));
+              threshold = static_cast<int>(as_num(p));
+            } else if (n == "filter.resolution") {
+              resolution = as_num(p);
+            } else if (n == "filter.radius") {
+              radius = as_num(p);
+            } else if (n == "filter.min_points") {
+              min_points = static_cast<int>(as_num(p));
+            } else if (n == "filter.skip") {
+              skip = static_cast<int>(as_num(p));
+            } else if (n == "filter.min_range") {
+              min_range = as_num(p);
+            } else if (n == "filter.max_range") {
+              max_range = as_num(p);
             }
           }
-          if (rebuild) {
-            detector_ = std::make_unique<CFAR>(ntc_, ngc_, pfa_, rank_);
+          if (rebuild)
+            detector_ = std::make_unique<CFAR>(ntc, ngc, pfa, rank);
+          ntc_ = ntc;
+          ngc_ = ngc;
+          pfa_ = pfa;
+          rank_ = rank;
+          alg_ = alg;
+          threshold_ = threshold;
+          resolution_ = resolution;
+          outlier_filter_radius_ = radius;
+          outlier_filter_min_points_ = min_points;
+          skip_ = skip;
+          feature_min_range_ = min_range;
+          feature_max_range_ = max_range;
+          if (rebuild)
             RCLCPP_INFO(get_logger(),
                         "CFAR rebuilt: Ntc %d, Ngc %d, Pfa %g, rank %d",
                         ntc_, ngc_, pfa_, rank_);
-          }
         } catch (const std::exception& e) {
           result.successful = false;
           result.reason = e.what();
@@ -138,6 +177,9 @@ public:
     outlier_filter_radius_ = get_double("filter/radius");
     outlier_filter_min_points_ = get_int("filter/min_points");
     skip_ = get_int("filter/skip");
+    extract_polar_ = get_bool("filter/extract_polar", true);
+    feature_min_range_ = get_double("filter/min_range", 0.0);
+    feature_max_range_ = get_double("filter/max_range", 0.0);
 
     compressed_images_ = get_bool("compressed_images");
 
@@ -162,6 +204,8 @@ public:
 
     feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       SONAR_FEATURE_TOPIC, 10);
+    slam_feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      SONAR_SLAM_FEATURE_TOPIC, 10);
     feature_img_pub_ = create_publisher<sensor_msgs::msg::Image>(
       SONAR_FEATURE_IMG_TOPIC, 10);
 
@@ -176,7 +220,7 @@ public:
         create_publisher<sensor_msgs::msg::PointCloud2>(map_topic, 10);
     // residual TVG for the map stream (identity at 0) — keep these equal to
     // sonar_proc's values so the union's two intensity sources stay on one
-    // radiometric scale (SURVEY_RADIOMETRICS_PLAN.md)
+    // radiometric scale
     tvg_spread_db_ = get_double("tvg_spread_db", 0.0);
     tvg_absorption_db_per_m_ = get_double("tvg_absorption_db_per_m", 0.0);
 
@@ -195,12 +239,13 @@ public:
     // bright curved band whose planar (x,y) projection registers against
     // real walls from other frames and pulls the graph (the observed "bad
     // SLAM corrections"), and whose features stamp curved bands into the
-    // mapping tiles. Skip feature frames when |head pitch| exceeds this
-    // bound (rad; 0 disables the gate). The NaN sentinel keeps the SLAM
-    // synchronizer advancing; dead-reckoning odometry factors carry the
-    // graph between level frames, and the sweep frames still feed the map
-    // through sonar_proc's candidates/dense streams (which place them with
-    // the floor/wall projections).
+    // mapping tiles. Evaluate the sonar head relative to base_link: vehicle
+    // attitude is already represented by the robot pose and must not turn a
+    // normal pitched operating pose into a rejected scan. The configured
+    // bound must sit above the platform's normal head tilt but below its
+    // extreme sweep. The real 3D cloud/image always publish for operators;
+    // only SONAR_SLAM_FEATURE_TOPIC and the CFAR map contribution are gated.
+    // The NaN sentinel keeps SLAM/mapping synchronizers advancing.
     max_head_pitch_ = get_double("max_head_pitch", 0.0);
 
     apply_head_tilt_ = get_bool("apply_head_tilt", true);
@@ -268,6 +313,31 @@ private:
   }
 
   // build (or refresh) the polar -> Cartesian maps when geometry changes
+  // Nearest beam column to `bearing`. bearings_ is strictly monotonic — the
+  // adapters verify that on the first ping — so a binary search is valid;
+  // pick whichever neighbour is closer. Returns 0 for an empty table.
+  int beam_index(double bearing) const
+  {
+    if (bearings_.empty()) return 0;
+    const bool ascending = bearings_.back() >= bearings_.front();
+    std::size_t lo;
+    if (ascending) {
+      lo = static_cast<std::size_t>(
+        std::lower_bound(bearings_.begin(), bearings_.end(),
+                         static_cast<float>(bearing)) - bearings_.begin());
+    } else {
+      lo = static_cast<std::size_t>(
+        std::lower_bound(bearings_.begin(), bearings_.end(),
+                         static_cast<float>(bearing),
+                         std::greater<float>()) - bearings_.begin());
+    }
+    if (lo == 0) return 0;
+    if (lo >= bearings_.size()) return static_cast<int>(bearings_.size()) - 1;
+    const double d_hi = std::abs(bearings_[lo] - bearing);
+    const double d_lo = std::abs(bearings_[lo - 1] - bearing);
+    return static_cast<int>(d_lo <= d_hi ? lo - 1 : lo);
+  }
+
   void generate_map_xy(const SonarPing& ping)
   {
     const double res = ping.range_resolution;
@@ -329,10 +399,31 @@ private:
     bearings_ = ping.bearings;
     // new maps -> new version so the GPU remap re-uploads its cached copy
     ++map_version_;
+
+    // Report the blanking the CFAR window imposes for THIS geometry. It is a
+    // side effect of the sliding window (detect_cpu skips the first and last
+    // border rows), not a deliberate exclusion, and it moves whenever Ntc/Ngc
+    // change — so an operator setting filter/min_range against wake or
+    // filter/max_range against multipath needs to see where it already sits,
+    // and that a configured max_range above the reported usable range does
+    // nothing.
+    const double blank = (ntc_ / 2 + ngc_ / 2) * res;
+    // bind the temporary: a `(... + " m").c_str()` inline in a logging macro
+    // hands the sink a pointer into a string that may already be gone
+    const std::string max_txt = feature_max_range_ > 0.0
+                                  ? std::to_string(feature_max_range_) + " m"
+                                  : std::string("off");
+    RCLCPP_INFO(get_logger(),
+                "sonar geometry: %d bins x %zu beams @ %.3f m; CFAR window "
+                "blanks the inner %.2f m and the outer %.2f m (usable %.2f-"
+                "%.2f m). filter/min_range %.2f m, max_range %s",
+                ping.num_ranges, ping.bearings.size(), res, blank, blank,
+                range_min + blank, range_min + rows * res - blank,
+                feature_min_range_, max_txt.c_str());
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
-                        const Matrix& points, float phi)
+                        const Matrix& points, float phi, bool slam_eligible)
   {
     // Publish honest planar base_link coordinates: [x, y, 0]. The python
     // original packed the lateral coordinate into z ([x, 0, y] — a leftover
@@ -358,10 +449,22 @@ private:
     msg.header.frame_id = "base_link";
     feature_pub_->publish(msg);
 
+    if (slam_eligible) {
+      slam_feature_pub_->publish(msg);
+    } else {
+      Matrix sentinel_xyz(1, 3);
+      sentinel_xyz.setConstant(std::numeric_limits<float>::quiet_NaN());
+      auto sentinel = make_cloud_xyz(sentinel_xyz);
+      sentinel.header = msg.header;
+      slam_feature_pub_->publish(sentinel);
+    }
+
     // union map stream (see constructor): skip the NaN skip-frame sentinel
-    // (a sync signal for the slam node, poison for map consumers) and empty
-    // frames (they only flood the chain/assembler with no-data warnings)
-    if (map_points_pub_ && xyz.rows() > 0 && !std::isnan(xyz(0, 0))) {
+    // (a sync signal for the slam node, poison for map consumers), gated
+    // floor-dominated frames, and empty frames (they only flood the
+    // chain/assembler with no-data warnings)
+    if (map_points_pub_ && slam_eligible && xyz.rows() > 0 &&
+        !std::isnan(xyz(0, 0))) {
       // real echo intensity (0..1): invert the extraction pixel->meters
       // mapping back into this ping's remapped grayscale. points col0 =
       // forward (rows axis), col1 = lateral (cols axis), pre-tilt — their
@@ -370,15 +473,29 @@ private:
       Eigen::VectorXf ranges = Eigen::VectorXf::Zero(points.rows());
       for (long r = 0; r < points.rows(); ++r)
         ranges(r) = std::hypot(points(r, 0), points(r, 1));
-      if (!cart_gray_.empty() && rows_ > 0 && height_ > 0 && width_ > 0) {
+      // In polar-extraction mode invert straight back to (range, bearing) and
+      // read the ORIGINAL polar echo — no resampling on either leg. The
+      // Cartesian branch keeps the legacy grayscale-remap lookup.
+      const bool polar_lookup = !polar_gray_.empty() && res_ > 0.0 &&
+                                !bearings_.empty();
+      if (polar_lookup || (!cart_gray_.empty() && rows_ > 0 && height_ > 0 &&
+                           width_ > 0)) {
         for (long r = 0; r < points.rows(); ++r) {
-          const int row = static_cast<int>(
-            std::lround((1.0 - points(r, 0) / height_) * rows_));
-          const int col = static_cast<int>(
-            std::lround(cols_ / 2.0 - points(r, 1) * cols_ / width_));
-          if (row >= 0 && row < cart_gray_.rows && col >= 0 &&
-              col < cart_gray_.cols)
-            intens(r) = cart_gray_.at<std::uint8_t>(row, col) / 255.0f;
+          int row, col;
+          if (polar_lookup) {
+            // lateral axis is negated on the way out (see the extractor)
+            const double bearing = std::atan2(-points(r, 1), points(r, 0));
+            row = static_cast<int>(std::lround((ranges(r) - range_min_) / res_));
+            col = beam_index(bearing);
+          } else {
+            row = static_cast<int>(
+              std::lround((1.0 - points(r, 0) / height_) * rows_));
+            col = static_cast<int>(
+              std::lround(cols_ / 2.0 - points(r, 1) * cols_ / width_));
+          }
+          const cv::Mat& gray = polar_lookup ? polar_gray_ : cart_gray_;
+          if (row >= 0 && row < gray.rows && col >= 0 && col < gray.cols)
+            intens(r) = gray.at<std::uint8_t>(row, col) / 255.0f;
           // residual TVG (dB; identity when both coefficients are 0) — must
           // match sonar_proc's mapIntensity so the union stays on one scale
           if (ranges(r) > 1e-3f &&
@@ -427,26 +544,35 @@ private:
     // the SLAM node's time synchronizer keeps advancing
     ++frame_count_;
     const int ping_id = ping.ping_id != 0 ? ping.ping_id : frame_count_;
-    // head pitch AT THE PING STAMP (interpolated), used by both the frame
-    // gate and the published fan's z-fold
+    // Head pitch AT THE PING STAMP (interpolated) both places the real feature
+    // fan in base_link and determines admission to the planar consumers.
+    const int64_t ping_stamp_ns = rclcpp::Time(ping.stamp).nanoseconds();
     const float phi = apply_head_tilt_
-      ? tilt_at(rclcpp::Time(ping.stamp).nanoseconds()) : 0.0f;
+      ? tilt_at(ping_stamp_ns) : 0.0f;
     if (skip_ > 0 && ping_id % skip_ != 0) {
       Matrix nan(1, 2);
       nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan, phi);
+      publish_features(ping.stamp, nan, phi, false);
       return;
     }
 
-    // head-pitch frame gate (see constructor): swept frames are floor- or
-    // surface-dominated — poison for the planar registration and the tiles
-    if (max_head_pitch_ > 0.0 &&
-        std::fabs(phi) > static_cast<float>(max_head_pitch_)) {
-      Matrix nan(1, 2);
-      nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan, phi);
-      return;
+    const bool slam_eligible =
+      max_head_pitch_ <= 0.0 ||
+      std::fabs(phi) <= static_cast<float>(max_head_pitch_);
+    if (!slam_eligible && !gate_active_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Planar-SLAM feature gate active: head pitch %.1f deg exceeds "
+        "%.1f deg (3D feature visualization remains live)",
+        phi * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
+    } else if (slam_eligible && gate_active_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Planar-SLAM feature gate cleared: head pitch %.1f deg is within "
+        "%.1f deg",
+        phi * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
     }
+    gate_active_ = !slam_eligible;
 
     // a malformed adapter frame (empty / zero-range image) must not throw out
     // of the callback and terminate the node
@@ -495,26 +621,99 @@ private:
           *cv_bridge::CvImage(header, "bgr8", vis).toImageMsg());
       }
 
-      // to Cartesian — nearest-neighbour for the binary mask
-      const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
+      Matrix points;
+      if (extract_polar_ && !bearings_.empty() && res_ > 0.0) {
+        // Extract in POLAR and convert exactly (docs/SONAR_FRONTEND_REVIEW.md
+        // §5). The legacy path below remaps the binary mask to Cartesian FIRST
+        // and reads pixel indices out of it, which makes a detection survive
+        // only if some destination pixel happens to sample its polar cell.
+        // Inside the range where beam arc spacing is finer than the Cartesian
+        // cell — 6.8 m for an Oculus at 0.03 m, 9.4 m for the Revolution
+        // preset — cells compete for pixels and lose: 68.7% and 73.9% of
+        // near-field cells respectively are unreachable, and the survivors
+        // come out snapped to the Cartesian grid. Reading the polar mask
+        // directly has neither problem, and is CHEAPER (no mask remap at all;
+        // the Cartesian remap survives only for the feature_img
+        // visualization, which is already subscription-gated).
+        //
+        // Convention matches generate_map_xy exactly so the cloud keeps its
+        // orientation: that map places Cartesian (r,c) at forward
+        // res*(rows-r), lateral res*(-cols/2+c+0.5), and reads polar row
+        // (range-range_min)/res at bearing atan2(lateral, forward). Inverting
+        // it, polar cell (row, beam) is at range = range_min + row*res on
+        // bearing bearings_[beam] — and the legacy conversion negates the
+        // lateral axis, which is preserved here.
+        std::vector<cv::Point> locs;  // x = beam column, y = range bin
+        cv::findNonZero(peaks, locs);
+        points.resize(static_cast<long>(locs.size()), 2);
+        for (std::size_t i = 0; i < locs.size(); ++i) {
+          const int beam = locs[i].x;
+          const double range = range_min_ + locs[i].y * res_;
+          const double bearing = bearings_[static_cast<std::size_t>(beam)];
+          points(static_cast<long>(i), 0) =
+            static_cast<float>(range * std::cos(bearing));
+          points(static_cast<long>(i), 1) =
+            static_cast<float>(-range * std::sin(bearing));
+        }
+        // polar echo image for the map stream's per-point intensity; the
+        // lookup inverts to (range, bearing) rather than to a Cartesian pixel
+        if (map_points_pub_) polar_gray_ = img.clone();
+      } else {
+        // Legacy path: remap the mask to Cartesian, then read pixel indices.
+        // Kept behind filter/extract_polar for a one-line revert if a bag
+        // replay disagrees with the change above.
+        const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
 
-      // grayscale echo image for the map stream's per-point intensity
-      // (looked up at publish time, after downsample/outlier filtering)
-      if (map_points_pub_)
-        cart_gray_ = remap_u8(img, /*interp=*/1);
+        // grayscale echo image for the map stream's per-point intensity
+        // (looked up at publish time, after downsample/outlier filtering)
+        if (map_points_pub_) cart_gray_ = remap_u8(img, /*interp=*/1);
 
-      std::vector<cv::Point> locs;
-      cv::findNonZero(cart_peaks, locs);
+        std::vector<cv::Point> locs;
+        cv::findNonZero(cart_peaks, locs);
 
-      // image coordinates -> meters (feature_extraction.py lines 254-258)
-      Matrix points(static_cast<long>(locs.size()), 2);
-      for (std::size_t i = 0; i < locs.size(); ++i) {
-        double x = locs[i].x - cols_ / 2.0;
-        x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
-        const double y =
-          -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
-        points(static_cast<long>(i), 0) = static_cast<float>(y);
-        points(static_cast<long>(i), 1) = static_cast<float>(x);
+        // image coordinates -> meters (feature_extraction.py lines 254-258)
+        points.resize(static_cast<long>(locs.size()), 2);
+        for (std::size_t i = 0; i < locs.size(); ++i) {
+          double x = locs[i].x - cols_ / 2.0;
+          x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
+          const double y =
+            -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
+          points(static_cast<long>(i), 0) = static_cast<float>(y);
+          points(static_cast<long>(i), 1) = static_cast<float>(x);
+        }
+      }
+
+      // Explicit range gate, in METRES, applied to whichever extractor ran.
+      //
+      // The CFAR window already blanks the innermost and outermost `Ntc/2 +
+      // Ngc/2` range bins (detect_cpu iterates [border, rows-border)) — 2.08 m
+      // for the Revolution preset, 0.75 m for an Oculus at 0.03 m — but that
+      // is an ACCIDENT of window size, not a statement about the platform, and
+      // it moves whenever Ntc/Ngc are tuned. These knobs make the exclusion
+      // deliberate and independent:
+      //   min_range — thruster wake and bubble clouds, transducer ringdown and
+      //     near-field saturation, and the vehicle's own frame/tether in the
+      //     beam. All produce strong, geometrically real-looking returns that
+      //     are body-fixed rather than world-fixed, so they survive CFAR (they
+      //     ARE bright against their surroundings) and then drag ICP toward
+      //     the vehicle's own motion.
+      //   max_range — in confined water this is a multipath filter with a hard
+      //     physical justification: a surface or bottom bounce arrives at a
+      //     LONGER path length than the direct return, so in a pool of known
+      //     size any echo beyond the maximum direct-path dimension cannot be
+      //     structure and is necessarily a ghost.
+      // Both default to 0 (off), so the shipped behaviour is unchanged and
+      // this stays an explicit operator decision made against real imagery.
+      if (points.rows() > 0 &&
+          (feature_min_range_ > 0.0 || feature_max_range_ > 0.0)) {
+        long keep = 0;
+        for (long i = 0; i < points.rows(); ++i) {
+          const double rr = std::hypot(points(i, 0), points(i, 1));
+          if (rr < feature_min_range_) continue;
+          if (feature_max_range_ > 0.0 && rr > feature_max_range_) continue;
+          points.row(keep++) = points.row(i);
+        }
+        points.conservativeResize(keep, Eigen::NoChange);
       }
 
       if (points.rows() > 0 && resolution_ > 0)
@@ -524,7 +723,7 @@ private:
         points = remove_outlier(points, outlier_filter_radius_,
                                 outlier_filter_min_points_);
 
-      publish_features(ping.stamp, points, phi);
+      publish_features(ping.stamp, points, phi, slam_eligible);
     } catch (const cv::Exception& e) {
       RCLCPP_WARN(get_logger(), "Dropping sonar ping: OpenCV error: %s", e.what());
     } catch (const std::exception& e) {
@@ -551,11 +750,20 @@ private:
   std::vector<float> bearings_;
   int map_version_ = 0;
   cv::Mat map_x_, map_y_;
-  // per-ping remapped grayscale for map-stream intensity lookup
+  // per-ping grayscale for map-stream intensity lookup: the polar original
+  // when extracting in polar, the Cartesian remap on the legacy path
   cv::Mat cart_gray_;
+  cv::Mat polar_gray_;
+  // extract detections from the polar mask (exact) rather than from the
+  // Cartesian remap of it (lossy in the near field) — see the extractor
+  bool extract_polar_ = true;
+  // explicit range gate (m; 0 = off) for wake/ringdown and multipath ghosts
+  double feature_min_range_ = 0.0;
+  double feature_max_range_ = 0.0;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr feature_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr slam_feature_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feature_img_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_pub_;
   double tvg_spread_db_ = 0.0;
@@ -568,16 +776,15 @@ private:
   std::deque<std::pair<int64_t, float>> tilt_buf_;
   static constexpr std::size_t kTiltBufMax = 1024;
   bool apply_head_tilt_ = true;
-  // skip feature frames when |head pitch| exceeds this (rad); 0 = no gate
+  // Skip planar-consumer frames when |head pitch relative to base_link|
+  // exceeds this value (rad); 0 = no gate.
   double max_head_pitch_ = 0.0;
+  bool gate_active_ = false;
 };
 
 }  // namespace sonar_slam
 
 int main(int argc, char** argv)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<sonar_slam::FeatureExtractionNode>());
-  rclcpp::shutdown();
-  return 0;
+  return sonar_slam::run_node<sonar_slam::FeatureExtractionNode>(argc, argv);
 }

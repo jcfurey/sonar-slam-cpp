@@ -59,15 +59,18 @@
     # skipped with an empty tile (the pairing tolerance itself stays 2 ms)
     stream_grace: 1.0
 
-    # MUST match slam_node's enu_world so the reconstructed sonar fan lands in
-    # the same frame as the trajectory poses (true -> standard ENU trajectory).
+    # MUST match slam.yaml's enu_world so the reconstructed sonar fan lands in
+    # the same frame chirality as the trajectory poses (both ship true; the
+    # bluerov_legacy payload overlay flips both to false).
     enu_world: true
 
     # optional min seconds between map publishes (0 = publish every keyframe)
     publish_period: 0.0
 
     # raw sonar ping (same driver/topic as feature_extraction). Left blank here
-    # so the sensor-payload overlay sets them, like the other nodes.
+    # so the sensor-payload overlay sets them; a blank driver auto-selects the
+    # Oculus adapter from compressed_images (all sonar consumers share this
+    # fallback in sensors.cpp).
     sonar:
       driver: ""    # e.g. "oculus_compressed", "projected_sonar", "image"
       topic: ""     # "" -> the driver's default topic

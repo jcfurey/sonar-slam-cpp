@@ -1,6 +1,10 @@
 readingDataPointsFilters:
+  - SurfaceNormalDataPointsFilter:
+      knn: 7
 
 referenceDataPointsFilters:
+  - SurfaceNormalDataPointsFilter:
+      knn: 7
 
 matcher:
   KDTreeMatcher:
@@ -15,9 +19,9 @@ outlierFilters:
       ratio: 0.8
 
 errorMinimizer:
-  # PointToPlaneErrorMinimizer:
-  #   force2D: 1
-  PointToPointErrorMinimizer
+  PointToPlaneErrorMinimizer:
+    force2D: 1
+  # PointToPointErrorMinimizer
 
 transformationCheckers:
   - CounterTransformationChecker:

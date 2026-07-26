@@ -17,12 +17,13 @@ if(SONAR_SLAM_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
       # RTX 3090 = sm_86. `-real` emits the cubin for this GPU; `-virtual` also
       # embeds PTX so a newer GPU can JIT. Override with -DCMAKE_CUDA_ARCHITECTURES.
-      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual)
+      set(CMAKE_CUDA_ARCHITECTURES 86-real 86-virtual CACHE STRING
+        "CUDA architectures (RTX 3090 default)")
     endif()
+    enable_language(CUDA)
     # A stale CACHED value (the observed case: 52, from an old configure) is
     # worse than it looks: under nvcc 12.x it still BUILDS (pre-75 archs are
     # merely deprecated), so the kernels ship as compute_52 PTX that the
@@ -117,8 +118,11 @@ endforeach()
 if(SONAR_SLAM_VENDOR_MSG_DEPS)
   message(STATUS "sonar_slam_cpp: vendor message packages found: ${SONAR_SLAM_VENDOR_MSG_DEPS}")
 else()
-  message(STATUS "sonar_slam_cpp: no legacy vendor message packages found — "
-                 "standard-message drivers only (Revolution-style build)")
+  message(
+    STATUS
+    "sonar_slam_cpp: no legacy vendor message packages found — "
+    "standard-message drivers only (Revolution-style build)"
+  )
 endif()
 
 find_package(Eigen3 REQUIRED)
@@ -257,6 +261,31 @@ install(TARGETS parity_vs_python DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_test REQUIRED)
 
+  add_executable(test_cfar_math test/cfar_math_test.cpp)
+  target_link_libraries(test_cfar_math sonar_slam_core)
+  ament_add_test(test_cfar_math
+    COMMAND $<TARGET_FILE:test_cfar_math>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 120)
+
+  add_executable(test_interp_spline test/interp_spline_test.cpp)
+  target_include_directories(test_interp_spline PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  ament_add_test(test_interp_spline
+    COMMAND $<TARGET_FILE:test_interp_spline>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_censi_covariance test/censi_covariance_test.cpp)
+  target_include_directories(test_censi_covariance PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  ament_add_test(test_censi_covariance
+    COMMAND $<TARGET_FILE:test_censi_covariance>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_sonar_geometry test/sonar_geometry_test.cpp)
+  target_link_libraries(test_sonar_geometry sonar_slam_core)
+  ament_add_test(test_sonar_geometry
+    COMMAND $<TARGET_FILE:test_sonar_geometry>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_isam_recovery test/test_isam_recovery.cpp)
   target_include_directories(test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
   target_link_libraries(test_isam_recovery gtsam)
@@ -283,6 +312,25 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_pipeline_e2e>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 300)
+
+  # In CPU-only CI this is a CPU smoke test; on a CUDA build with a visible
+  # device the same registered test exercises every GPU kernel against its CPU
+  # twin.
+  #
+  # --smoke-ok is REQUIRED here and must not be dropped: without it the tool
+  # exits 2 ("nothing was compared, NOT a pass"), which is the right answer for
+  # an operator running it by hand but turns this test — and therefore the
+  # package's own CI, which builds -DSONAR_SLAM_ENABLE_CUDA=OFF — permanently
+  # red on every machine that cannot observe parity at all. A genuine mismatch
+  # still exits 1 and still fails the test.
+  ament_add_test(test_runtime_parity
+    COMMAND $<TARGET_FILE:parity_check> --smoke-ok
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 120)
+
+  # test/parity_driver.py additionally needs the original bruce_slam package
+  # and generated reference fixtures, so it remains a manual cross-project
+  # compatibility harness rather than a hermetic package test.
 endif()
 
 # ------------------------------------------------------------------------- install

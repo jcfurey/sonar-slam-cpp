@@ -85,11 +85,60 @@ struct GeoDatum
   GeoDatum(double lat, double lon, double bearing)
   : lat0(lat), lon0(lon), bearing_deg(bearing), origin(wgs84_to_utm(lat, lon))
   {
-    const double alpha = (90.0 - bearing) * M_PI / 180.0;  // ENU angle of +x
-    ex = std::cos(alpha);
-    nx = std::sin(alpha);
-    ey = -std::sin(alpha);
-    ny = std::cos(alpha);
+    // The compass bearing is TRUE-north; UTM axes are GRID-north, which
+    // differs by the grid convergence (up to ~3 deg near zone edges) and a
+    // point scale factor (~4e-4). Build the exact local true-ENU -> UTM
+    // Jacobian by finite-differencing the projection over one meter of true
+    // north / true east (geodesic steps via the correct meridional M(phi)
+    // and normal N(phi) radii) — convergence and scale come along for free.
+    const double phi = lat0 * M_PI / 180.0;
+    const double dlat_per_m = (1.0 / meridional_radius(phi)) * 180.0 / M_PI;
+    const double dlon_per_m =
+      (1.0 / (normal_radius(phi) * std::cos(phi))) * 180.0 / M_PI;
+    // a probe that crosses a zone or hemisphere boundary lands in a
+    // different projection (easting jumps ~666 km) — step the other way and
+    // negate the difference instead
+    UtmPoint north = wgs84_to_utm(lat0 + dlat_per_m, lon0);
+    double sn = 1.0;
+    if (north.zone != origin.zone || north.north != origin.north) {
+      north = wgs84_to_utm(lat0 - dlat_per_m, lon0);
+      sn = -1.0;
+    }
+    UtmPoint east = wgs84_to_utm(lat0, lon0 + dlon_per_m);
+    double se = 1.0;
+    if (east.zone != origin.zone || east.north != origin.north) {
+      east = wgs84_to_utm(lat0, lon0 - dlon_per_m);
+      se = -1.0;
+    }
+    const double eE = se * (east.easting - origin.easting);
+    const double eN = se * (east.northing - origin.northing);
+    const double nE = sn * (north.easting - origin.easting);
+    const double nN = sn * (north.northing - origin.northing);
+
+    // map +x points along the TRUE bearing; +y is +x rotated 90 deg CCW
+    const double b = bearing * M_PI / 180.0;
+    const double xe = std::sin(b), xn = std::cos(b);   // +x in true ENU
+    const double ye = -std::cos(b), yn = std::sin(b);  // +y in true ENU
+    ex = xe * eE + xn * nE;
+    nx = xe * eN + xn * nN;
+    ey = ye * eE + yn * nE;
+    ny = ye * eN + yn * nN;
+  }
+
+  static double meridional_radius(double phi)
+  {
+    constexpr double a = 6378137.0, f = 1.0 / 298.257223563;
+    const double e2 = f * (2.0 - f);
+    const double s2 = std::sin(phi) * std::sin(phi);
+    return a * (1.0 - e2) / std::pow(1.0 - e2 * s2, 1.5);
+  }
+
+  static double normal_radius(double phi)
+  {
+    constexpr double a = 6378137.0, f = 1.0 / 298.257223563;
+    const double e2 = f * (2.0 - f);
+    const double s2 = std::sin(phi) * std::sin(phi);
+    return a / std::sqrt(1.0 - e2 * s2);
   }
 
   void map_to_utm(double x, double y, double& E, double& N) const
@@ -98,14 +147,16 @@ struct GeoDatum
     N = origin.northing + x * nx + y * ny;
   }
 
-  // small-extent (survey-scale) lon/lat for GeoJSON output
+  // small-extent (survey-scale) lon/lat for GeoJSON output, using the
+  // correct local radii (the equatorial-sphere shortcut was 2.5-6.7 m/km off)
   void map_to_lonlat(double x, double y, double& lon, double& lat) const
   {
-    constexpr double R = 6378137.0;
-    const double dE = x * ex + y * ey;
-    const double dN = x * nx + y * ny;
-    lat = lat0 + (dN / R) * 180.0 / M_PI;
-    lon = lon0 + (dE / (R * std::cos(lat0 * M_PI / 180.0))) * 180.0 / M_PI;
+    const double b = bearing_deg * M_PI / 180.0;
+    const double dE = x * std::sin(b) - y * std::cos(b);  // true ENU meters
+    const double dN = x * std::cos(b) + y * std::sin(b);
+    const double phi = lat0 * M_PI / 180.0;
+    lat = lat0 + (dN / meridional_radius(phi)) * 180.0 / M_PI;
+    lon = lon0 + (dE / (normal_radius(phi) * std::cos(phi))) * 180.0 / M_PI;
   }
 };
 

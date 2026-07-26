@@ -36,3 +36,7 @@
       driver: ""          # auto-select the Oculus adapter from compressed_images
       topic: ""
     compressed_images: false
+
+    # legacy z-down world convention for the whole stack (slam + mapping read
+    # this same key; the modern base configs ship ENU)
+    enu_world: false
