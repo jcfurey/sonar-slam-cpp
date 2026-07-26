@@ -36,11 +36,12 @@ feature extractor against the Python SLAM node or vice versa.
 
 The C++ stack is a strict **superset**: it adds parameters the Python
 original has no equivalent for — the NSSM degeneracy and compass gates
-(`nssm/max_sigma`, `max_anisotropy`, `max_yaw_vs_compass`,
-`max_translation_vs_dr`, `min_revisit_sep`, `min_overlap_ratio`), the
-post-loop verification (`post_loop_max_yaw_rms`,
-`post_loop_max_link_error_sigma`), map persistence, USBL input, operator hand
-correction, and the `map->odom` republish timer. Those are additive; a Python
+(`nssm/max_sigma`, `max_anisotropy`, `degeneracy_prefloor`,
+`max_yaw_vs_compass`, `max_translation_vs_dr`, `min_revisit_sep`,
+`min_overlap_ratio`), the post-loop verification (`post_loop_max_yaw_rms`,
+`post_loop_max_link_error_sigma`), the front-end range gate
+(`filter/min_range`, `max_range`, `extract_polar`), map persistence, USBL
+input, operator hand correction, and the `map->odom` republish timer. Those are additive; a Python
 config simply leaves them at their defaults.
 
 | executable | ports | Python original |

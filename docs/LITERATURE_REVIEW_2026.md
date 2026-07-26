@@ -273,11 +273,17 @@ consume the minimizer's surface normals. Merely changing the optimizer does
 not make that mismatched Hessian valid. Two consequences:
   - Keeping **sampled + FAST-MCD as the default is the correct, safe choice** —
     and it measures the behavior of the configured registration pipeline.
-  - `Slam::configure` now **rejects `cov_method: censi`** rather than attaching
-    a point-to-point covariance to a point-to-plane transform. Re-enabling it
-    requires a Hessian built from the same normals/objective, or a
-    rematching-aware estimator such as Brossard, Bonnabel & Barrau (RA-L 2020,
-    arXiv 1909.05722).
+  - `Slam::configure` **gates `cov_method: censi` on the LOADED ICP chain**
+    (`ICP::error_minimizer_name()`) rather than attaching a point-to-point
+    covariance to a point-to-plane transform: rejected against this package's
+    point-to-plane default, accepted against a point-to-point override such as
+    the deployed `settings_erdc` chain. Note the two failure modes are
+    different — against point-to-plane the objectives simply do not match,
+    while against point-to-point they match but Bonnabel's result says the
+    closed form is *itself* unreliable there. So censi is never the
+    recommended path; making it trustworthy needs a Hessian built from the
+    same normals/objective, or a rematching-aware estimator such as Brossard,
+    Bonnabel & Barrau (RA-L 2020, arXiv 1909.05722).
 
 **7. Compass / absolute-yaw gating of loop closures — VALIDATED (underwater),
 BREAKS ON LAND.**
@@ -331,13 +337,14 @@ specifically prescribed by any paper.
 
 ## What the literature suggests we change or test next (prioritized)
 
-1. **Censi covariance (Part 2.6) — safely disabled.** The Deep Trekker
-   Revolution preset uses `sampled` (cov_samples 20), which fixes the original
-   fixed-confidence concern. The later point-to-plane ICP switch did not
-   update the retained point-to-point covariance Hessian, so
-   `Slam::configure` now rejects `censi`. Re-enable it only with a
-   point-to-plane covariance implementation using the configured normals, or
-   adopt a Brossard-style rematching-aware estimator.
+1. **Censi covariance (Part 2.6) — not on the default path.** The Deep
+   Trekker Revolution preset uses `sampled` (cov_samples 20), which fixes the
+   original fixed-confidence concern. `Slam::configure` gates `censi` on the
+   loaded ICP chain, so it is rejected against this package's point-to-plane
+   default and accepted against a point-to-point one — but Bonnabel's result
+   means even the matched case is optimistic. Prefer `sampled` regardless;
+   trusting censi needs a point-to-plane covariance implementation using the
+   configured normals, or a Brossard-style rematching-aware estimator.
 2. **On any radar port, replace compass anchoring with gyro yaw-rate (Part
    1.4).** The single assumption most certain to break on land. The verify
    layer should compare optimized yaw against integrated gyro, not a

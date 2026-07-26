@@ -211,9 +211,12 @@ than this anyway. The honest conclusion is narrower:
 
 - Below ~3 m the remap discards most of the angular resolution and can erase
   compact returns entirely. For a pool deployment that band is not empty.
-- Extracted points are snapped to the Cartesian grid, adding up to ~res/√2
-  position error (0.06 m Oculus, 0.06 m Revolution) — small against the 0.5 m
-  voxel, but it is pure loss for nothing.
+- Extracted points are snapped to the Cartesian grid. The half-cell diagonal
+  bound is res/√2 — 0.021 m Oculus, 0.059 m Revolution — but the point lands
+  in whichever cell *sampled* it rather than the nearest one, so the measured
+  displacement runs to about a full cell (0.032 m at res 0.030 m; see the
+  convention check in §"What was implemented"). Small against the 0.5 m voxel
+  either way, but it is pure loss for nothing.
 - The ordering blocks any future move to finer clouds: lowering
   `filter/resolution` cannot recover detail the remap already discarded.
 

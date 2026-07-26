@@ -92,7 +92,7 @@ struct Keyframe
     update(new_pose);
   }
 
-  // SE3 graph update (FULL_3D_ROADMAP.md Phase 4): the graph estimates
+  // SE3 graph update: the graph estimates
   // HORIZON poses — yaw-only rotation with z a live state — because point
   // clouds are attitude-rotated at ingestion (roll/pitch in a pose would
   // double-apply them). z comes from the estimate; roll/pitch ride from DR.
@@ -277,8 +277,11 @@ struct SMParams
   // how the ICP factor covariance is estimated when cov_samples > 0:
   //   SAMPLED - run cov_samples ICPs from the best init guesses and take a
   //             robust (FAST-MCD) covariance of the results (slam.py default)
-  //   CENSI   - reserved legacy value; Slam::configure rejects it because its
-  //             point-to-point Hessian does not match the point-to-plane ICP
+  //   CENSI   - one ICP plus the Censi (2007) closed form. Its Hessian is
+  //             point-to-POINT, so Slam::configure accepts it only when the
+  //             LOADED ICP chain minimises the same objective (it reads
+  //             ICP::error_minimizer_name(); the package default icp.yaml is
+  //             point-to-plane, so censi is rejected there)
   enum CovMethod { SAMPLED, CENSI };
 
   bool enable = true;

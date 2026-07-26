@@ -42,7 +42,7 @@ gtsam::ISAM2Params make_isam2_params()
   return p;
 }
 
-// SE3 graph chart (FULL_3D_ROADMAP.md Phase 4): states are HORIZON poses
+// SE3 graph chart: states are HORIZON poses
 // (yaw-only rotation, live z). Sonar ICP observes (x, y, yaw); depth is an
 // absolute measurement; roll/pitch are 0 BY CONSTRUCTION in this chart (the
 // clouds are attitude-rotated at ingestion). Sigma constants for the
@@ -1143,7 +1143,7 @@ bool Slam::add_nonsequential_scan_matching()
     }
   }
 
-  // Degeneracy gate (FULL_3D_ROADMAP.md "Path to survey-grade" item 1):
+  // Degeneracy gate:
   // pool/wall aliasing produced self-consistent-but-wrong closures that PCM
   // could not reject (2026-07 CHL_Pool: 9 accepted closures demanding 21 deg
   // RMS yaw correction — why NSSM was turned off). Sliding along featureless

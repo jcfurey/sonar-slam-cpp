@@ -93,9 +93,10 @@ public:
       return v;
     };
 
-    // ICP-covariance method when cov_samples > 0. "censi" is still parsed for
-    // a useful configuration error from Slam::configure(), but is disabled
-    // while its point-to-point Hessian does not match the point-to-plane ICP.
+    // ICP-covariance method when cov_samples > 0: "sampled" (many ICPs +
+    // FAST-MCD, the default) or "censi" (one ICP + the point-to-point closed
+    // form). Slam::configure() validates "censi" against the LOADED ICP chain
+    // and throws a naming error if the objectives do not match.
     const auto cov_method = [this](const char* name) {
       const std::string s = get_string(name, "sampled");
       if (s == "sampled") return SMParams::SAMPLED;
@@ -514,9 +515,8 @@ private:
     // roll/pitch (Ry(p)*Rx(r), yaw excluded) so stored points are
     // horizon-referenced: registration then matches world-horizontal
     // projections even when the vehicle pitches, and col2 carries elevation
-    // relative to the vehicle for the 3D map cloud (FULL_3D_ROADMAP.md
-    // Phase 3). A level vehicle (roll=pitch=0) reduces col0/col1 to the old
-    // planar values byte-for-byte.
+    // relative to the vehicle for the 3D map cloud. A level vehicle
+    // (roll=pitch=0) reduces col0/col1 to the old planar values byte-for-byte.
     // dr_pose3 arrives through enu_odom_relay's roll-pi conjugation, so its
     // euler attitude is (roll, -pitch, -yaw) of the ENU vehicle attitude and
     // its z is +depth (down-positive). Undo the pitch flip to rotate the

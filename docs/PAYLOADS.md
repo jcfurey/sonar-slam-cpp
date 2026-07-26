@@ -13,6 +13,8 @@ Ready overlays are provided under `config/payloads/`:
 | Legacy BlueROV (bruce_slam original) | `bluerov_legacy.yaml` | `sonar_oculus`, `rti_dvl`, `bar30_depth`, `kvh_gyro` |
 | Modern BlueROV2 (Water Linked A50) | `bluerov2_waterlinked.yaml` | **none** (standard messages only) |
 | **Deep Trekker Revolution** | `deeptrekker_revolution.yaml` | **none** (standard messages only) |
+| Synthetic demo (no hardware, no bags) | `sim_demo.yaml` | **none** — driven by `sim_payload`; see `launch/demo.launch.xml` and the README quick demo |
+| Default no-op marker | `none.yaml` | **none** — sets only `sonar_slam_payload`, so the per-node base configs apply unchanged |
 
 The two standard-message payloads differ only in their default topics and
 frame conventions (the Revolution's internal AHRS vs. the BlueROV2's

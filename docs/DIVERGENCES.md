@@ -64,7 +64,8 @@ at the time of comparison.
   reproduced by this port's CPU and CUDA paths) thresholds on `train[rank]`
   after `nth_element`, the **(rank+1)-th smallest**. The solved τ therefore
   over-thresholds: realized P_FA = target × (N−rank)/(τ+N−rank). At the
-  shipped config (Ntc 40, rank 10, Pfa 0.1) that is ≈ 0.0767 instead of 0.1
+  config this port inherited (Ntc 40, rank 10, Pfa 0.1) that is ≈ 0.0767
+  instead of 0.1
   (Monte Carlo: 0.0766).
 - **Here:** `pfa_os()` uses the product with rank+1 factors
   (`Γ(N−rank)`, `Γ(τ+N−rank)`), matching the detector's actual statistic;
@@ -86,8 +87,7 @@ at the time of comparison.
   `grow_rows`) with the matching increment, so the intensity mosaic stays
   aligned as the map expands sideways. The port enables `pub_intensity` (the
   backscatter mosaic is a shipped product), so the branch is now live and had
-  to be correct. (`mapping_node`, the port of `mapping.py`; see
-  `SONAR_MAPPING_ARCHITECTURE.md` §5.)
+  to be correct. (`mapping_node`, the port of `mapping.py`.)
 
 ### 8. Sampled-covariance registrations run in parallel (`parallel_cov_samples`)
 - **Upstream:** `slam.py` runs the `cov_samples` (30) ICP registrations of the
@@ -211,8 +211,10 @@ global-init-cost parity fixtures are unaffected.
 `test/interp_spline_test.cpp` checks `Interp1d` against `scipy.interp1d`: LINEAR
 and the not-a-knot CUBIC both match scipy to ~1e-15 (incl. a uniform grid, the
 zero-pivot case). `test/censi_covariance_test.cpp` Monte-Carlo-validates the
-retained point-to-point covariance math; runtime selection is disabled because
-the shipped ICP objective is now point-to-plane.
+point-to-point covariance math directly. Runtime selection of `cov_method:
+censi` is gated on the loaded ICP chain rather than disabled outright: it is
+rejected against the package default's point-to-plane minimizer and accepted
+against a point-to-point one.
 
 ## Angle-innovation wrapping in the Kalman node (deliberate, correctness over parity)
 
