@@ -320,6 +320,13 @@ config → unchanged behavior) and only when their correctness can be validated.
   is already a config knob (`CFAR/rank`) for anyone who wants to follow the
   guidance. The code's negative-`rank` fallback stays at N/2 to match
   `CFAR.py`'s `rank=None`.
+  **RESOLVED 2026-07-26** by measurement, see `SONAR_FRONTEND_REVIEW.md` §3:
+  on uint8 input `rank: 10` realizes 13% more false alarms than nominal while
+  Rohling's 3N/4 (`rank: 30`) tracks it to 0.4%, because the low-rank
+  statistic is a single-digit integer that the large τ then amplifies. The
+  recommendation is now to set `rank: 30` whenever `alg: OS` is selected;
+  parity is preserved for the shipped `alg: 'SOCA'` default, which never
+  reads it.
 
 **Deferred (new algorithms; correctness not verifiable in this environment):**
 

@@ -409,6 +409,19 @@ Verified 2026-07-10 (GPU and CPU-forced): CFAR masks, cloud ops, KNN match,
 full ICP and the global scan-match cost are **bit-exact** vs the originals;
 threshold factors match scipy; FAST-MCD agrees with the planted ground truth.
 
+## Detection front-end (CFAR) — operating point
+
+`docs/SONAR_FRONTEND_REVIEW.md` reviews the CFAR stage and the polar image
+path against the sonar literature, with measurements taken on this code. The
+short version: the detector implements its own model correctly (realized
+false-alarm rate tracks nominal to 3% on exponential clutter), but the shipped
+operating point is looser than sonar practice (`Pfa: 0.1` vs ~2%) and is
+effectively set by the *fixed* `filter/threshold`, which is not range-adaptive
+and therefore moves with gain and TVG. If you tune one, tune both. Also
+recorded there: `CFAR/rank: 10` should be `30` if you select `alg: OS`, and
+the e2e fixture's Gaussian background understates clutter load ~30×, so CI
+cannot currently see any of this.
+
 ## Intentional deviations from the Python stack
 
 - `shgo` is replaced by Sobol sampling + Nelder–Mead: same sample budget
