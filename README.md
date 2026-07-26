@@ -417,10 +417,17 @@ short version: the detector implements its own model correctly (realized
 false-alarm rate tracks nominal to 3% on exponential clutter), but the shipped
 operating point is looser than sonar practice (`Pfa: 0.1` vs ~2%) and is
 effectively set by the *fixed* `filter/threshold`, which is not range-adaptive
-and therefore moves with gain and TVG. If you tune one, tune both. Also
-recorded there: `CFAR/rank: 10` should be `30` if you select `alg: OS`, and
-the e2e fixture's Gaussian background understates clutter load ~30×, so CI
-cannot currently see any of this.
+and therefore moves with gain and TVG. **If you tune one, tune both** — that
+is the one open item, and it needs a bag.
+
+Applied from that review: `CFAR/rank` is now `30` (Rohling's 3N/4 — the
+inherited `10` realizes 13% more false alarms than nominal on uint8 input;
+`alg: OS` only, inert for the `SOCA` default); `test_cfar_math` stage [5] now
+asserts realized false-alarm rate through `detect()` on exponential clutter,
+which the previous continuous-domain Monte Carlo could not see; and
+`filter/extract_polar` (default true) extracts detections from the polar mask
+instead of from a Cartesian remap of it, which used to discard most near-field
+polar cells outright — see `docs/DIVERGENCES.md` #11.
 
 ## Intentional deviations from the Python stack
 

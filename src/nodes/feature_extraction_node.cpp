@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -169,6 +170,7 @@ public:
     outlier_filter_radius_ = get_double("filter/radius");
     outlier_filter_min_points_ = get_int("filter/min_points");
     skip_ = get_int("filter/skip");
+    extract_polar_ = get_bool("filter/extract_polar", true);
 
     compressed_images_ = get_bool("compressed_images");
 
@@ -302,6 +304,31 @@ private:
   }
 
   // build (or refresh) the polar -> Cartesian maps when geometry changes
+  // Nearest beam column to `bearing`. bearings_ is strictly monotonic — the
+  // adapters verify that on the first ping — so a binary search is valid;
+  // pick whichever neighbour is closer. Returns 0 for an empty table.
+  int beam_index(double bearing) const
+  {
+    if (bearings_.empty()) return 0;
+    const bool ascending = bearings_.back() >= bearings_.front();
+    std::size_t lo;
+    if (ascending) {
+      lo = static_cast<std::size_t>(
+        std::lower_bound(bearings_.begin(), bearings_.end(),
+                         static_cast<float>(bearing)) - bearings_.begin());
+    } else {
+      lo = static_cast<std::size_t>(
+        std::lower_bound(bearings_.begin(), bearings_.end(),
+                         static_cast<float>(bearing),
+                         std::greater<float>()) - bearings_.begin());
+    }
+    if (lo == 0) return 0;
+    if (lo >= bearings_.size()) return static_cast<int>(bearings_.size()) - 1;
+    const double d_hi = std::abs(bearings_[lo] - bearing);
+    const double d_lo = std::abs(bearings_[lo - 1] - bearing);
+    return static_cast<int>(d_lo <= d_hi ? lo - 1 : lo);
+  }
+
   void generate_map_xy(const SonarPing& ping)
   {
     const double res = ping.range_resolution;
@@ -416,15 +443,29 @@ private:
       Eigen::VectorXf ranges = Eigen::VectorXf::Zero(points.rows());
       for (long r = 0; r < points.rows(); ++r)
         ranges(r) = std::hypot(points(r, 0), points(r, 1));
-      if (!cart_gray_.empty() && rows_ > 0 && height_ > 0 && width_ > 0) {
+      // In polar-extraction mode invert straight back to (range, bearing) and
+      // read the ORIGINAL polar echo — no resampling on either leg. The
+      // Cartesian branch keeps the legacy grayscale-remap lookup.
+      const bool polar_lookup = !polar_gray_.empty() && res_ > 0.0 &&
+                                !bearings_.empty();
+      if (polar_lookup || (!cart_gray_.empty() && rows_ > 0 && height_ > 0 &&
+                           width_ > 0)) {
         for (long r = 0; r < points.rows(); ++r) {
-          const int row = static_cast<int>(
-            std::lround((1.0 - points(r, 0) / height_) * rows_));
-          const int col = static_cast<int>(
-            std::lround(cols_ / 2.0 - points(r, 1) * cols_ / width_));
-          if (row >= 0 && row < cart_gray_.rows && col >= 0 &&
-              col < cart_gray_.cols)
-            intens(r) = cart_gray_.at<std::uint8_t>(row, col) / 255.0f;
+          int row, col;
+          if (polar_lookup) {
+            // lateral axis is negated on the way out (see the extractor)
+            const double bearing = std::atan2(-points(r, 1), points(r, 0));
+            row = static_cast<int>(std::lround((ranges(r) - range_min_) / res_));
+            col = beam_index(bearing);
+          } else {
+            row = static_cast<int>(
+              std::lround((1.0 - points(r, 0) / height_) * rows_));
+            col = static_cast<int>(
+              std::lround(cols_ / 2.0 - points(r, 1) * cols_ / width_));
+          }
+          const cv::Mat& gray = polar_lookup ? polar_gray_ : cart_gray_;
+          if (row >= 0 && row < gray.rows && col >= 0 && col < gray.cols)
+            intens(r) = gray.at<std::uint8_t>(row, col) / 255.0f;
           // residual TVG (dB; identity when both coefficients are 0) — must
           // match sonar_proc's mapIntensity so the union stays on one scale
           if (ranges(r) > 1e-3f &&
@@ -550,26 +591,66 @@ private:
           *cv_bridge::CvImage(header, "bgr8", vis).toImageMsg());
       }
 
-      // to Cartesian — nearest-neighbour for the binary mask
-      const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
+      Matrix points;
+      if (extract_polar_ && !bearings_.empty() && res_ > 0.0) {
+        // Extract in POLAR and convert exactly (docs/SONAR_FRONTEND_REVIEW.md
+        // §5). The legacy path below remaps the binary mask to Cartesian FIRST
+        // and reads pixel indices out of it, which makes a detection survive
+        // only if some destination pixel happens to sample its polar cell.
+        // Inside the range where beam arc spacing is finer than the Cartesian
+        // cell — 6.8 m for an Oculus at 0.03 m, 9.4 m for the Revolution
+        // preset — cells compete for pixels and lose: 68.7% and 73.9% of
+        // near-field cells respectively are unreachable, and the survivors
+        // come out snapped to the Cartesian grid. Reading the polar mask
+        // directly has neither problem, and is CHEAPER (no mask remap at all;
+        // the Cartesian remap survives only for the feature_img
+        // visualization, which is already subscription-gated).
+        //
+        // Convention matches generate_map_xy exactly so the cloud keeps its
+        // orientation: that map places Cartesian (r,c) at forward
+        // res*(rows-r), lateral res*(-cols/2+c+0.5), and reads polar row
+        // (range-range_min)/res at bearing atan2(lateral, forward). Inverting
+        // it, polar cell (row, beam) is at range = range_min + row*res on
+        // bearing bearings_[beam] — and the legacy conversion negates the
+        // lateral axis, which is preserved here.
+        std::vector<cv::Point> locs;  // x = beam column, y = range bin
+        cv::findNonZero(peaks, locs);
+        points.resize(static_cast<long>(locs.size()), 2);
+        for (std::size_t i = 0; i < locs.size(); ++i) {
+          const int beam = locs[i].x;
+          const double range = range_min_ + locs[i].y * res_;
+          const double bearing = bearings_[static_cast<std::size_t>(beam)];
+          points(static_cast<long>(i), 0) =
+            static_cast<float>(range * std::cos(bearing));
+          points(static_cast<long>(i), 1) =
+            static_cast<float>(-range * std::sin(bearing));
+        }
+        // polar echo image for the map stream's per-point intensity; the
+        // lookup inverts to (range, bearing) rather than to a Cartesian pixel
+        if (map_points_pub_) polar_gray_ = img.clone();
+      } else {
+        // Legacy path: remap the mask to Cartesian, then read pixel indices.
+        // Kept behind filter/extract_polar for a one-line revert if a bag
+        // replay disagrees with the change above.
+        const cv::Mat cart_peaks = remap_u8(peaks, /*interp=*/0);
 
-      // grayscale echo image for the map stream's per-point intensity
-      // (looked up at publish time, after downsample/outlier filtering)
-      if (map_points_pub_)
-        cart_gray_ = remap_u8(img, /*interp=*/1);
+        // grayscale echo image for the map stream's per-point intensity
+        // (looked up at publish time, after downsample/outlier filtering)
+        if (map_points_pub_) cart_gray_ = remap_u8(img, /*interp=*/1);
 
-      std::vector<cv::Point> locs;
-      cv::findNonZero(cart_peaks, locs);
+        std::vector<cv::Point> locs;
+        cv::findNonZero(cart_peaks, locs);
 
-      // image coordinates -> meters (feature_extraction.py lines 254-258)
-      Matrix points(static_cast<long>(locs.size()), 2);
-      for (std::size_t i = 0; i < locs.size(); ++i) {
-        double x = locs[i].x - cols_ / 2.0;
-        x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
-        const double y =
-          -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
-        points(static_cast<long>(i), 0) = static_cast<float>(y);
-        points(static_cast<long>(i), 1) = static_cast<float>(x);
+        // image coordinates -> meters (feature_extraction.py lines 254-258)
+        points.resize(static_cast<long>(locs.size()), 2);
+        for (std::size_t i = 0; i < locs.size(); ++i) {
+          double x = locs[i].x - cols_ / 2.0;
+          x = -1.0 * ((x / (cols_ / 2.0)) * (width_ / 2.0));
+          const double y =
+            -1.0 * (locs[i].y / static_cast<double>(rows_)) * height_ + height_;
+          points(static_cast<long>(i), 0) = static_cast<float>(y);
+          points(static_cast<long>(i), 1) = static_cast<float>(x);
+        }
       }
 
       if (points.rows() > 0 && resolution_ > 0)
@@ -606,8 +687,13 @@ private:
   std::vector<float> bearings_;
   int map_version_ = 0;
   cv::Mat map_x_, map_y_;
-  // per-ping remapped grayscale for map-stream intensity lookup
+  // per-ping grayscale for map-stream intensity lookup: the polar original
+  // when extracting in polar, the Cartesian remap on the legacy path
   cv::Mat cart_gray_;
+  cv::Mat polar_gray_;
+  // extract detections from the polar mask (exact) rather than from the
+  // Cartesian remap of it (lossy in the near field) — see the extractor
+  bool extract_polar_ = true;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr feature_pub_;

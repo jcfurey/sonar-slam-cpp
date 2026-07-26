@@ -249,17 +249,49 @@ scratch directory.
 
 ## Summary: what to change, in order
 
-| # | Change | Cost | Confidence |
-|---|---|---|---|
-| 1 | `CFAR/rank: 10 → 30` when `alg: OS` | config only, inert for SOCA default | high — measured + literature agree |
-| 2 | Clutter-background e2e test + realized-Pfa assertion (§6) | new test, no runtime change | high |
-| 3 | Extract in polar, drop the mask remap (§5) | code change, needs bag replay | high on correctness, modest on impact |
-| 4 | Tune `Pfa` / `filter.threshold` as one operating point (§2.2) | bag replay | high that they interact; value unproven |
-| 5 | 2-D range-azimuth window (§4) | real work | low priority — no evidence of need |
+| # | Change | Status |
+|---|---|---|
+| 1 | `CFAR/rank: 10 → 30` for `alg: OS` | **DONE** — `feature.yaml`; inert for the SOCA default |
+| 2 | Realized-P_FA assertion on uint8 clutter (§6) | **DONE** — `cfar_math_test` stage [5] |
+| 3 | Extract in polar, drop the mask remap (§5) | **DONE** — `filter/extract_polar: true`, legacy path retained |
+| 4 | Tune `Pfa` / `filter.threshold` as one operating point (§2.2) | **OPEN** — needs a bag; documented in `feature.yaml` |
+| 5 | 2-D range-azimuth window (§4) | **NOT PLANNED** — no evidence of need |
 
 Nothing here is a defect in the detector itself (§1). The findings are about
 operating point, an inherited processing order, and a test fixture that cannot
 see any of it.
+
+### What was implemented, and how it was verified (2026-07-26)
+
+- **#1** `feature.yaml` ships `rank: 30`. Only `alg: OS` reads it, and the
+  default is `SOCA`, so this changes no shipped behaviour — it fixes the value
+  for anyone who selects OS.
+- **#2** `cfar_math_test` stage [5] drives `CFAR::detect()` on uint8
+  exponential clutter and asserts realized P_FA against nominal for
+  CA/SOCA/GOCA (all within 0.01), asserts the shipped OS rank holds nominal,
+  and asserts 3N/4 stays closer to nominal than N/4 so the finding cannot
+  silently invert. It reproduces this document's numbers independently:
+  CA 0.1023, SOCA 0.1031, GOCA 0.1020, OS rank 10 **0.1140**, OS rank 30
+  **0.1012**. Note stage [2]'s existing Monte Carlo — continuous doubles —
+  reports OS at 0.0999, which is exactly why the quantization effect was
+  invisible before: it is not a property of the formula, only of uint8 input.
+- **#3** implemented in `feature_extraction_node.cpp` behind
+  `filter/extract_polar` (default true). The legacy Cartesian path is kept
+  intact for a one-line revert. Conventions were verified numerically rather
+  than by inspection, because a sign or axis error here would mirror the map:
+  a harness replicating `generate_map_xy` and `cv::remap(..., INTER_NEAREST)`
+  ran both conversions over 35 probe cells spanning the fan — **35/35 agree**,
+  worst delta 0.032 m against a 0.030 m cell, i.e. exactly the one-cell grid
+  snap the polar path removes and nothing more.
+
+The §6 recommendation to give `polar_image` an exponential-background option
+was **not** taken. The detector assertion belongs in the detector test, where
+it is self-contained; switching the *pipeline* fixture's background to
+exponential would put ~10% false alarms into the e2e cloud and require
+re-tuning `Pfa`/`filter.threshold` inside the test — which is open item #4,
+and needs a bag rather than a guess. The e2e fixture therefore stays Gaussian
+deliberately, and §6's caveat about what its `0 stray detections` line means
+still stands.
 
 ## Sources
 
