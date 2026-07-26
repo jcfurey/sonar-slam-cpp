@@ -1006,6 +1006,8 @@ std::string nssm_hist_key(const Status& s)
   std::string key = s.name();
   const std::string& d = s.description;
   if (d.rfind("compass-inconsistent", 0) == 0) key += " (compass)";
+  else if (d.rfind("DR-translation-inconsistent", 0) == 0)
+    key += " (DR translation)";
   else if (d.rfind("degenerate", 0) == 0) key += " (degenerate)";
   else if (d.rfind("no-revisit", 0) == 0) key += " (no-revisit)";
   return key;
@@ -1060,6 +1062,29 @@ bool Slam::add_nonsequential_scan_matching()
     if (!ret2.status.description.empty()) ret2.status.description += ", ";
     ret2.status.description += "overlap " + std::to_string(overlap) +
                               " (" + std::to_string(ratio) + " of source)";
+  }
+
+  // Absolute translation-consistency gate, paired with the Sobol bound in
+  // initialize_nonsequential_scan_matching(). The initialization clamp alone
+  // is not a final bound: ICP may refine as far as nssm/max_translation from
+  // that seed. On CHL_Pool, max_translation_vs_dr=1.0 still admitted
+  // parallel-wall aliases demanding 2-5 m corrections because ICP walked
+  // from the edge of the 1 m initialization window into the alias basin.
+  // Judge the final target->source transform against the DR-predicted one,
+  // matching the absolute compass check below. 0 disables.
+  if (ret2.status && nssm_max_translation_vs_dr > 0.0) {
+    const gtsam::Pose2 dr_rel =
+      keyframes[ret2.target_key]->dr_pose.between(
+        keyframes[ret2.source_key]->dr_pose);
+    const gtsam::Pose2 corr = dr_rel.between(ret2.estimated_transform);
+    const double trans_err = std::hypot(corr.x(), corr.y());
+    // Inverted comparison makes a non-finite transform fail closed.
+    if (!(trans_err <= nssm_max_translation_vs_dr)) {
+      ret2.status = Status(Status::LARGE_TRANSFORMATION);
+      ret2.status.description =
+        "DR-translation-inconsistent (closure translation vs DR differs by " +
+        std::to_string(trans_err) + " m)";
+    }
   }
 
   // Compass-consistency gate (ABSOLUTE, added 2026-07-15 night after two
@@ -1179,7 +1204,8 @@ bool Slam::add_nonsequential_scan_matching()
           std::to_string(dr_rel.theta()) + ") ICP rel=(" +
           std::to_string(loop.estimated_transform.x()) + "," +
           std::to_string(loop.estimated_transform.y()) + "," +
-          std::to_string(loop.estimated_transform.theta()) + ")");
+          std::to_string(loop.estimated_transform.theta()) + ") | " +
+          loop.status.description);
       }
       // tentative until the next update_factor_graph succeeds; rolled back
       // (inserted flag, constraints entry, counter) if the solve throws

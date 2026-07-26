@@ -96,13 +96,12 @@ public:
   // Neither max_rotation (ICP-vs-Sobol refinement only) nor the covariance
   // gate (catches sliding, not confident-but-wrong locks) covers this mode.
   double nssm_max_yaw_vs_compass = 0.15;  // rad (~8.6°, > compass noise)
-  // OPTIONAL init-search TRANSLATION clamp — the x/y analog of the yaw clamp
-  // above, for parallel-wall TRANSLATIONAL aliasing on symmetric venues. When
-  // >0, the Sobol init translation search is bounded to ±min(5*std, this) so it
-  // cannot jump to a parallel-wall basin many metres off the DR-predicted
-  // overlap. Set just above the real revisit-drift scale (e.g. ~1.5-2 m for the
-  // ~1 m pool doubling). 0 = disabled (full ±5*std freedom) — the default, so
-  // this lever stays inert until a replay confirms aliasing.
+  // OPTIONAL absolute TRANSLATION gate — the x/y analog of the yaw gate
+  // above, for parallel-wall translational aliasing on symmetric venues. When
+  // >0, it clamps the Sobol init search and rejects a final ICP relative pose
+  // outside the same radius from DR. The final check matters because ICP can
+  // otherwise walk from a bounded seed into a distant alias basin. Set just
+  // above the real revisit-drift scale. 0 disables both checks.
   double nssm_max_translation_vs_dr = 0.0;  // m; 0 disables
   // optimize-then-verify (rtabmap RGBD/OptimizeMaxError analog): after a
   // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay

@@ -85,6 +85,9 @@ void configure_slam(Slam& slam)
   // rejects, 0.32 m final error; true -> 25 accepted, 16 degenerate rejects,
   // 0.01 m.
   slam.nssm_degeneracy_prefloor = true;
+  // Pool venue safety: both the global-init seed and final ICP result must
+  // remain within 1 m of the DR-predicted relative translation.
+  slam.nssm_max_translation_vs_dr = 1.0;
   slam.pcm_queue_size = 5;
   slam.min_pcm = 2;
   slam.icp.load_from_yaml(std::string(TEST_SOURCE_DIR) + "/config/icp.yaml");
@@ -262,9 +265,13 @@ int main()
               "%d); final err slam %.2f m vs dr %.2f m\n",
               slam.current_key(), slam.ssm_accepted, slam.nssm_accepted,
               slam.nssm_reverted, slam_err, dr_err);
-  std::printf("    nssm rejects: [%s]\n", slam.nssm_reject_summary().c_str());
+  const std::string reject_summary = slam.nssm_reject_summary();
+  std::printf("    nssm rejects: [%s]\n", reject_summary.c_str());
   CHECK(dr_err > 0.5, "fixture broken: DR did not drift (%.2f m)", dr_err);
   CHECK(slam.nssm_accepted >= 1, "no loop closure was ever accepted");
+  CHECK(reject_summary.find("DR translation") != std::string::npos,
+        "final DR-translation gate was not exercised: [%s]",
+        reject_summary.c_str());
   CHECK(slam_err < dr_err * 0.7,
         "loop closure did not meaningfully correct (slam %.2f vs dr %.2f)",
         slam_err, dr_err);
