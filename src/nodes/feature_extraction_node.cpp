@@ -112,6 +112,7 @@ public:
         // while rclcpp keeps the old value
         double resolution = resolution_, radius = outlier_filter_radius_;
         int min_points = outlier_filter_min_points_, skip = skip_;
+        double min_range = feature_min_range_, max_range = feature_max_range_;
         bool rebuild = false;
         try {
           for (const auto& p : params) {
@@ -140,6 +141,10 @@ public:
               min_points = static_cast<int>(as_num(p));
             } else if (n == "filter.skip") {
               skip = static_cast<int>(as_num(p));
+            } else if (n == "filter.min_range") {
+              min_range = as_num(p);
+            } else if (n == "filter.max_range") {
+              max_range = as_num(p);
             }
           }
           if (rebuild)
@@ -154,6 +159,8 @@ public:
           outlier_filter_radius_ = radius;
           outlier_filter_min_points_ = min_points;
           skip_ = skip;
+          feature_min_range_ = min_range;
+          feature_max_range_ = max_range;
           if (rebuild)
             RCLCPP_INFO(get_logger(),
                         "CFAR rebuilt: Ntc %d, Ngc %d, Pfa %g, rank %d",
@@ -171,6 +178,8 @@ public:
     outlier_filter_min_points_ = get_int("filter/min_points");
     skip_ = get_int("filter/skip");
     extract_polar_ = get_bool("filter/extract_polar", true);
+    feature_min_range_ = get_double("filter/min_range", 0.0);
+    feature_max_range_ = get_double("filter/max_range", 0.0);
 
     compressed_images_ = get_bool("compressed_images");
 
@@ -390,6 +399,27 @@ private:
     bearings_ = ping.bearings;
     // new maps -> new version so the GPU remap re-uploads its cached copy
     ++map_version_;
+
+    // Report the blanking the CFAR window imposes for THIS geometry. It is a
+    // side effect of the sliding window (detect_cpu skips the first and last
+    // border rows), not a deliberate exclusion, and it moves whenever Ntc/Ngc
+    // change — so an operator setting filter/min_range against wake or
+    // filter/max_range against multipath needs to see where it already sits,
+    // and that a configured max_range above the reported usable range does
+    // nothing.
+    const double blank = (ntc_ / 2 + ngc_ / 2) * res;
+    // bind the temporary: a `(... + " m").c_str()` inline in a logging macro
+    // hands the sink a pointer into a string that may already be gone
+    const std::string max_txt = feature_max_range_ > 0.0
+                                  ? std::to_string(feature_max_range_) + " m"
+                                  : std::string("off");
+    RCLCPP_INFO(get_logger(),
+                "sonar geometry: %d bins x %zu beams @ %.3f m; CFAR window "
+                "blanks the inner %.2f m and the outer %.2f m (usable %.2f-"
+                "%.2f m). filter/min_range %.2f m, max_range %s",
+                ping.num_ranges, ping.bearings.size(), res, blank, blank,
+                range_min + blank, range_min + rows * res - blank,
+                feature_min_range_, max_txt.c_str());
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
@@ -653,6 +683,39 @@ private:
         }
       }
 
+      // Explicit range gate, in METRES, applied to whichever extractor ran.
+      //
+      // The CFAR window already blanks the innermost and outermost `Ntc/2 +
+      // Ngc/2` range bins (detect_cpu iterates [border, rows-border)) — 2.08 m
+      // for the Revolution preset, 0.75 m for an Oculus at 0.03 m — but that
+      // is an ACCIDENT of window size, not a statement about the platform, and
+      // it moves whenever Ntc/Ngc are tuned. These knobs make the exclusion
+      // deliberate and independent:
+      //   min_range — thruster wake and bubble clouds, transducer ringdown and
+      //     near-field saturation, and the vehicle's own frame/tether in the
+      //     beam. All produce strong, geometrically real-looking returns that
+      //     are body-fixed rather than world-fixed, so they survive CFAR (they
+      //     ARE bright against their surroundings) and then drag ICP toward
+      //     the vehicle's own motion.
+      //   max_range — in confined water this is a multipath filter with a hard
+      //     physical justification: a surface or bottom bounce arrives at a
+      //     LONGER path length than the direct return, so in a pool of known
+      //     size any echo beyond the maximum direct-path dimension cannot be
+      //     structure and is necessarily a ghost.
+      // Both default to 0 (off), so the shipped behaviour is unchanged and
+      // this stays an explicit operator decision made against real imagery.
+      if (points.rows() > 0 &&
+          (feature_min_range_ > 0.0 || feature_max_range_ > 0.0)) {
+        long keep = 0;
+        for (long i = 0; i < points.rows(); ++i) {
+          const double rr = std::hypot(points(i, 0), points(i, 1));
+          if (rr < feature_min_range_) continue;
+          if (feature_max_range_ > 0.0 && rr > feature_max_range_) continue;
+          points.row(keep++) = points.row(i);
+        }
+        points.conservativeResize(keep, Eigen::NoChange);
+      }
+
       if (points.rows() > 0 && resolution_ > 0)
         points = downsample(points, static_cast<float>(resolution_));
 
@@ -694,6 +757,9 @@ private:
   // extract detections from the polar mask (exact) rather than from the
   // Cartesian remap of it (lossy in the near field) — see the extractor
   bool extract_polar_ = true;
+  // explicit range gate (m; 0 = off) for wake/ringdown and multipath ghosts
+  double feature_min_range_ = 0.0;
+  double feature_max_range_ = 0.0;
 
   rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr feature_pub_;

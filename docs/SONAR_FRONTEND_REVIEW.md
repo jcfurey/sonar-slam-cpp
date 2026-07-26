@@ -164,6 +164,16 @@ Nearest-neighbour resampling is a *pull*: a polar cell survives only if some
 destination pixel's nearest source is that cell. Replicating `generate_map_xy`
 exactly and counting reachable polar cells:
 
+**Correction (2026-07-26).** The per-band figures below count *every* polar
+cell, including rows CFAR can never mark: `detect_cpu` iterates
+`[border, rows-border)` with `border = Ntc/2 + Ngc/2 = 25`, so the innermost
+and outermost 25 bins are structurally blank — 2.08 m on the Revolution preset,
+0.75 m on an Oculus at 0.03 m. Restricted to CFAR-valid rows the near-band loss
+is **62.9%** (Revolution, 2.08–5 m) and **63.2%** (Oculus, 0.75–4.3 m) rather
+than the 73.9% / 68.7% published below, and over the whole valid fan it is
+15.6% / 14.8%. The conclusion is unchanged; the headline numbers were inflated
+by dead rows and the corrected ones are what should be quoted.
+
 **Revolution sim preset** (res 0.083 m, 300 bins × 256 beams, 130°):
 
 | range band | polar cells | reachable | lost |
@@ -216,6 +226,70 @@ subscription-gated) and it is exact. Deferred here rather than done because it
 changes the shipped cloud on every platform and so needs a bag replay against
 `map_metrics`, not a green e2e test.
 
+## 5b. Near-field artifacts: wake, ringdown, multipath [DOMAIN]
+
+§5 recovers near-field detections that the Cartesian remap used to discard.
+That is correct as geometry and it is also where the *dirtiest* returns live,
+so the two must be read together — recovering more of a band that is full of
+artifact is not automatically an improvement.
+
+The near field carries three things CFAR cannot help with, because they are not
+statistical anomalies at all — they are genuinely bright against their
+surroundings and pass any detector honestly:
+
+- **Thruster wake and bubble clouds.** Air is an enormous acoustic impedance
+  mismatch, so bubbles are among the strongest scatterers a sonar will ever
+  see. Worst while hovering, backing down, or manoeuvring in confined water —
+  exactly the CHL_Pool regime.
+- **Ringdown / near-field saturation and own-platform structure** (frame,
+  tether) inside the beam.
+- **Multipath.** A surface or bottom bounce arrives at a *longer* path length
+  than the direct return, so ghosts appear beyond the true target, not before
+  it. In shallow confined water they can dominate at moderate range.
+
+The distinguishing property of the first two is that they are **body-fixed, not
+world-fixed**. They sit at the same place in the sensor frame every ping, so
+scan matching sees a rigid structure that moves exactly with the vehicle —
+which biases ICP toward the vehicle's own motion, i.e. toward under-estimating
+travel. That is a systematic error, not noise, and no amount of averaging or
+outlier rejection removes it. Multipath is worse in a different way: a ghost is
+world-fixed-ish and geometrically plausible, so it can form consistent
+loop-closure evidence.
+
+**What the code does about it now.** `filter/min_range` and `filter/max_range`
+(metres, 0 = off, both dynamic), applied before voxel downsampling and outlier
+rejection so an excluded return cannot contribute the density that keeps a
+spurious cluster alive. Both default off — this is an operator decision made
+against real imagery, not something to guess.
+
+`max_range` in confined water has a hard physical justification worth stating
+plainly: in a pool of known size, any echo beyond the largest direct-path
+dimension **cannot** be structure, so it is provably a ghost. That makes a
+range cap a principled multipath filter here in a way it would not be in open
+water.
+
+The CFAR window already blanks the inner and outer `Ntc/2 + Ngc/2` bins, but
+that is an accident of window size, not a statement about the platform, and it
+moves whenever `Ntc`/`Ngc` are tuned. The node now logs the actual figures on
+the first ping of each geometry so the implicit exclusion is visible before
+anyone sets an explicit one:
+
+```
+sonar geometry: 300 bins x 256 beams @ 0.083 m; CFAR window blanks the inner
+2.08 m and the outer 2.08 m (usable 2.08-22.92 m). filter/min_range 0.00 m,
+max_range off
+```
+
+Note the *outer* blanking too: usable range is `Ntc/2 + Ngc/2` bins short of
+configured range on both ends, so a `max_range` above the reported usable range
+does nothing.
+
+**Not attempted.** Discriminating wake from structure *within* a ping (bubble
+clouds have distinctive texture and decorrelate between pings, unlike a wall).
+That is a real technique but it needs bag data with known wake events to
+develop against, and a range gate captures most of the benefit for a fraction
+of the risk.
+
 ## 6. The e2e fixture never stresses the detector [MEASURED]
 
 `SyntheticWorld::polar_image` draws background from **N(30, 6)** and wall
@@ -256,6 +330,7 @@ scratch directory.
 | 3 | Extract in polar, drop the mask remap (§5) | **DONE** — `filter/extract_polar: true`, legacy path retained |
 | 4 | Tune `Pfa` / `filter.threshold` as one operating point (§2.2) | **OPEN** — needs a bag; documented in `feature.yaml` |
 | 5 | 2-D range-azimuth window (§4) | **NOT PLANNED** — no evidence of need |
+| 6 | Range gate for wake / ringdown / multipath (§5b) | **DONE** — `filter/min_range`, `filter/max_range`, default off |
 
 Nothing here is a defect in the detector itself (§1). The findings are about
 operating point, an inherited processing order, and a test fixture that cannot

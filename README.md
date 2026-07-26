@@ -429,6 +429,19 @@ which the previous continuous-domain Monte Carlo could not see; and
 instead of from a Cartesian remap of it, which used to discard most near-field
 polar cells outright — see `docs/DIVERGENCES.md` #11.
 
+Because that last change recovers near-field returns, and the near field is
+also where **thruster wake, ringdown and multipath** live, `filter/min_range`
+and `filter/max_range` (metres, 0 = off, both dynamic) gate the cloud
+explicitly. Wake and ringdown pass CFAR honestly — they really are bright —
+but they are *body*-fixed, so scan matching reads them as structure moving
+with the vehicle and biases ICP toward its own motion. In confined water
+`max_range` is a principled multipath filter: a surface or bottom bounce
+travels a longer path than the direct return, so in a pool of known size any
+echo beyond the largest direct-path dimension cannot be structure. The node
+logs the blanking the CFAR window already imposes (2.08 m inner *and* outer on
+the Revolution preset) on the first ping of each geometry, so you can see where
+the implicit exclusion sits before setting an explicit one.
+
 ## Intentional deviations from the Python stack
 
 - `shgo` is replaced by Sobol sampling + Nelder–Mead: same sample budget
