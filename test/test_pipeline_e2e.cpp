@@ -10,7 +10,11 @@
 //  [4] A USBL-style absolute position prior pulls the estimate toward truth.
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <random>
+#include <string>
+#include <system_error>
 
 #include "sonar_slam_cpp/cfar.hpp"
 #include "sonar_slam_cpp/slam_core.hpp"
@@ -140,15 +144,31 @@ int main()
   // test the loaded chain — this used to assert unconditional rejection,
   // which was wrong for the deployed configuration.
   {
-    const auto write_icp = [](const char* path, const char* minimizer) {
+    // Unique per run, and cleaned up below. Fixed /tmp names race when two
+    // test runs share a host — `colcon test` parallelises, and a shared build
+    // machine can have several workspaces running at once — which would make
+    // this stage flaky for reasons that have nothing to do with what it tests.
+    const std::filesystem::path tmp = std::filesystem::temp_directory_path();
+    const std::string tag = std::to_string(std::random_device{}());
+    const std::string icp_p2plane =
+      (tmp / ("sslm_test_icp_" + tag + "_p2plane.yaml")).string();
+    const std::string icp_p2point =
+      (tmp / ("sslm_test_icp_" + tag + "_p2point.yaml")).string();
+
+    const auto write_icp = [](const std::string& path, const char* minimizer) {
       std::ofstream f(path);
       f << "matcher:\n  KDTreeMatcher:\n    knn: 1\n    maxDist: 2.5\n"
         << "errorMinimizer:\n  " << minimizer << "\n"
         << "transformationCheckers:\n"
         << "  - CounterTransformationChecker:\n      maxIterationCount: 40\n"
         << "inspector:\n  NullInspector\n";
+      f.close();
+      // An unwritable temp dir would leave load_from_yaml on its default
+      // chain, and this stage would then be asserting against a config it
+      // never wrote — a pass that means nothing.
+      return f.good();
     };
-    const auto censi_rejected = [](const char* icp_path) {
+    const auto censi_rejected = [](const std::string& icp_path) {
       Slam s;
       s.icp.load_from_yaml(icp_path);
       s.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
@@ -160,20 +180,27 @@ int main()
       return false;
     };
 
-    write_icp("/tmp/sslm_test_icp_p2plane.yaml", "PointToPlaneErrorMinimizer");
-    write_icp("/tmp/sslm_test_icp_p2point.yaml", "PointToPointErrorMinimizer");
+    CHECK(write_icp(icp_p2plane, "PointToPlaneErrorMinimizer"),
+          "could not write %s", icp_p2plane.c_str());
+    CHECK(write_icp(icp_p2point, "PointToPointErrorMinimizer"),
+          "could not write %s", icp_p2point.c_str());
 
-    CHECK(censi_rejected("/tmp/sslm_test_icp_p2plane.yaml"),
+    CHECK(censi_rejected(icp_p2plane),
           "configure accepted Censi against a point-to-plane ICP chain");
-    CHECK(!censi_rejected("/tmp/sslm_test_icp_p2point.yaml"),
+    CHECK(!censi_rejected(icp_p2point),
           "configure rejected Censi against a point-to-point ICP chain");
 
     // and the reported name must reflect what was actually loaded
     Slam probe;
-    probe.icp.load_from_yaml("/tmp/sslm_test_icp_p2plane.yaml");
-    CHECK(probe.icp.error_minimizer_name() == "PointToPlaneErrorMinimizer",
-          "error_minimizer_name reported '%s'",
-          probe.icp.error_minimizer_name().c_str());
+    probe.icp.load_from_yaml(icp_p2plane);
+    const std::string reported = probe.icp.error_minimizer_name();
+
+    std::error_code ec;  // best-effort cleanup; never fail the test on it
+    std::filesystem::remove(icp_p2plane, ec);
+    std::filesystem::remove(icp_p2point, ec);
+
+    CHECK(reported == "PointToPlaneErrorMinimizer",
+          "error_minimizer_name reported '%s'", reported.c_str());
   }
 
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);

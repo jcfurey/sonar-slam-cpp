@@ -81,7 +81,14 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   // callers pass (x, y, theta) samples, but a different width would silently
   // mis-scale the consistency correction AND mis-set the reweighting cutoff —
   // a wrong covariance rather than a failure, which now feeds the NSSM
-  // degeneracy gate. Fail loudly instead.
+  // degeneracy gate. Refuse instead: return the default-constructed result,
+  // i.e. success = false, exactly as the size guards above do. That is this
+  // function's failure contract, not a silent success — the callers branch on
+  // it (slam_core.cpp reports "Failed to calculate covariance" and abandons
+  // the estimate). Deliberately NOT a throw: every other rejection here is a
+  // return, and this runs inside the SLAM callback where a config-shaped
+  // error must not unwind the graph update. `d` is fixed at 3 by both call
+  // sites today, so this guards future misuse rather than a live path.
   if (d != 3) return result;
 
   std::mt19937 rng(0x5eed);  // deterministic across runs
