@@ -1,13 +1,26 @@
 // CPU/GPU parity and performance self-check. Runs every CUDA kernel against
 // its CPU twin on synthetic sonar-like data and reports max mismatch + timing.
-// Exits nonzero on any parity failure. With no GPU (or SONAR_SLAM_FORCE_CPU=1)
-// it degrades to a CPU smoke test.
+// With no GPU (or SONAR_SLAM_FORCE_CPU=1) it degrades to a CPU smoke test.
+//
+// Exit codes:
+//   0  every comparison passed (count reported)
+//   1  a comparison FAILED
+//   2  nothing was compared — CPU-only build or no visible device. NOT a pass.
+//
+// --smoke-ok downgrades 2 to 0 while still printing the NOT-CHECKED notice.
+// It exists for the registered `test_runtime_parity` ament test, which must
+// stay green in the configurations where parity is simply not observable
+// (the package's own CI builds -DSONAR_SLAM_ENABLE_CUDA=OFF, and a CUDA build
+// inside a GPU-less container is just as common) while still going red on a
+// real mismatch. Operators running the tool by hand get the strict contract:
+// a green light from a tool that compared nothing is worse than no answer.
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -30,8 +43,22 @@ double ms_since(Clock::time_point t0)
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+  bool smoke_ok = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg(argv[i]);
+    if (arg == "--smoke-ok") {
+      smoke_ok = true;
+    } else {
+      std::fprintf(stderr,
+                   "parity_check: unknown argument '%s'\n"
+                   "usage: parity_check [--smoke-ok]\n",
+                   argv[i]);
+      return 1;
+    }
+  }
+
   const int rows = 716, cols = 512;  // typical Oculus polar image size
   std::mt19937 rng(42);
   std::uniform_real_distribution<float> dist(0.f, 80.f);
@@ -247,7 +274,11 @@ int main()
       "parity NOT CHECKED: 0 comparisons ran.\n"
       "  Built without CUDA (-DSONAR_SLAM_ENABLE_CUDA=OFF), or no device is\n"
       "  visible. This is NOT a pass — there was nothing to compare.\n");
-    return 2;
+    if (!smoke_ok) return 2;
+    std::printf(
+      "  --smoke-ok: reporting success anyway (CPU smoke run only). The CPU\n"
+      "  kernels above ran without crashing; GPU parity remains UNVERIFIED.\n");
+    return 0;
   }
   std::printf("parity OK (%d comparisons, 0 failures)\n", compared);
   return 0;

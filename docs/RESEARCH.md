@@ -113,9 +113,9 @@ sliding window).
   Accessible derivations of the CA/GOCA/SOCA/OS threshold factors with the
   primary-source trail (Hansen 1973 for GO; Weiss 1982 for SO/GO; Rohling 1983
   for OS), including the closed-form OS-CFAR P_FA product the repo's
-  `pfa_os()` implements. Notes that ranks near 3N/4–4N/5 are recommended —
-  worth comparing against the repo's default `rank: 10` of `Ntc: 40` (N/4)
-  when tuning.
+  `pfa_os()` implements. Notes that ranks near 3N/4–4N/5 are recommended,
+  which the shipped `rank: 30` of `Ntc: 40` now follows (see the resolved
+  open question below and `SONAR_FRONTEND_REVIEW.md` §3).
 
 ## 3. Scan matching: ICP, libpointmatcher, and ICP covariance
 
@@ -314,12 +314,20 @@ config → unchanged behavior) and only when their correctness can be validated.
 
 **Documented, not changed (would break `bruce_slam` parity):**
 
-- **OS-CFAR rank** (§2) — the literature favours k ≈ 3N/4–4N/5, whereas the
-  shipped `feature.yaml` uses `rank: 10` with `Ntc: 40` (N/4), inherited
-  verbatim from `bruce_slam`. Left as-is to preserve tuning parity; the value
-  is already a config knob (`CFAR/rank`) for anyone who wants to follow the
-  guidance. The code's negative-`rank` fallback stays at N/2 to match
-  `CFAR.py`'s `rank=None`.
+- **OS-CFAR rank** (§2) — the literature favours k ≈ 3N/4–4N/5, whereas
+  `bruce_slam` used `rank: 10` with `Ntc: 40` (N/4). This was left at the
+  inherited value for tuning parity, then **changed to `rank: 30` on
+  2026-07-26** once measurement showed the inherited value costs accuracy on
+  uint8 input (below). `alg: OS` is the only consumer and the shipped default
+  is `SOCA`, so parity of the default path is untouched. The code's
+  negative-`rank` fallback stays at N/2 to match `CFAR.py`'s `rank=None`.
+  **RESOLVED 2026-07-26** by measurement, see `SONAR_FRONTEND_REVIEW.md` §3:
+  on uint8 input `rank: 10` realizes 13% more false alarms than nominal while
+  Rohling's 3N/4 (`rank: 30`) tracks it to 0.4%, because the low-rank
+  statistic is a single-digit integer that the large τ then amplifies. The
+  recommendation is now to set `rank: 30` whenever `alg: OS` is selected;
+  parity is preserved for the shipped `alg: 'SOCA'` default, which never
+  reads it.
 
 **Deferred (new algorithms; correctness not verifiable in this environment):**
 

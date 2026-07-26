@@ -4,8 +4,22 @@
     CFAR:
       Ntc: 40      # number of training cells
       Ngc: 10      # number of guard cells
+      # Per-PIXEL false-alarm probability, not per-frame: 0.1 admits ~1 in 10
+      # background pixels (~32k per 716x512 ping) before filter/threshold and
+      # the geometric filters below. Published sonar CFAR practice is ~0.02.
+      # It is deliberately permissive — this front-end feeds ICP, not target
+      # declaration — but note that the ABSOLUTE filter/threshold gate below
+      # is what then carries the load, and unlike this it is not
+      # range-adaptive. Tune the two together, never one alone:
+      # docs/SONAR_FRONTEND_REVIEW.md §2.
       Pfa: 0.1     # false alarm rate
-      rank: 10     # matrix rank
+      # Order statistic used by alg: OS (ignored by CA/SOCA/GOCA). Rohling's
+      # 3N/4 = 30 of Ntc 40, not bruce_slam's inherited 10: on uint8 input the
+      # 11th-smallest of 40 samples is a single-digit integer whose
+      # quantization step the large tau amplifies, realizing 13% MORE false
+      # alarms than nominal (rank 30 tracks nominal to 0.4%). Measured in
+      # docs/SONAR_FRONTEND_REVIEW.md §3, asserted by test_cfar_math [5].
+      rank: 30     # order statistic for alg: OS (~3N/4)
       alg: 'SOCA'  # method of CFAR, see cfar.cpp for options. SOCA is best.
 
     # point cloud filtering params
@@ -15,6 +29,40 @@
       radius: 1.0      # outlier rejection radius
       min_points: 5    # outlier rejection min points
       skip: 1          # how often to skip a point cloud, use 1
+      # Extract detections from the POLAR mask and convert exactly, instead of
+      # remapping the mask to Cartesian first and reading pixel indices out of
+      # it. The legacy order lets a detection survive only if some Cartesian
+      # pixel happens to sample its polar cell — 68.7% of cells inside 4.3 m
+      # are unreachable on an Oculus, 73.9% inside 5 m on the Revolution
+      # preset — and snaps the survivors to the grid. Polar extraction has
+      # neither problem and skips the mask remap entirely, so it is also
+      # cheaper. Set false to restore the legacy path if a bag replay
+      # disagrees (startup only — unlike the tuning knobs above this one is
+      # not re-read dynamically). docs/SONAR_FRONTEND_REVIEW.md §5.
+      extract_polar: true
+      # Explicit range gate in METRES (0 = off, both dynamic). The CFAR window
+      # ALREADY blanks the inner and outer Ntc/2+Ngc/2 bins — 2.08 m on the
+      # Revolution preset, 0.75 m on an Oculus at 0.03 m — but that is an
+      # accident of window size and moves when you tune Ntc/Ngc. The node logs
+      # the actual figures on the first ping of each geometry.
+      #
+      # min_range: thruster wake and bubble clouds, ringdown / near-field
+      #   saturation, and the vehicle's own frame or tether in the beam. These
+      #   pass CFAR honestly — they really are bright against their
+      #   surroundings — but they are BODY-fixed, not world-fixed, so they pull
+      #   ICP toward the vehicle's own motion. Raise this until the wake stops
+      #   appearing in feature_img while hovering or backing down.
+      # max_range: in confined water this is a multipath filter with a hard
+      #   physical basis — a surface or bottom bounce travels a LONGER path
+      #   than the direct return, so in a pool of known size any echo beyond
+      #   the largest direct-path dimension cannot be structure. Set it near
+      #   that dimension (a ~16 m pool: ~18-20 m) to drop the ghost ring.
+      #   Above the usable range logged at startup it does nothing.
+      # NOTE both gates are applied BEFORE voxel downsampling and outlier
+      # rejection, so excluded returns cannot contribute density that keeps a
+      # spurious cluster alive.
+      min_range: 0.0
+      max_range: 0.0
 
     # are we using compressed imagary
     compressed_images: false

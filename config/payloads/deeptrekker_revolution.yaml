@@ -85,9 +85,10 @@
     # actually locked — the last cleared-with-an-asterisk suspect in
     # docs/SLAM_EFFECTIVENESS_AUDIT.md section 4.
     #
-    # Use the SAMPLED estimator (FAST-MCD over N registrations). Runtime ICP is
-    # now point-to-plane, while the retained Censi helper still builds the old
-    # point-to-point Hessian; `censi` is rejected until those objectives match
+    # Use the SAMPLED estimator (FAST-MCD over N registrations). `censi` is
+    # gated on the LOADED ICP chain, so it is rejected against this package's
+    # point-to-plane config/icp.yaml and accepted against a point-to-point
+    # override — but even matched it is optimistic for point-to-point ICP
     # (docs/LITERATURE_REVIEW_2026.md Part 2.6). Sampled fixes the fixed-
     # confidence problem and costs N registrations per keyframe (bounded by the
     # OpenMP pool + the 2 s cap). If that is too heavy on target compute, lower

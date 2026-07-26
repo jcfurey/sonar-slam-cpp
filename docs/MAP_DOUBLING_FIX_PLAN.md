@@ -4,6 +4,13 @@
 **Bag:** `bags/2026-04-16_Callisto_CHL_Pool_19-20-45_UTC_corrected_v2` (CHL_Pool, `robot_slam_venue=pool`)
 **Goal:** eliminate the ~1 m wall **doubling** in the graph-anchored map so the corrected map has single, crisp walls.
 
+> **Status note (2026-07-26).** This is a point-in-time plan, kept for the
+> diagnosis and the replay protocol in §5. Several items have since been
+> superseded by work done after it was written — see `DIVERGENCES.md` #9
+> (revisit-target selection), #11 (polar extraction), and
+> `SONAR_FRONTEND_REVIEW.md`. Code references here name functions rather than
+> line numbers, which had already drifted.
+
 ---
 
 ## 1. Problem statement
@@ -30,7 +37,7 @@ Sharp lines + ~1 m separation ⇒ **not blur, but two offset passes** of the sam
 |---|---|---|
 | Loop closure (NSSM) destabilizes the graph | A/B: `nssm/enable` on vs off | ❌ on ≈ off (map→odom ±2.5 m either way) |
 | Feature dropout drives the instability | corr(feature-drop, map→odom motion) = **−0.215**; biggest snaps have healthy features | ❌ not the trigger |
-| Head-pitch gate misfiring on a bad signal | NaN-sentinel timing: 10 sustained bands, 0 singletons | ❌ genuine head sweeps; gate is correct by design (`feature_extraction_node.cpp:375-376`) |
+| Head-pitch gate misfiring on a bad signal | NaN-sentinel timing: 10 sustained bands, 0 singletons | ❌ genuine head sweeps; gate is correct by design (`feature_extraction_node.cpp`, the `max_head_pitch` gate) |
 | map→odom "oscillation" is the defect | map→odom dips near the origin revisit, grows far from it | ⚠️ largely expected geometry, not the defect |
 | **Loop closure is ineffective → revisit drift uncorrected** | doubling = crisp offset passes; SSM is sequential and cannot close a revisit gap | ✅ **root cause** |
 
@@ -41,7 +48,8 @@ accepted closures over ~100 keyframes — far too few to close the revisit drift
 ~1 m gap between passes is never corrected → doubling.
 
 **Aliasing source:** the NSSM Sobol global-init searches yaw over `±5·rotation_std`
-(`src/packages/localization/sonar_slam_cpp/src/core/slam_core.cpp:683-686`). When a
+(`slam_core.cpp`, `initialize_nonsequential_scan_matching`, the `yaw_bound`/`bounds`
+block). When a
 keyframe's marginal yaw uncertainty is loose, that window spans the ~90° alias basin,
 so the search lands on a rotated-but-plausible match that the compass gate then kills.
 
@@ -51,15 +59,16 @@ so the search lands on a rotated-but-plausible match that the compass gate then 
 
 ### 3a. Compass-clamped NSSM init yaw (primary)
 
-**File:** `src/packages/localization/sonar_slam_cpp/src/core/slam_core.cpp`, in
-`initialize_nonsequential_scan_matching`, the bounds block at ~683-686.
+**File:** `src/core/slam_core.cpp`, in
+`initialize_nonsequential_scan_matching`, the bounds block.
 
 Change the rotation bounds from `±5·rotation_std` to
 `±min(5·rotation_std, nssm_max_yaw_vs_compass)` (~0.15 rad). Keep translation bounds
 (`±5·translation_std`) unchanged.
 
 Rationale: both keyframes' DR yaws are compass-anchored and drift-free (the same
-premise the compass gate at `:783-795` relies on), so the true closure yaw is always
+premise the compass gate in `add_nonsequential_scan_matching` relies on), so the
+true closure yaw is always
 within the compass band. Narrowing the search keeps full translation freedom but
 prevents the Sobol search from ever entering the 90° alias basin.
 
@@ -68,7 +77,7 @@ revisit passes pull together → doubling drops.
 
 ### 3b. `is_keyframe` min-point gate (supporting, cheap)
 
-**File:** `slam_core.cpp:307-319` (`is_keyframe`).
+**File:** `slam_core.cpp`, `Slam::is_keyframe`.
 
 Add a minimum point-count condition so a near-empty (0-row) feature cloud does not
 become a 0-pt keyframe. NaN-sentinel frames already become non-keyframes; genuinely
@@ -78,7 +87,8 @@ still carries the pose across the gap.
 ### 3c. Head pitch — no code change
 
 The 26% head-pitch drops are genuine sweeps of a floor/surface-dominated fan; the gate
-is correct (`feature_extraction_node.cpp:375-383`) and the 2D registration points are
+is correct (`feature_extraction_node.cpp`, the `max_head_pitch` gate) and the 2D
+registration points are
 not pitch-compensated, so **raising `max_head_pitch` would admit corrupting frames**.
 Mitigation is operational: keep the camera head level while surveying.
 
@@ -89,11 +99,17 @@ Mitigation is operational: keep the camera head level while surveying.
 The change *narrows* the search (makes aliasing less likely); it does not touch any
 acceptance gate. All existing guards remain:
 
-- Compass-consistency gate (`slam_core.cpp:783-795`)
+- Compass-consistency gate (`slam_core.cpp`, `add_nonsequential_scan_matching`)
 - PCM clique consistency (`min_pcm`, `pcm_queue_size`)
 - Degeneracy gate (`max_sigma`, `max_anisotropy`)
-- DCS robust kernel on loop factors (`:851-855` / `:868`)
-- Post-loop revert (`post_loop_max_yaw_rms`, `post_loop_max_translation_err`)
+- DCS robust kernel on loop factors (`nssm/use_dcs`, default off)
+- Post-loop revert (`post_loop_max_yaw_rms`, `post_loop_max_link_error_sigma`
+  — renamed from `post_loop_max_translation_err` when the chain-tear check
+  moved from metres-vs-DR to sigma-of-the-link's-own-measurement; slam_node
+  warns if the old key is still set)
+- Revisit-target selection (`min_revisit_sep` + run clustering,
+  `docs/DIVERGENCES.md` #9) and the absolute translation gate
+  (`max_translation_vs_dr`) — both added after this plan was written
 
 ---
 

@@ -287,6 +287,27 @@ private:
   void record_consecutive_link(int key, const gtsam::Pose2& measured,
                                double trans_sigma, double rot_sigma);
 
+  // True when both keyframes' dr_pose values were produced by the SAME
+  // dead-reckoning epoch, i.e. they are differenceable. A loaded map's
+  // keyframes carry the dr_pose they were serialized with in a PREVIOUS
+  // mission; this session's keyframes start from this mission's DR origin.
+  // Within either group `between` is meaningful; across the boundary it is
+  // an arbitrary offset. (loaded_key_count_ == 0 => one epoch, always true.)
+  bool same_dr_epoch(int key_a, int key_b) const;
+
+  // Predicted target->source relative pose used by the loop-closure
+  // consistency gates.
+  //
+  // Dead reckoning is the preferred predictor because it is INDEPENDENT of
+  // the pose graph: a graph already bent by an earlier bad closure cannot
+  // then excuse the next one. Across a map-load boundary DR cannot supply it
+  // (see same_dr_epoch), so the graph estimate does — after relocalization
+  // that IS the common frame tying the loaded chain to this session, and it
+  // is the same reference the Sobol init bounds are already centred on.
+  // dr_backed reports which was used, for the gate's diagnostic text.
+  gtsam::Pose2 predicted_relative_pose(int target_key, int source_key,
+                                       bool* dr_backed = nullptr) const;
+
   // failure recovery for update_factor_graph: undo loop-closure bookkeeping
   // written before a failed solve, and reconstruct ISAM2 from the committed
   // factor mirror (a thrown ISAM2::update leaves the estimator in an

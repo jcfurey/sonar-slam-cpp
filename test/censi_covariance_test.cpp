@@ -1,7 +1,8 @@
-// Standalone validation of the retained point-to-point Censi (2007)
-// covariance math. The runtime cov_method is deliberately disabled because
-// the shipped ICP is point-to-plane; this test protects the isolated helper
-// while a matching point-to-plane covariance implementation is pending. The
+// Standalone validation of the point-to-point Censi (2007) covariance math.
+// Runtime selection of cov_method: censi is gated on the loaded ICP chain
+// (rejected against the package default's point-to-plane minimizer, accepted
+// against a point-to-point one), so this test covers the helper directly and
+// independently of which chain a deployment configures. The
 // estimator tested here is
 //     cov = 2 * sensor_var * (Sum_i J_i^T J_i)^-1
 // for 2D point-to-point registration. This test Monte-Carlo checks it: it

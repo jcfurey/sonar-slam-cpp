@@ -64,7 +64,8 @@ at the time of comparison.
   reproduced by this port's CPU and CUDA paths) thresholds on `train[rank]`
   after `nth_element`, the **(rank+1)-th smallest**. The solved τ therefore
   over-thresholds: realized P_FA = target × (N−rank)/(τ+N−rank). At the
-  shipped config (Ntc 40, rank 10, Pfa 0.1) that is ≈ 0.0767 instead of 0.1
+  config this port inherited (Ntc 40, rank 10, Pfa 0.1) that is ≈ 0.0767
+  instead of 0.1
   (Monte Carlo: 0.0766).
 - **Here:** `pfa_os()` uses the product with rank+1 factors
   (`Γ(N−rank)`, `Γ(τ+N−rank)`), matching the detector's actual statistic;
@@ -86,8 +87,7 @@ at the time of comparison.
   `grow_rows`) with the matching increment, so the intensity mosaic stays
   aligned as the map expands sideways. The port enables `pub_intensity` (the
   backscatter mosaic is a shipped product), so the branch is now live and had
-  to be correct. (`mapping_node`, the port of `mapping.py`; see
-  `SONAR_MAPPING_ARCHITECTURE.md` §5.)
+  to be correct. (`mapping_node`, the port of `mapping.py`.)
 
 ### 8. Sampled-covariance registrations run in parallel (`parallel_cov_samples`)
 - **Upstream:** `slam.py` runs the `cov_samples` (30) ICP registrations of the
@@ -160,6 +160,34 @@ at the time of comparison.
   the failure shows up as a corrupted map rather than a SLAM divergence, which
   is why it could persist unnoticed.
 
+### 11. Feature extraction reads the POLAR mask, not its Cartesian remap
+
+- **Upstream:** `feature_extraction.py` remaps the binary CFAR mask to a
+  Cartesian image with nearest-neighbour interpolation, calls `findNonZero` on
+  that, and converts the resulting pixel indices to metres.
+- **Here:** `feature_extraction_node.cpp` runs `findNonZero` on the polar mask
+  and converts each `(range bin, beam)` exactly —
+  `range = range_min + row*res`, `bearing = bearings[beam]` — using the same
+  axis convention `generate_map_xy` defines, so cloud orientation is unchanged.
+  `filter/extract_polar: false` restores the upstream order.
+- **Why:** nearest-neighbour resampling is a *pull*, so a polar cell reaches
+  the cloud only if some destination pixel happens to sample it. Inside the
+  range where beam arc spacing is finer than the Cartesian cell (6.8 m for an
+  Oculus at 0.03 m, 9.4 m for the Revolution preset) cells compete and lose:
+  68.7% and 73.9% of near-field cells respectively are unreachable, and the
+  survivors arrive snapped to the grid. Measurements and the bounded-impact
+  analysis are in `docs/SONAR_FRONTEND_REVIEW.md` §5 — the practical damage is
+  confined to roughly the inner 3 m because `filter/resolution` (0.5 m)
+  downsamples far more aggressively than either grid, so this is a
+  correctness/near-field fix, not a claimed accuracy jump.
+- **Cost:** negative — the mask remap disappears entirely. The Cartesian remap
+  survives only for the `feature_img` visualization, which is already gated on
+  a subscriber.
+- **Verification:** 35/35 probe cells across the fan agree between the two
+  conversions to within one Cartesian cell (worst 0.032 m against a 0.030 m
+  cell), which is exactly the grid snap being removed — confirming no mirror
+  or axis swap was introduced.
+
 ## Carried-over limitations left in place (with rationale)
 
 ### A. Only the newest keyframe's covariance is refreshed
@@ -183,8 +211,10 @@ global-init-cost parity fixtures are unaffected.
 `test/interp_spline_test.cpp` checks `Interp1d` against `scipy.interp1d`: LINEAR
 and the not-a-knot CUBIC both match scipy to ~1e-15 (incl. a uniform grid, the
 zero-pivot case). `test/censi_covariance_test.cpp` Monte-Carlo-validates the
-retained point-to-point covariance math; runtime selection is disabled because
-the shipped ICP objective is now point-to-plane.
+point-to-point covariance math directly. Runtime selection of `cov_method:
+censi` is gated on the loaded ICP chain rather than disabled outright: it is
+rejected against the package default's point-to-plane minimizer and accepted
+against a point-to-point one.
 
 ## Angle-innovation wrapping in the Kalman node (deliberate, correctness over parity)
 

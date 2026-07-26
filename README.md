@@ -36,11 +36,12 @@ feature extractor against the Python SLAM node or vice versa.
 
 The C++ stack is a strict **superset**: it adds parameters the Python
 original has no equivalent for — the NSSM degeneracy and compass gates
-(`nssm/max_sigma`, `max_anisotropy`, `max_yaw_vs_compass`,
-`max_translation_vs_dr`, `min_revisit_sep`, `min_overlap_ratio`), the
-post-loop verification (`post_loop_max_yaw_rms`,
-`post_loop_max_link_error_sigma`), map persistence, USBL input, operator hand
-correction, and the `map->odom` republish timer. Those are additive; a Python
+(`nssm/max_sigma`, `max_anisotropy`, `degeneracy_prefloor`,
+`max_yaw_vs_compass`, `max_translation_vs_dr`, `min_revisit_sep`,
+`min_overlap_ratio`), the post-loop verification (`post_loop_max_yaw_rms`,
+`post_loop_max_link_error_sigma`), the front-end range gate
+(`filter/min_range`, `max_range`, `extract_polar`), map persistence, USBL
+input, operator hand correction, and the `map->odom` republish timer. Those are additive; a Python
 config simply leaves them at their defaults.
 
 | executable | ports | Python original |
@@ -277,6 +278,15 @@ SONAR_SLAM_FORCE_CPU=1 ros2 launch sonar_slam_cpp slam.launch.xml
 ros2 run sonar_slam_cpp parity_check
 ```
 
+`parity_check` exits `0` when every CPU/GPU comparison passed (it prints the
+count), `1` on a mismatch, and `2` when **nothing was compared** — a CPU-only
+build or no visible device. Exit 2 is deliberately not a pass: a green light
+from a tool that compared nothing is worse than no answer. The registered
+`test_runtime_parity` test invokes it with `--smoke-ok`, which downgrades 2 to
+0 so the suite stays green where parity is unobservable (CI builds
+`-DSONAR_SLAM_ENABLE_CUDA=OFF`); a real mismatch still fails. Run it without
+the flag to actually certify a GPU build.
+
 ### Hand correction
 
 The operator can correct the SLAM estimate live: use RViz's **2D Pose
@@ -399,6 +409,39 @@ python3 test/parity_driver.py compare /tmp/slam_parity
 Verified 2026-07-10 (GPU and CPU-forced): CFAR masks, cloud ops, KNN match,
 full ICP and the global scan-match cost are **bit-exact** vs the originals;
 threshold factors match scipy; FAST-MCD agrees with the planted ground truth.
+
+## Detection front-end (CFAR) — operating point
+
+`docs/SONAR_FRONTEND_REVIEW.md` reviews the CFAR stage and the polar image
+path against the sonar literature, with measurements taken on this code. The
+short version: the detector implements its own model correctly (realized
+false-alarm rate tracks nominal to 3% on exponential clutter), but the shipped
+operating point is looser than sonar practice (`Pfa: 0.1` vs ~2%) and is
+effectively set by the *fixed* `filter/threshold`, which is not range-adaptive
+and therefore moves with gain and TVG. **If you tune one, tune both** — that
+is the one open item, and it needs a bag.
+
+Applied from that review: `CFAR/rank` is now `30` (Rohling's 3N/4 — the
+inherited `10` realizes 13% more false alarms than nominal on uint8 input;
+`alg: OS` only, inert for the `SOCA` default); `test_cfar_math` stage [5] now
+asserts realized false-alarm rate through `detect()` on exponential clutter,
+which the previous continuous-domain Monte Carlo could not see; and
+`filter/extract_polar` (default true) extracts detections from the polar mask
+instead of from a Cartesian remap of it, which used to discard most near-field
+polar cells outright — see `docs/DIVERGENCES.md` #11.
+
+Because that last change recovers near-field returns, and the near field is
+also where **thruster wake, ringdown and multipath** live, `filter/min_range`
+and `filter/max_range` (metres, 0 = off, both dynamic) gate the cloud
+explicitly. Wake and ringdown pass CFAR honestly — they really are bright —
+but they are *body*-fixed, so scan matching reads them as structure moving
+with the vehicle and biases ICP toward its own motion. In confined water
+`max_range` is a principled multipath filter: a surface or bottom bounce
+travels a longer path than the direct return, so in a pool of known size any
+echo beyond the largest direct-path dimension cannot be structure. The node
+logs the blanking the CFAR window already imposes (2.08 m inner *and* outer on
+the Revolution preset) on the first ping of each geometry, so you can see where
+the implicit exclusion sits before setting an explicit one.
 
 ## Intentional deviations from the Python stack
 
