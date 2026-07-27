@@ -291,6 +291,16 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 180)
 
+  # Mapping core invariants: tile placement, exact reversibility of the
+  # loop-closure correction (the additive-logodds premise), grid growth, and
+  # the sparse-frame free-space policy. mapping.cpp had no coverage at all.
+  add_executable(test_mapping test/mapping_test.cpp)
+  target_link_libraries(test_mapping sonar_slam_core)
+  ament_add_test(test_mapping
+    COMMAND $<TARGET_FILE:test_mapping>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 120)
+
   add_executable(test_sonar_geometry test/sonar_geometry_test.cpp)
   target_link_libraries(test_sonar_geometry sonar_slam_core)
   ament_add_test(test_sonar_geometry
