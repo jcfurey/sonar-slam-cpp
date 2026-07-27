@@ -371,28 +371,29 @@ and prints one line per map update: total wall length, local wall thickness
 skeleton cell count — the `docs/MAP_DOUBLING_FIX_PLAN.md` §5 numbers, so
 before/after replays compare as numbers instead of screenshots.
 
-> **Check `skel=` before trusting a run.** Thinning can *collapse* walls
-> instead of thinning them, and every metric then reads ~0 — including
-> `doubled`, i.e. a perfect score for a doubled map. Measured on synthetic
-> clouds at `--grid 0.05`:
->
-> | input | occupied | skeleton | wall_len | truth |
-> | --- | --- | --- | --- | --- |
-> | horizontal 10 m wall | 200 | 200 | 9.95 m | ok |
-> | single 45° 10 m wall | 142 | 142 | 9.97 m | ok |
-> | 30° 10 m wall | 261 | 259 | 13.15 m | **+32%** |
-> | two parallel 45° walls, 1 m apart | 566 | **2** | **0.00 m** | **20 m erased** |
->
-> A collapse now prints a WARNING naming the ratio, so it cannot pass
-> silently — but the underlying thinning is **not fixed**. A single wall of
-> either orientation measures correctly, so the trigger is a
-> rasterisation/thinning interaction rather than orientation alone. The 30°
-> over-read is the staircase problem: the length sum corrects the pure-45°
-> case only, so intermediate angles over-count by up to 41%.
->
-> Practically: run it on a known cloud first and confirm `skel` is a healthy
-> fraction of `cells`. If it warns, fix the thinning before using the numbers
-> to judge a tuning change.
+The measurement was **wrong in both directions before 2026-07-27** and is now
+accurate to under 2% at any wall orientation. Two defects, one root cause —
+Zhang–Suen thinning cannot thin the 2-cell-wide band an oblique wall
+rasterises into:
+
+| input (`--grid 0.05`) | was | now | truth |
+| --- | --- | --- | --- |
+| horizontal 10 m wall | 10.00 m | 10.00 m | 10 m |
+| single 45° 10 m wall | 9.97 m | 9.97 m | 10 m |
+| 30° 10 m wall | 13.15 m (**+32%**) | 9.93 m (−0.7%) | 10 m |
+| two parallel 45° walls, 1 m apart | **0.00 m, 0% doubled** | 19.96 m, 100% doubled | 20 m, doubled |
+
+The last row is the one that mattered: on the exact geometry this tool exists
+to detect, Zhang–Suen ate the walls end-first (it can only delete their
+terminal pixels), leaving 2 skeleton cells from 566 occupied — so a perfectly
+doubled map scored a **perfect 0% doubled**. Thinning is now Guo–Hall, which
+thins the band properly, and wall length applies a per-corner correction
+(`n_axis + √2·n_diag − 0.108·n_corner`) that keeps the raw staircase sum's
++7.9% orientation bias under 1.9% while staying exact at 0°/45°/90°.
+
+`test_map_metrics` locks this in against synthetic walls of known length and
+known doubling, including both former failures; the collapse WARNING stays as
+a backstop, and `skel=` is still worth a glance on an unfamiliar cloud.
 
 ## Parity verification against the Python stack
 

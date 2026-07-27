@@ -280,6 +280,17 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_censi_covariance>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  # map-quality metrics against synthetic walls of known length and known
+  # doubling — locks in the thinning/length accuracy the replay protocol
+  # depends on (a doubled map used to score a perfect 0% doubled, 0.00 m)
+  add_executable(test_map_metrics test/map_metrics_test.cpp)
+  target_include_directories(test_map_metrics PRIVATE ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(test_map_metrics ${OpenCV_LIBS})
+  ament_add_test(test_map_metrics
+    COMMAND $<TARGET_FILE:test_map_metrics>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 180)
+
   add_executable(test_sonar_geometry test/sonar_geometry_test.cpp)
   target_link_libraries(test_sonar_geometry sonar_slam_core)
   ament_add_test(test_sonar_geometry

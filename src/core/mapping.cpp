@@ -228,16 +228,22 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
       //
       // The explicit loop can tell the two cases apart, unlike argmax:
       // `first` stays sub_rows_ only when no cell exceeded the threshold.
-      for (int col = 0; col < sub_cols_; ++col) {
-        int first = sub_rows_;  // no hit in this column -> free it entirely
-        for (int row = 0; row < sub_rows_; ++row) {
-          if (mask.at<float>(row, col) > 0.5f) {
-            first = row;  // free only what lies BEFORE the hit (none if row 0)
-            break;
-          }
-        }
-        for (int row = 0; row < first; ++row)
-          mask.at<float>(row, col) = static_cast<float>(miss_prob);
+      //
+      // Done as two ROW-major sweeps rather than a per-column walk: the mask
+      // is row-major, so scanning a column touched one useful float per cache
+      // line. Columns never interact (each only reads and writes its own), so
+      // hoisting the per-column state into a vector is the same computation.
+      first_hit_.assign(static_cast<size_t>(sub_cols_), sub_rows_);
+      for (int row = 0; row < sub_rows_; ++row) {
+        const float* m = mask.ptr<float>(row);
+        for (int col = 0; col < sub_cols_; ++col)
+          if (first_hit_[col] == sub_rows_ && m[col] > 0.5f)
+            first_hit_[col] = row;  // free only what lies BEFORE the hit
+      }
+      for (int row = 0; row < sub_rows_; ++row) {
+        float* m = mask.ptr<float>(row);
+        for (int col = 0; col < sub_cols_; ++col)
+          if (row < first_hit_[col]) m[col] = static_cast<float>(miss_prob);
       }
     } else {
       mask.setTo(static_cast<float>(miss_prob));  // no returns -> all free
@@ -245,9 +251,10 @@ void Mapping::add_keyframe(int key, const gtsam::Pose2& pose,
 
     kf.logodds.resize(static_cast<size_t>(sub_rows_) * sub_cols_);
     size_t idx = 0;
-    for (int row = 0; row < sub_rows_; ++row)
-      for (int col = 0; col < sub_cols_; ++col)
-        kf.logodds[idx++] = logit(mask.at<float>(row, col));
+    for (int row = 0; row < sub_rows_; ++row) {
+      const float* m = mask.ptr<float>(row);
+      for (int col = 0; col < sub_cols_; ++col) kf.logodds[idx++] = logit(m[col]);
+    }
   }
 
   // --------- intensity/backscatter tile (mapping.py:244-246) ---------

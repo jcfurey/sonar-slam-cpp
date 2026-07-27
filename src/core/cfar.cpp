@@ -246,11 +246,25 @@ cv::Mat CFAR::detect(const cv::Mat& img, Alg alg, float threshold) const
   // the wrapper refuses unsupported configs and reports device errors; either
   // way the CPU paths below produce the result
   if (gpu::available()) {
-    const cv::Mat fimg = to_float(img);
-    if (gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
-                       static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
-                       threshold, mask.ptr<std::uint8_t>()))
-      return mask;
+    // Runtime polar images are uint8 — upload them as uint8. Converting to
+    // float first cost a whole-image host pass plus an allocation per ping
+    // and quadrupled the host->device transfer, all so the kernel could
+    // immediately re-widen the same values. uint8 -> float is exact, so the
+    // mask is identical either way (parity_check still exercises the float
+    // entry point against the float CPU twin).
+    if (img.type() == CV_8UC1) {
+      const cv::Mat u8 = img.isContinuous() ? img : img.clone();
+      if (gpu::cfar_u8_cuda(u8.ptr<std::uint8_t>(), img.rows, img.cols,
+                            static_cast<int>(alg), train_hs, guard_hs, rank_,
+                            tau, threshold, mask.ptr<std::uint8_t>()))
+        return mask;
+    } else {
+      const cv::Mat fimg = to_float(img);
+      if (gpu::cfar_cuda(fimg.ptr<float>(), img.rows, img.cols,
+                         static_cast<int>(alg), train_hs, guard_hs, rank_, tau,
+                         threshold, mask.ptr<std::uint8_t>()))
+        return mask;
+    }
   }
 #endif
 

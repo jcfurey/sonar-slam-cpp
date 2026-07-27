@@ -157,6 +157,9 @@ private:
   // range bounds — it does not scale with the map.
   std::vector<int> fit_r_, fit_c_;
   std::vector<unsigned char> seen_;
+  // per-bearing-column first-hit row, so the free-space sweep can run
+  // row-major over the row-major mask instead of column by column
+  std::vector<int> first_hit_;
 
   GridF logodds_grid_;
   GridU intensity_grid_;

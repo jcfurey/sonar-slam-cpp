@@ -49,6 +49,16 @@ bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
                int guard_hs, int rank, double tau, float threshold,
                std::uint8_t* mask_out);
 
+// Same detector over a NATIVE uint8 polar image — what every sonar adapter
+// actually delivers. Widening to float on the host first cost a full-image
+// conversion pass plus allocation per ping and quadrupled the host->device
+// traffic for data the kernel immediately widens back; uint8 -> float is
+// exact, so this produces the identical mask. The float entry point above
+// stays for the parity tooling, which compares against the float CPU twin.
+bool cfar_u8_cuda(const std::uint8_t* img, int rows, int cols, int alg,
+                  int train_hs, int guard_hs, int rank, double tau,
+                  float threshold, std::uint8_t* mask_out);
+
 // Nearest / bilinear remap of a uint8 image with float32 maps (cv::remap
 // semantics, constant 0 border). interp: 0=nearest, 1=linear.
 // map_version tags the (map_x, map_y) pair so the wrapper can keep the maps

@@ -126,6 +126,64 @@ int main(int argc, char** argv)
     }
   }
 
+  // ------------------------------------------------- CFAR on a uint8 image
+  // This is the path the RUNTIME takes: every sonar adapter delivers CV_8UC1,
+  // and CFAR::detect uploads it as uint8 rather than widening to float first.
+  // Certifying only the float entry point above would leave the kernel the
+  // deployment actually runs uncompared, which is the same "green light from
+  // a tool that checked nothing" this file exists to avoid. Reference is the
+  // float CPU twin over the exact widening of the same bytes — uint8 -> float
+  // is exact, so a correct GPU path must match it pixel for pixel.
+  {
+    // Same contrast as the float fixture above (clutter 0..80, sparse bright
+    // targets): uniform 0..255 clutter yields ZERO detections, and comparing
+    // two identically empty masks would certify nothing.
+    cv::Mat u8(rows, cols, CV_8UC1);
+    std::uniform_int_distribution<int> pix(0, 80);
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c) u8.at<std::uint8_t>(r, c) =
+        static_cast<std::uint8_t>(pix(rng));
+    for (int k = 0; k < 200; ++k) u8.at<std::uint8_t>(rng() % rows, rng() % cols) = 255;
+    cv::Mat u8f;
+    u8.convertTo(u8f, CV_32FC1);
+
+    for (const auto alg : {sonar_slam::CFAR::CA, sonar_slam::CFAR::SOCA,
+                           sonar_slam::CFAR::GOCA, sonar_slam::CFAR::OS}) {
+      cv::Mat cpu_mask(rows, cols, CV_8UC1);
+      auto t0 = Clock::now();
+      sonar_slam::CFAR::detect_cpu(u8f.ptr<float>(), rows, cols,
+                                   static_cast<int>(alg), 20, 5, 10,
+                                   cfar.threshold_factor(alg), kNoGate,
+                                   cpu_mask.ptr<std::uint8_t>());
+      const double cpu_ms = ms_since(t0);
+      if (gpu) {
+#ifdef SONAR_SLAM_WITH_CUDA
+        cv::Mat gpu_mask(rows, cols, CV_8UC1);
+        t0 = Clock::now();
+        const bool ok = sonar_slam::gpu::cfar_u8_cuda(
+          u8.ptr<std::uint8_t>(), rows, cols, static_cast<int>(alg), 20, 5, 10,
+          cfar.threshold_factor(alg), kNoGate, gpu_mask.ptr<std::uint8_t>());
+        const double gpu_ms = ms_since(t0);
+        if (!ok) {
+          std::printf("CFAR-u8 alg %d: GPU path failed\n", static_cast<int>(alg));
+          ++failures;
+          continue;
+        }
+        const int diff = cv::countNonZero(cpu_mask != gpu_mask);
+        ++compared;
+        std::printf("CFAR-u8 alg %d: cpu %.2f ms, gpu %.2f ms, mismatched px %d\n",
+                    static_cast<int>(alg), cpu_ms, gpu_ms, diff);
+        // uint8 inputs are integers, so every partial sum is exact on both
+        // sides — unlike the float case above this must match EXACTLY
+        if (diff != 0) ++failures;
+#endif
+      } else {
+        std::printf("CFAR-u8 alg %d: cpu %.2f ms (%d detections)\n",
+                    static_cast<int>(alg), cpu_ms, cv::countNonZero(cpu_mask));
+      }
+    }
+  }
+
 #ifdef SONAR_SLAM_WITH_CUDA
   // ----------------------------------------------------------------- remap
   if (gpu) {
