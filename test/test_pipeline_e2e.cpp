@@ -304,7 +304,14 @@ int main()
         slam_err, dr_err);
 
   // ---- [3] persistence roundtrip + relocalization --------------------------
-  const std::string map_path = "test_pipeline_e2e_map.ssm";
+  // Unique per run, for the same reason the ICP fixtures above are: two runs
+  // sharing a working directory otherwise interleave on one file, and
+  // save_map's write-temp-then-rename means the loser can load the winner's
+  // map. This one kept a fixed name after that fix landed.
+  const std::string map_path =
+    (std::filesystem::temp_directory_path() /
+     ("sslm_test_map_" + std::to_string(std::random_device{}()) + ".ssm"))
+      .string();
   CHECK(slam.save_map(map_path), "save_map failed: %s",
         slam.last_error().c_str());
   Slam s2;
