@@ -15,8 +15,23 @@ namespace sonar_slam {
 namespace gpu {
 
 // True when the package was built with CUDA, a device is present, and
-// SONAR_SLAM_FORCE_CPU is not set. Cached after the first call.
+// SONAR_SLAM_FORCE_CPU is not set. Cached after the first call, then gated on
+// disable() below.
 bool available();
+
+// Abandon the GPU path for the remainder of the process; available() returns
+// false from then on. Called by the wrappers when a device allocation fails.
+//
+// Retrying such a failure is worse than useless: the buffers are grow-only and
+// a failed ensure() leaves capacity at 0, so the next ping re-enters the
+// driver, fails identically, and logs again -- at ping rate, for as long as
+// the pressure lasts. Nothing about the process's own behaviour clears it,
+// because the memory belongs to someone else. The CPU twin already produces
+// the same result, so taking it immediately costs only latency.
+//
+// Reports once; later calls are silent. Thread-safe. Deliberately one-way:
+// re-probing would reintroduce exactly the retry storm this exists to stop.
+void disable(const char* why);
 
 #ifdef SONAR_SLAM_WITH_CUDA
 

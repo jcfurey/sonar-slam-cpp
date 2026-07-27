@@ -96,11 +96,20 @@ bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
   const std::size_t n_src = static_cast<std::size_t>(src_rows) * src_cols;
   const std::size_t n_dst = static_cast<std::size_t>(dst_rows) * dst_cols;
 
-  if (!src_buf.ensure(n_src, "remap_u8_cuda src") ||
-      !dst_buf.ensure(n_dst, "remap_u8_cuda dst") ||
-      !mx_buf.ensure(n_dst * sizeof(float), "remap_u8_cuda map_x") ||
-      !my_buf.ensure(n_dst * sizeof(float), "remap_u8_cuda map_y"))
+  if (!detail::ensure_all(
+        {{&src_buf, n_src, "remap_u8_cuda src"},
+         {&dst_buf, n_dst, "remap_u8_cuda dst"},
+         {&mx_buf, n_dst * sizeof(float), "remap_u8_cuda map_x"},
+         {&my_buf, n_dst * sizeof(float), "remap_u8_cuda map_y"}})) {
+    // The rollback freed the map buffers, so the device-resident maps this
+    // key describes no longer exist. Leaving the key intact would let a later
+    // call with the same version and host map pointers take the cached branch
+    // and sample whatever a fresh allocation happens to contain.
+    cached_version = -1;
+    cached_mx = nullptr;
+    cached_my = nullptr;
     return false;
+  }
 
   const bool maps_cached = map_version >= 0 && map_version == cached_version &&
                            dst_rows == cached_rows && dst_cols == cached_cols &&

@@ -100,8 +100,8 @@ bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
   std::lock_guard<std::mutex> lock(mutex);
 
   const std::size_t n_img = static_cast<std::size_t>(rows) * cols;
-  if (!img_buf.ensure(n_img * sizeof(float), "cfar_cuda img") ||
-      !mask_buf.ensure(n_img, "cfar_cuda mask"))
+  if (!detail::ensure_all({{&img_buf, n_img * sizeof(float), "cfar_cuda img"},
+                           {&mask_buf, n_img, "cfar_cuda mask"}}))
     return false;
   if (!detail::check(cudaMemcpy(img_buf.as<float>(), img, n_img * sizeof(float),
                                 cudaMemcpyHostToDevice),

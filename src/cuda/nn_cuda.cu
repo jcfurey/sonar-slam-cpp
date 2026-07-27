@@ -68,10 +68,11 @@ bool nn1_cuda(const float* ref_xy, int n_ref, const float* query_xy,
   static detail::DeviceBuffer ref_buf, query_buf, ids_buf, dists_buf;
   std::lock_guard<std::mutex> lock(mutex);
 
-  if (!ref_buf.ensure(2 * n_ref * sizeof(float), "nn1_cuda ref") ||
-      !query_buf.ensure(2 * n_query * sizeof(float), "nn1_cuda query") ||
-      !ids_buf.ensure(n_query * sizeof(int), "nn1_cuda ids") ||
-      !dists_buf.ensure(n_query * sizeof(float), "nn1_cuda dists"))
+  if (!detail::ensure_all(
+        {{&ref_buf, 2 * n_ref * sizeof(float), "nn1_cuda ref"},
+         {&query_buf, 2 * n_query * sizeof(float), "nn1_cuda query"},
+         {&ids_buf, n_query * sizeof(int), "nn1_cuda ids"},
+         {&dists_buf, n_query * sizeof(float), "nn1_cuda dists"}}))
     return false;
 
   if (!detail::check(cudaMemcpy(ref_buf.as<float>(), ref_xy,

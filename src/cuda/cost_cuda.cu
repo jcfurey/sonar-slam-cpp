@@ -56,11 +56,12 @@ bool grid_cost_cuda(const float* points, int n_points, const float* transforms,
   std::lock_guard<std::mutex> lock(mutex);
 
   const std::size_t n_grid = static_cast<std::size_t>(grid_rows) * grid_cols;
-  if (!points_buf.ensure(2 * n_points * sizeof(float), "grid_cost_cuda points") ||
-      !transforms_buf.ensure(6 * n_samples * sizeof(float),
-                             "grid_cost_cuda transforms") ||
-      !costs_buf.ensure(n_samples * sizeof(float), "grid_cost_cuda costs") ||
-      !grid_buf.ensure(n_grid, "grid_cost_cuda grid"))
+  if (!detail::ensure_all(
+        {{&points_buf, 2 * n_points * sizeof(float), "grid_cost_cuda points"},
+         {&transforms_buf, 6 * n_samples * sizeof(float),
+          "grid_cost_cuda transforms"},
+         {&costs_buf, n_samples * sizeof(float), "grid_cost_cuda costs"},
+         {&grid_buf, n_grid, "grid_cost_cuda grid"}}))
     return false;
 
   if (!detail::check(cudaMemcpy(points_buf.as<float>(), points,
