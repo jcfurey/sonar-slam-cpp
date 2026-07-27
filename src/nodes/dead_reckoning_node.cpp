@@ -198,7 +198,7 @@ public:
         RCLCPP_ERROR(get_logger(),
                      "No gyro integration received on %s — is gyro_node "
                      "running? (enable_gyro:=false with use_gyro: true starves "
-                     "localization)", GYRO_INTEGRATION_TOPIC);
+                     "localization)", GYRO_INTEGRATION_TOPIC.c_str());
       }
       if (!last_depth_) {
         all_seen = false;

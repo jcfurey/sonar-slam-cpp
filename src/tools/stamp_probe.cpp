@@ -9,7 +9,7 @@
 // report per-stream median (stamp − arrival) plus the pairwise deltas and
 // the exact config lines to set.
 //
-//   ros2 run sonar_slam_cpp stamp_probe --topics /oculus/sonar_image /dvl/data \
+//   ros2 run sonar_slam_cpp stamp_probe --topics /oculus/sonar_image /dvl/data
 //        [--window 30]
 //
 // The FIRST topic is the reference; suggested offsets shift the others onto
