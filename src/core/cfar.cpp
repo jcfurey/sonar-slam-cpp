@@ -25,9 +25,19 @@ double solve_root(const std::function<double(double)>& f)
     const double fx = f(x);
     if (std::isfinite(fx) && std::isfinite(prev_f) && prev_f * fx <= 0.0) {
       double lo = prev_x, hi = x;
+      // f(lo) only changes when lo moves, so carry it rather than
+      // re-evaluating it every iteration — same bracketing, half the
+      // evaluations of a function that costs O(Ntc) lgamma/exp/pow calls.
+      double f_lo = f(lo);
       for (int it = 0; it < 200; ++it) {
         const double mid = 0.5 * (lo + hi);
-        if (f(lo) * f(mid) <= 0.0) hi = mid; else lo = mid;
+        const double f_mid = f(mid);
+        if (f_lo * f_mid <= 0.0) {
+          hi = mid;
+        } else {
+          lo = mid;
+          f_lo = f_mid;
+        }
       }
       return 0.5 * (lo + hi);
     }

@@ -41,7 +41,6 @@ public:
 
 private:
   double calc_threshold_factor_ca() const;
-  double calc_threshold_factor(int alg) const;   // SOCA/GOCA/OS via root finding
   double pfa_gosoca_core(double x) const;
   double pfa_soca(double x) const;
   double pfa_goca(double x) const;

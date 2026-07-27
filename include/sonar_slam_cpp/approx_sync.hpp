@@ -15,7 +15,6 @@
 #include <deque>
 #include <functional>
 #include <mutex>
-#include <optional>
 #include <utility>
 
 namespace sonar_slam {
@@ -29,17 +28,21 @@ struct Stamped
   T value;
 };
 
+// Returns a POINTER into the queue (null when nothing lies within slop) rather
+// than a copy of the match — the callers only read it, and the queued value is
+// a whole ROS message. Valid until the queue is mutated, which the callers do
+// only after they are done with it.
 template <typename T>
-std::optional<Stamped<T>> nearest_within(const std::deque<Stamped<T>>& q,
-                                         double t, double slop)
+const Stamped<T>* nearest_within(const std::deque<Stamped<T>>& q, double t,
+                                 double slop)
 {
-  std::optional<Stamped<T>> best;
+  const Stamped<T>* best = nullptr;
   double best_dt = slop;
   for (const auto& item : q) {
     const double dt = std::abs(item.t - t);
     if (dt <= best_dt) {
       best_dt = dt;
-      best = item;
+      best = &item;
     }
   }
   return best;
@@ -140,15 +143,16 @@ private:
       // wait until the secondary stream has passed head.t + slop, so the
       // nearest neighbor is final
       if (qb_.empty() || qb_.back().t < head.t + slop_) return;
-      const auto match = detail::nearest_within(qb_, head.t, slop_);
+      const auto* match = detail::nearest_within(qb_, head.t, slop_);
       if (match) {
+        const double match_t = match->t;  // read before qb_ is mutated
         cb_(head.value, match->value);
         // keep the matched secondary (drop only strictly-older ones): a dense
         // secondary (e.g. odometry) may be the nearest neighbour of several
         // primaries. This deliberately diverges from message_filters ATS,
         // which consumes a matched message — here we prefer pairing every
         // primary (each a keyframe candidate) over one-shot secondary use.
-        detail::drop_older(qb_, match->t - slop_);
+        detail::drop_older(qb_, match_t - slop_);
       } else if (on_nomatch_) {
         // the secondary passed this primary with nothing inside slop: a
         // cross-device stamp offset > slop reaches steady state HERE, with
@@ -244,12 +248,13 @@ private:
       const auto& head = qa_.front();
       if (qb_.empty() || qb_.back().t < head.t + slop_) return;
       if (qc_.empty() || qc_.back().t < head.t + slop_) return;
-      const auto mb = detail::nearest_within(qb_, head.t, slop_);
-      const auto mc = detail::nearest_within(qc_, head.t, slop_);
+      const auto* mb = detail::nearest_within(qb_, head.t, slop_);
+      const auto* mc = detail::nearest_within(qc_, head.t, slop_);
       if (mb && mc) {
+        const double mb_t = mb->t, mc_t = mc->t;  // read before the queues move
         cb_(head.value, mb->value, mc->value);
-        detail::drop_older(qb_, mb->t - slop_);
-        detail::drop_older(qc_, mc->t - slop_);
+        detail::drop_older(qb_, mb_t - slop_);
+        detail::drop_older(qc_, mc_t - slop_);
       } else if (on_nomatch_) {
         on_nomatch_(1);
       }

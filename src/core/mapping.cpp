@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_set>
 
 namespace sonar_slam {
 
@@ -47,9 +46,6 @@ void Mapping::grow_cols(GridU& g, int left, int right) { grow_cols_impl(g, left,
 
 void Mapping::configure()
 {
-  hit_logodds_ = logit(static_cast<float>(hit_prob));
-  miss_logodds_ = logit(static_cast<float>(miss_prob));
-
   // xs = arange(0, width, res); ys = arange(0, height, res)  (mapping.py:116)
   cols_ = static_cast<int>(std::ceil(width / resolution - 1e-9));
   rows_ = static_cast<int>(std::ceil(height / resolution - 1e-9));
@@ -327,7 +323,13 @@ void Mapping::fit_grid(Submap& kf)
   const Matrix& xy = *kf.sonar_xy;
   const int N = static_cast<int>(xy.rows());
 
-  std::vector<int> r(N), c(N);
+  // scratch reused across keyframes: a loop closure re-fits every moved
+  // keyframe, so a per-call pair of N-element allocations is one allocation
+  // per keyframe per correction round
+  std::vector<int>& r = fit_r_;
+  std::vector<int>& c = fit_c_;
+  r.resize(static_cast<size_t>(N));
+  c.resize(static_cast<size_t>(N));
   for (int i = 0; i < N; ++i) {
     const double X = xy(i, 0);
     const double Y = frame_y_sign * xy(i, 1);
@@ -339,26 +341,48 @@ void Mapping::fit_grid(Submap& kf)
 
   adjust_bounds(r, c);  // may grow the grids and shift every cached tile + r/c
 
-  // collapse pixels landing in the same cell to one deposit (mapping.py:491-502)
-  std::unordered_set<long long> seen;
-  seen.reserve(static_cast<size_t>(N));
-  kf.r.clear();
-  kf.c.clear();
-  kf.l.clear();
-  kf.i.clear();
+  // Collapse pixels landing in the same cell to one deposit
+  // (mapping.py:491-502), keeping the FIRST occurrence in fan order.
+  //
+  // Membership is tested against a dense byte map over the TILE's own
+  // bounding box rather than a hash set over global cell ids. The fan is
+  // bounded by the sonar's max range, so that box is O(N) — it never scales
+  // with the map — and this turns ~N hash inserts per keyframe into ~N array
+  // probes. On a loop closure that re-places hundreds of keyframes, the hash
+  // was a measurable share of the correction.
+  int rlo = r[0], rhi = r[0], clo = c[0], chi = c[0];
+  for (int i = 1; i < N; ++i) {
+    rlo = std::min(rlo, r[i]);
+    rhi = std::max(rhi, r[i]);
+    clo = std::min(clo, c[i]);
+    chi = std::max(chi, c[i]);
+  }
+  const size_t box_w = static_cast<size_t>(chi - clo) + 1;
+  const size_t box_h = static_cast<size_t>(rhi - rlo) + 1;
+  seen_.assign(box_w * box_h, 0);
+
+  kf.r.reserve(static_cast<size_t>(N));
+  kf.c.reserve(static_cast<size_t>(N));
+  if (pub_occupancy1) kf.l.reserve(static_cast<size_t>(N));
+  if (pub_intensity) kf.i.reserve(static_cast<size_t>(N));
   for (int i = 0; i < N; ++i) {
-    const long long id = static_cast<long long>(r[i]) * cols_ + c[i];
-    if (seen.insert(id).second) {
-      kf.r.push_back(r[i]);
-      kf.c.push_back(c[i]);
-      if (pub_occupancy1) kf.l.push_back(kf.logodds[i]);
-      if (pub_intensity) kf.i.push_back(kf.intensity[i]);
-    }
+    const size_t id =
+      static_cast<size_t>(r[i] - rlo) * box_w + static_cast<size_t>(c[i] - clo);
+    if (seen_[id]) continue;
+    seen_[id] = 1;
+    kf.r.push_back(r[i]);
+    kf.c.push_back(c[i]);
+    if (pub_occupancy1) kf.l.push_back(kf.logodds[i]);
+    if (pub_intensity) kf.i.push_back(kf.intensity[i]);
   }
 }
 
 void Mapping::inc_grid(const Submap& kf)
 {
+  if (kf.r.empty()) return;
+  // the edited bounding box is folded into the same pass as the deposits
+  // instead of four extra full scans of the tile
+  int rlo = kf.r[0], rhi = kf.r[0], clo = kf.c[0], chi = kf.c[0];
   for (size_t j = 0; j < kf.r.size(); ++j) {
     const int rr = kf.r[j], cc = kf.c[j];
     if (pub_occupancy1) logodds_grid_(rr, cc) += kf.l[j];
@@ -366,13 +390,15 @@ void Mapping::inc_grid(const Submap& kf)
       intensity_grid_(rr, cc) += kf.i[j];
       counter_grid_(rr, cc) += 1;
     }
+    rlo = std::min(rlo, rr);
+    rhi = std::max(rhi, rr);
+    clo = std::min(clo, cc);
+    chi = std::max(chi, cc);
   }
-  if (!kf.r.empty()) {
-    rmin_ = std::min(rmin_, *std::min_element(kf.r.begin(), kf.r.end()));
-    rmax_ = std::max(rmax_, *std::max_element(kf.r.begin(), kf.r.end()));
-    cmin_ = std::min(cmin_, *std::min_element(kf.c.begin(), kf.c.end()));
-    cmax_ = std::max(cmax_, *std::max_element(kf.c.begin(), kf.c.end()));
-  }
+  rmin_ = std::min(rmin_, rlo);
+  rmax_ = std::max(rmax_, rhi);
+  cmin_ = std::min(cmin_, clo);
+  cmax_ = std::max(cmax_, chi);
 }
 
 void Mapping::dec_grid(const Submap& kf)
@@ -391,69 +417,98 @@ void Mapping::dec_grid(const Submap& kf)
 void Mapping::adjust_bounds(std::vector<int>& r, std::vector<int>& c)
 {
   if (r.empty()) return;
-  auto any_lt = [](const std::vector<int>& v, int bound) {
-    for (int x : v) if (x < bound) return true;
-    return false;
+
+  // Growth is applied in ONE step per side instead of one `inc` at a time.
+  //
+  // The per-`inc` loops this replaces re-scanned r/c, reallocated and copied
+  // the whole grid, and shifted EVERY cached tile of EVERY keyframe on each
+  // iteration — so a keyframe landing k increments outside cost k full grid
+  // copies and k passes over the entire map history. A vehicle leaving the
+  // initial 100 m box, or any `inc` small relative to the excursion, paid that
+  // quadratic directly. The counts below are exactly the iteration counts of
+  // those loops, so the resulting geometry is identical; the scalar
+  // bookkeeping is still accumulated step-by-step so the floating-point
+  // origin/extent match the incremental form bit for bit.
+  const auto steps_below = [](long long lo, int inc) -> long long {
+    return lo < 0 ? (-lo + inc - 1) / inc : 0;  // smallest n with lo + n*inc >= 0
   };
-  auto any_ge = [](const std::vector<int>& v, int bound) {
-    for (int x : v) if (x >= bound) return true;
-    return false;
+  const auto steps_above = [](long long hi, long long limit, int inc) -> long long {
+    return hi >= limit ? (hi - limit) / inc + 1 : 0;  // smallest n with hi < limit + n*inc
   };
 
-  // prepend rows (mapping.py:504-527)
-  while (any_lt(r, 0)) {
-    if (pub_occupancy1) grow_rows(logodds_grid_, inc_r_, 0);
-    if (pub_intensity) {
-      grow_rows(intensity_grid_, inc_r_, 0);
-      grow_rows(counter_grid_, inc_r_, 0);
-    }
-    rows_ += inc_r_;
-    rmin_ += inc_r_;
-    rmax_ += inc_r_;
-    y0 -= inc_r_ * resolution;
-    height += inc_r_ * resolution;
-    for (auto& kf : keyframes_)
-      for (int& rr : kf.r) rr += inc_r_;
-    for (int& rr : r) rr += inc_r_;
+  long long rlo = r[0], rhi = r[0], clo = c[0], chi = c[0];
+  for (size_t i = 1; i < r.size(); ++i) {
+    rlo = std::min<long long>(rlo, r[i]);
+    rhi = std::max<long long>(rhi, r[i]);
+    clo = std::min<long long>(clo, c[i]);
+    chi = std::max<long long>(chi, c[i]);
   }
-  // append rows (mapping.py:528-544)
-  while (any_ge(r, rows_)) {
-    if (pub_occupancy1) grow_rows(logodds_grid_, 0, inc_r_);
+
+  // --------------------------------------------------------------- rows
+  const long long n_top = steps_below(rlo, inc_r_);
+  // the append loop runs AFTER the prepend shift, so it sees shifted indices
+  // against the already-grown row count
+  const long long n_bot =
+    steps_above(rhi + n_top * inc_r_, static_cast<long long>(rows_) + n_top * inc_r_,
+                inc_r_);
+  if (n_top > 0 || n_bot > 0) {
+    const int top = static_cast<int>(n_top * inc_r_);
+    const int bottom = static_cast<int>(n_bot * inc_r_);
+    if (pub_occupancy1) grow_rows(logodds_grid_, top, bottom);
     if (pub_intensity) {
-      grow_rows(intensity_grid_, 0, inc_r_);
-      grow_rows(counter_grid_, 0, inc_r_);
+      grow_rows(intensity_grid_, top, bottom);
+      grow_rows(counter_grid_, top, bottom);
     }
-    rows_ += inc_r_;
-    height += inc_r_ * resolution;
+    for (long long i = 0; i < n_top; ++i) {  // prepend bookkeeping (mapping.py:504-527)
+      rows_ += inc_r_;
+      rmin_ += inc_r_;
+      rmax_ += inc_r_;
+      y0 -= inc_r_ * resolution;
+      height += inc_r_ * resolution;
+    }
+    for (long long i = 0; i < n_bot; ++i) {  // append bookkeeping (mapping.py:528-544)
+      rows_ += inc_r_;
+      height += inc_r_ * resolution;
+    }
+    if (top > 0) {
+      for (auto& kf : keyframes_)
+        for (int& rr : kf.r) rr += top;
+      for (int& rr : r) rr += top;
+    }
   }
-  // prepend columns (mapping.py:545-567). NOTE: fixes an upstream bug — the
-  // Python intensity/counter branches used np.r_ (rows) with inc_r here; the
-  // correct growth for a column shift is np.c_ with inc_c (pub_intensity was
-  // off upstream, so the bug was never hit).
-  while (any_lt(c, 0)) {
-    if (pub_occupancy1) grow_cols(logodds_grid_, inc_c_, 0);
+
+  // ------------------------------------------------------------ columns
+  // NOTE: fixes an upstream bug — the Python intensity/counter branches used
+  // np.r_ (rows) with inc_r here; the correct growth for a column shift is
+  // np.c_ with inc_c (pub_intensity was off upstream, so it was never hit).
+  const long long n_left = steps_below(clo, inc_c_);
+  const long long n_right =
+    steps_above(chi + n_left * inc_c_, static_cast<long long>(cols_) + n_left * inc_c_,
+                inc_c_);
+  if (n_left > 0 || n_right > 0) {
+    const int left = static_cast<int>(n_left * inc_c_);
+    const int right = static_cast<int>(n_right * inc_c_);
+    if (pub_occupancy1) grow_cols(logodds_grid_, left, right);
     if (pub_intensity) {
-      grow_cols(intensity_grid_, inc_c_, 0);
-      grow_cols(counter_grid_, inc_c_, 0);
+      grow_cols(intensity_grid_, left, right);
+      grow_cols(counter_grid_, left, right);
     }
-    cols_ += inc_c_;
-    cmin_ += inc_c_;
-    cmax_ += inc_c_;
-    x0 -= inc_c_ * resolution;
-    width += inc_c_ * resolution;
-    for (auto& kf : keyframes_)
-      for (int& cc : kf.c) cc += inc_c_;
-    for (int& cc : c) cc += inc_c_;
-  }
-  // append columns (mapping.py:568-585)
-  while (any_ge(c, cols_)) {
-    if (pub_occupancy1) grow_cols(logodds_grid_, 0, inc_c_);
-    if (pub_intensity) {
-      grow_cols(intensity_grid_, 0, inc_c_);
-      grow_cols(counter_grid_, 0, inc_c_);
+    for (long long i = 0; i < n_left; ++i) {  // mapping.py:545-567
+      cols_ += inc_c_;
+      cmin_ += inc_c_;
+      cmax_ += inc_c_;
+      x0 -= inc_c_ * resolution;
+      width += inc_c_ * resolution;
     }
-    cols_ += inc_c_;
-    width += inc_c_ * resolution;
+    for (long long i = 0; i < n_right; ++i) {  // mapping.py:568-585
+      cols_ += inc_c_;
+      width += inc_c_ * resolution;
+    }
+    if (left > 0) {
+      for (auto& kf : keyframes_)
+        for (int& cc : kf.c) cc += left;
+      for (int& cc : c) cc += left;
+    }
   }
 }
 

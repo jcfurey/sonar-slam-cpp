@@ -150,13 +150,20 @@ private:
   static void grow_cols(GridF& g, int left, int right);
   static void grow_cols(GridU& g, int left, int right);
 
+  // fit_grid scratch, reused across keyframes (a loop-closure correction
+  // re-fits every keyframe that moved, so these would otherwise be one
+  // allocation each per keyframe per round). seen_ is a dense "already
+  // deposited" byte map over the current tile's bounding box, which the sonar
+  // range bounds — it does not scale with the map.
+  std::vector<int> fit_r_, fit_c_;
+  std::vector<unsigned char> seen_;
+
   GridF logodds_grid_;
   GridU intensity_grid_;
   GridU counter_grid_;
   int rows_ = 0, cols_ = 0;
   int rmin_ = 0, rmax_ = 0, cmin_ = 0, cmax_ = 0;
   int inc_r_ = 0, inc_c_ = 0;
-  double hit_logodds_ = 0.0, miss_logodds_ = 0.0;
 
   // sonar geometry + the fan cache shared by same-geometry keyframes
   OculusProperty oculus_;

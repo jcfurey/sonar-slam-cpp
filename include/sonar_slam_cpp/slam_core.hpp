@@ -271,9 +271,6 @@ private:
   // Shared by the SSM and NSSM pipelines.
   void run_scan_match_icp(ICPResult& ret2, const SMParams& params);
 
-  gtsam::SharedNoiseModel create_noise_model(const Eigen::Vector3d& sigmas) const;
-  gtsam::SharedNoiseModel create_full_noise_model(const Eigen::Matrix3d& cov) const;
-
   // Odometry noise model scaled to the link's ACTUAL span. odom_sigmas
   // describes one nominal keyframe step (keyframe_translation /
   // keyframe_rotation); a link bridging a long DR-only gap accumulates

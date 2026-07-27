@@ -121,33 +121,40 @@ std::array<float, 6> pack_transform(const gtsam::Pose2& source_pose,
           static_cast<float>(T.x()),    static_cast<float>(T.y())};
 }
 
-void eval_costs_cpu(const Matrix& points, const std::vector<std::array<float, 6>>& Ts,
-                    const CostGrid& g, std::vector<float>& costs)
+// Cost of ONE candidate transform. Factored out of eval_costs_cpu so the
+// Nelder-Mead refinement — which scores one candidate at a time, a few hundred
+// times per scan match — does not pay for an OpenMP team plus two vector
+// allocations per probe just to run a single loop iteration.
+float eval_one_cost(const Matrix& points, const std::array<float, 6>& T,
+                    const CostGrid& g)
 {
   const int rows = g.grid.rows, cols = g.grid.cols;
   const float xmin = static_cast<float>(g.xmin), ymin = static_cast<float>(g.ymin);
   const float inv_res = 1.0f / static_cast<float>(g.resolution);
-  costs.resize(Ts.size());
-
-#pragma omp parallel for schedule(static)
-  for (int t = 0; t < static_cast<int>(Ts.size()); ++t) {
-    const auto& T = Ts[t];
-    int hits = 0;
-    for (int i = 0; i < points.rows(); ++i) {
-      const float px = points(i, 0), py = points(i, 1);
-      const float x = T[0] * px + T[1] * py + T[4];
-      const float y = T[2] * px + T[3] * py + T[5];
-      // rint = round half to even — the same arithmetic as np.round and the
-      // CUDA __float2int_rn, so CPU-scored and GPU-scored costs agree (the
-      // Nelder-Mead refinement always scores on the CPU)
-      const int r = static_cast<int>(std::rint((y - ymin) * inv_res));
-      const int c = static_cast<int>(std::rint((x - xmin) * inv_res));
-      if (r >= 0 && r < rows && c >= 0 && c < cols &&
-          g.grid.at<std::uint8_t>(r, c) > 0)
-        ++hits;
-    }
-    costs[t] = -static_cast<float>(hits);
+  int hits = 0;
+  for (int i = 0; i < points.rows(); ++i) {
+    const float px = points(i, 0), py = points(i, 1);
+    const float x = T[0] * px + T[1] * py + T[4];
+    const float y = T[2] * px + T[3] * py + T[5];
+    // rint = round half to even — the same arithmetic as np.round and the
+    // CUDA __float2int_rn, so CPU-scored and GPU-scored costs agree (the
+    // Nelder-Mead refinement always scores on the CPU)
+    const int r = static_cast<int>(std::rint((y - ymin) * inv_res));
+    const int c = static_cast<int>(std::rint((x - xmin) * inv_res));
+    if (r >= 0 && r < rows && c >= 0 && c < cols &&
+        g.grid.at<std::uint8_t>(r, c) > 0)
+      ++hits;
   }
+  return -static_cast<float>(hits);
+}
+
+void eval_costs_cpu(const Matrix& points, const std::vector<std::array<float, 6>>& Ts,
+                    const CostGrid& g, std::vector<float>& costs)
+{
+  costs.resize(Ts.size());
+#pragma omp parallel for schedule(static)
+  for (int t = 0; t < static_cast<int>(Ts.size()); ++t)
+    costs[t] = eval_one_cost(points, Ts[t], g);
 }
 
 void eval_costs(const Matrix& points, const std::vector<std::array<float, 6>>& Ts,
@@ -271,10 +278,8 @@ GlobalInitResult global_scan_match_init(
   // single best guess) still comes from the refined NM optimum below, so
   // registration quality is unchanged — only the covariance POPULATION moves.
   auto cost_of = [&](const Eigen::Vector3d& d) {
-    std::vector<std::array<float, 6>> one{pack_transform(source_pose, target_pose, d)};
-    std::vector<float> c;
-    eval_costs_cpu(source_points, one, grid, c);
-    return static_cast<double>(c[0]);
+    return static_cast<double>(eval_one_cost(
+      source_points, pack_transform(source_pose, target_pose, d), grid));
   };
 
   std::array<Eigen::Vector3d, 4> simplex;

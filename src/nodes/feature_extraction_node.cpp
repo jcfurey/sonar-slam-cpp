@@ -368,6 +368,17 @@ private:
     for (std::size_t i = 0; i < by.size(); ++i) by[i] = static_cast<double>(i);
     const Interp1d f_bearings(bx, by, Interp1d::LINEAR, -1.0);
 
+    // Per-beam cos/sin, tabulated once per geometry instead of once per
+    // detection. The polar extractor below runs cos+sin for every CFAR hit —
+    // thousands per ping at a loose operating point — and the bearing only
+    // ever takes these num_beams values. Same double arguments, so the
+    // published coordinates are unchanged.
+    std::vector<double> cos_b(ping.bearings.size()), sin_b(ping.bearings.size());
+    for (std::size_t i = 0; i < ping.bearings.size(); ++i) {
+      cos_b[i] = std::cos(static_cast<double>(ping.bearings[i]));
+      sin_b[i] = std::sin(static_cast<double>(ping.bearings[i]));
+    }
+
     // build into locals and commit the cache fields only after the maps exist:
     // a throwing allocation (oversized geometry) must not poison the cache, or
     // every subsequent identical ping would reuse empty/stale maps
@@ -390,6 +401,8 @@ private:
 
     map_x_ = std::move(map_x);
     map_y_ = std::move(map_y);
+    cos_bearings_ = std::move(cos_b);
+    sin_bearings_ = std::move(sin_b);
     res_ = res;
     range_min_ = range_min;
     height_ = height;
@@ -647,17 +660,20 @@ private:
         cv::findNonZero(peaks, locs);
         points.resize(static_cast<long>(locs.size()), 2);
         for (std::size_t i = 0; i < locs.size(); ++i) {
-          const int beam = locs[i].x;
+          const std::size_t beam = static_cast<std::size_t>(locs[i].x);
           const double range = range_min_ + locs[i].y * res_;
-          const double bearing = bearings_[static_cast<std::size_t>(beam)];
           points(static_cast<long>(i), 0) =
-            static_cast<float>(range * std::cos(bearing));
+            static_cast<float>(range * cos_bearings_[beam]);
           points(static_cast<long>(i), 1) =
-            static_cast<float>(-range * std::sin(bearing));
+            static_cast<float>(-range * sin_bearings_[beam]);
         }
-        // polar echo image for the map stream's per-point intensity; the
-        // lookup inverts to (range, bearing) rather than to a Cartesian pixel
-        if (map_points_pub_) polar_gray_ = img.clone();
+        // Polar echo image for the map stream's per-point intensity; the
+        // lookup inverts to (range, bearing) rather than to a Cartesian pixel.
+        // A cv::Mat assignment shares the pixel buffer and bumps its refcount
+        // instead of copying it — every sonar adapter hands us a freshly
+        // decoded image per ping, so nothing overwrites it underneath us, and
+        // the consumer (publish_features) runs later in this same callback.
+        if (map_points_pub_) polar_gray_ = img;
       } else {
         // Legacy path: remap the mask to Cartesian, then read pixel indices.
         // Kept behind filter/extract_polar for a one-line revert if a bag
@@ -748,6 +764,8 @@ private:
   double res_ = 0.0, range_min_ = -1.0, height_ = 0.0, width_ = 0.0;
   int rows_ = 0, cols_ = 0;
   std::vector<float> bearings_;
+  // per-beam cos/sin of bearings_, rebuilt with the remap tables
+  std::vector<double> cos_bearings_, sin_bearings_;
   int map_version_ = 0;
   cv::Mat map_x_, map_y_;
   // per-ping grayscale for map-stream intensity lookup: the polar original

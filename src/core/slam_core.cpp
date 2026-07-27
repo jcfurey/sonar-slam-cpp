@@ -161,16 +161,6 @@ void Slam::configure()
   unary_model_ = gtsam::noiseModel::Diagonal::Sigmas(u);
 }
 
-gtsam::SharedNoiseModel Slam::create_noise_model(const Eigen::Vector3d& sigmas) const
-{
-  return gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-}
-
-gtsam::SharedNoiseModel Slam::create_full_noise_model(const Eigen::Matrix3d& cov) const
-{
-  return gtsam::noiseModel::Gaussian::Covariance(cov);
-}
-
 gtsam::SharedNoiseModel Slam::scaled_odom_model(const gtsam::Pose2& delta,
                                                 double& trans_sigma,
                                                 double& rot_sigma) const
@@ -750,11 +740,16 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // pre-selection PADDING, and inflation can only widen the fan, so it errs
   // toward over-selection (a bit more ICP work, never a missed overlap).
   // Intentional divergence from bruce_slam — see docs/DIVERGENCES.md.
-  std::vector<char> sel(target_points_all.rows(), 0);
+  const long n_target_all = static_cast<long>(target_points_all.rows());
+  std::vector<char> sel(n_target_all, 0);
+  long n_sel = 0;
   Eigen::Matrix3d cov;
   const Eigen::Matrix3d fresh_cov = keyframes[ret.source_key]->cov;
   const double anchor_time = to_sec(keyframes[ret.source_key]->time);
   for (int source_frame : source_frames) {
+    // every target point is already in some source frame's padded fan — the
+    // remaining frames can only re-select them
+    if (n_sel == n_target_all) break;
     const gtsam::Pose2& pose = keyframes[source_frame]->pose;
 
     // age >= 0: source_frames descend from the anchor (newest) keyframe.
@@ -773,15 +768,23 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
     const Matrix local_points =
       Keyframe::transform_points(target_points_all, pose.inverse());
+    // This runs over the WHOLE accumulated map cloud once per source frame,
+    // so the two transcendentals per point dominate the gate. Both are
+    // skipped for points a previous source frame already selected, and atan2
+    // is skipped for anything outside the range bound — the same conjunction,
+    // just short-circuited, so the selection is unchanged.
     for (int i = 0; i < local_points.rows(); ++i) {
+      if (sel[i]) continue;
       const double range = std::hypot(local_points(i, 0), local_points(i, 1));
+      if (!(range < range_bound)) continue;
       const double bearing = std::atan2(local_points(i, 1), local_points(i, 0));
-      if (range < range_bound && std::abs(bearing) < bearing_bound) sel[i] = 1;
+      if (std::abs(bearing) < bearing_bound) {
+        sel[i] = 1;
+        ++n_sel;
+      }
     }
   }
 
-  long n_sel = 0;
-  for (char s : sel) n_sel += s;
   Matrix target_points(n_sel, 2);
   std::vector<int> target_keys(n_sel);
   long at = 0;

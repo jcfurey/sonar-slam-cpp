@@ -30,6 +30,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "sonar_slam_cpp/geo.hpp"
@@ -314,7 +315,44 @@ private:
                         pit->second, fit->second);
       built = true;
     }
+    prune_buffers();
     return built;
+  }
+
+  // Release buffered inputs no future keyframe can pair with.
+  //
+  // The build is strictly in-order and trajectory stamps only advance, so once
+  // keyframe k is the next one to build, nothing older than its match window
+  // (widened to the grace window, which is what stream_passed judges against)
+  // can ever be matched again. Without this the only bound is kBufMax = 400
+  // entries, and a buffered ping owns a whole sonar image — 128 KB for a
+  // 512x256 Oculus frame, ~500 KB for a 1000x512 multibeam — so the steady
+  // state pinned 50-200 MB of already-consumed imagery on the vehicle
+  // computer. The count cap stays as the backstop for a stalled trajectory.
+  //
+  // The newest entry is never dropped, so `empty()` (which the no-data
+  // warnings and stream_passed read) keeps meaning "this stream never
+  // delivered" rather than "we tidied up".
+  void prune_buffers()
+  {
+    if (traj_.empty()) return;
+    const std::size_t idx = std::min<std::size_t>(
+      static_cast<std::size_t>(std::max(0, map_.num_keyframes())),
+      traj_.size() - 1);
+    const KFPose& ref = traj_[idx];
+    const int64_t cutoff =
+      ref.stamp_ns - std::max<int64_t>(ref.tol_ns, stream_grace_ns_);
+    prune_before(ping_buf_, cutoff);
+    prune_before(feat_buf_, cutoff);
+  }
+
+  template <class M>
+  static void prune_before(M& buf, int64_t cutoff)
+  {
+    if (buf.size() <= 1) return;
+    auto end = buf.lower_bound(cutoff);
+    if (end == buf.end()) --end;  // always keep the newest entry
+    buf.erase(buf.begin(), end);
   }
 
   // has the (in-order) buffered stream conclusively moved past stamp `key`?
@@ -354,12 +392,12 @@ private:
     }
     const auto st = ns_stamp(stamp);
     if (map_.pub_occupancy1) {
-      const OccGrid g = map_.get_occupancy_grid();
-      if (!g.empty()) occupancy_pub_->publish(to_occ_msg(g, st));
+      OccGrid g = map_.get_occupancy_grid();
+      if (!g.empty()) occupancy_pub_->publish(to_occ_msg(std::move(g), st));
     }
     if (map_.pub_intensity) {
-      const OccGrid g = map_.get_intensity_grid();
-      if (!g.empty()) intensity_pub_->publish(to_occ_msg(g, st));
+      OccGrid g = map_.get_intensity_grid();
+      if (!g.empty()) intensity_pub_->publish(to_occ_msg(std::move(g), st));
     }
   }
 
@@ -468,8 +506,11 @@ private:
     RCLCPP_INFO(get_logger(), "%s", res.message.c_str());
   }
 
+  // Takes the grid by value and MOVES its cells into the message: the payload
+  // is width*height bytes rebuilt on every keyframe (two grids), and copying
+  // it into the message doubled that per publish for no reason.
   static nav_msgs::msg::OccupancyGrid to_occ_msg(
-    const OccGrid& g, const builtin_interfaces::msg::Time& stamp)
+    OccGrid g, const builtin_interfaces::msg::Time& stamp)
   {
     nav_msgs::msg::OccupancyGrid m;
     m.header.stamp = stamp;
@@ -481,7 +522,7 @@ private:
     m.info.origin.position.x = g.origin_x;
     m.info.origin.position.y = g.origin_y;
     m.info.origin.orientation.w = 1.0;
-    m.data.assign(g.data.begin(), g.data.end());
+    m.data = std::move(g.data);
     return m;
   }
 
