@@ -60,7 +60,10 @@
       #   Above the usable range logged at startup it does nothing.
       # NOTE both gates are applied BEFORE voxel downsampling and outlier
       # rejection, so excluded returns cannot contribute density that keeps a
-      # spurious cluster alive.
+      # spurious cluster alive. If min_range lies beyond the ENTIRE
+      # CFAR-usable interval of a short-range ping, the node warns and uses the
+      # CFAR inner boundary for that geometry rather than emitting a
+      # guaranteed-empty cloud.
       min_range: 0.0
       max_range: 0.0
 
@@ -70,8 +73,9 @@
     # ------------------------------------------------------------------------
     # Sonar head tilt (Deep Trekker pivoting head; see feature_extraction_node)
     # ------------------------------------------------------------------------
-    # fold the head pitch (from head_tilt_topic, degrees, unstamped Float32)
-    # into the published fan; 0-behavior when the topic never arrives
+    # Use the head pitch (from head_tilt_topic, degrees, unstamped Float32) for
+    # the planar-SLAM admission gate. Point geometry itself comes from the
+    # timestamped TF configured under sonar below.
     apply_head_tilt: true
     # head_tilt_topic: /base/sensor_tilt_angle
     # Gate /slam_feature and the CFAR map contribution when the sonar head
@@ -99,6 +103,23 @@
     sonar:
       driver: ""     # see options above
       topic: ""      # "" -> default Oculus topic for the selected mode
+      # Planar samples use optical axes: [0, lateral, forward]. Keep this
+      # explicit because legacy ProjectedSonarImage bags have an empty header,
+      # and some current drivers publish optical-axis data with sensor_frame
+      # in the header. Every cloud is transformed frame_id -> base_frame_id at
+      # the source ping stamp, including the mount/head lever arm.
+      frame_id: "sonar0/optical_frame"
+      base_frame_id: "base_link"
+      # Seconds to wait for exact-stamp TF. The listener has a dedicated spin
+      # thread, so this absorbs normal TF/message arrival reordering without
+      # blocking TF delivery. Unavailable frames emit a NaN synchronization
+      # sentinel rather than mislabeled geometry.
+      projection_tf_timeout: 0.05
+      # Bag replay can leave dynamic joint TF a few milliseconds behind the
+      # sonar stamp even after the wait above. Permit latest-TF projection only
+      # within this absolute stamp delta (seconds). Larger startup/stale gaps
+      # still emit the sentinel.
+      projection_tf_max_delta: 0.02
       # for driver: image (a plain grayscale polar sensor_msgs/Image):
       # range_resolution: 0.03      # meters per range bin (required)
       # horizontal_fov: 2.2689      # radians across all beams (default 130 deg)

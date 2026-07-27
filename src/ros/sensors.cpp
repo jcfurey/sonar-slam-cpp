@@ -42,7 +42,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <stdexcept>
 
 namespace sonar_slam {
@@ -591,12 +590,18 @@ rclcpp::SubscriptionBase::SharedPtr subscribe_sonar(
 
         SonarPing ping;
         ping.stamp = msg.header.stamp;
-        // SonarImageData.data is range-major (row = range bin, col = beam) as
-        // read by the reference apl-ocean-engineering consumer:
-        // index = range * beam_count + beam.
+        // SonarImageData.data is beam-major by message contract. Decode it to
+        // the range-major cv::Mat used by CFAR (row = range, col = beam).
         ping.image.create(num_ranges, num_beams, CV_8UC1);
-        std::memcpy(ping.image.ptr(), msg.image.data.data(),
-                    static_cast<std::size_t>(num_ranges) * num_beams);
+        if (!beamMajorToRangeMajor(
+                msg.image.data.data(), msg.image.data.size(),
+                static_cast<std::size_t>(num_ranges),
+                static_cast<std::size_t>(num_beams), ping.image.ptr())) {
+          RCLCPP_WARN(node->get_logger(),
+                      "Dropping projected_sonar ping: could not decode "
+                      "beam-major image");
+          return;
+        }
         // bearing = atan2(-y, z), the driver's declared convention: the
         // optical frame is x=down, y=left, z=forward, so -y is the
         // starboard-positive lateral component. (The extraction step in

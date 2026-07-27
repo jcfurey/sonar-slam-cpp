@@ -8,7 +8,10 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -27,6 +30,7 @@
 #include "sonar_slam_cpp/node_base.hpp"
 #include "sonar_slam_cpp/ros_conversions.hpp"
 #include "sonar_slam_cpp/sensors.hpp"
+#include "sonar_slam_cpp/sonar_projection.hpp"
 
 namespace sonar_slam {
 
@@ -198,6 +202,33 @@ public:
           "sonar/topic must be set explicitly for sonar driver '" + driver + "'");
     }
 
+    // SonarPing's planar coordinates follow the optical convention regardless
+    // of the transport header: optical +z is the boresight and +y is lateral.
+    // Legacy ProjectedSonarImage bags have an empty header, while the current
+    // driver may identify sensor_frame even though the samples still use
+    // optical axes, so the source frame must be explicit.
+    sonar_frame_id_ = get_string("sonar/frame_id", "sonar0/optical_frame");
+    base_frame_id_ = get_string("sonar/base_frame_id", "base_link");
+    projection_tf_timeout_ =
+      get_double("sonar/projection_tf_timeout", 0.05);
+    projection_tf_max_delta_ =
+      get_double("sonar/projection_tf_max_delta", 0.02);
+    if (sonar_frame_id_.empty() || base_frame_id_.empty())
+      throw std::runtime_error(
+        "sonar/frame_id and sonar/base_frame_id must not be empty");
+    if (projection_tf_timeout_ < 0.0 || projection_tf_max_delta_ < 0.0)
+      throw std::runtime_error(
+        "sonar projection TF timing parameters must be non-negative");
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ =
+      std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this);
+    RCLCPP_INFO(
+      get_logger(),
+      "Sonar projection: %s <- %s at ping stamp (wait %.0f ms, latest-TF "
+      "fallback <= %.0f ms)",
+      base_frame_id_.c_str(), sonar_frame_id_.c_str(),
+      projection_tf_timeout_ * 1000.0, projection_tf_max_delta_ * 1000.0);
+
     sonar_sub_ = subscribe_sonar(
       this, driver, topic, rclcpp::SensorDataQoS(),
       [this](const SonarPing& ping) { callback(ping); });
@@ -225,14 +256,10 @@ public:
     tvg_absorption_db_per_m_ = get_double("tvg_absorption_db_per_m", 0.0);
 
     // Sonar head pitch. The Oculus rides the Deep Trekker's pivoting head
-    // (cameraHead.tilt), which sweeps up to +/-54 deg; treating it as a level
-    // scanner mis-places every feature. system_interface republishes the head
-    // angle on /base/sensor_tilt_angle (DEGREES). We fold it into the
-    // published fan as a pitch about the lateral axis so the cloud sits at the
-    // true sonar attitude in base_link. slam_node consumes only (x, y), so it
-    // automatically receives the horizontal (de-tilted) projection; z carries
-    // the pitch for viz / 3D consumers. If the topic never arrives the angle
-    // stays 0 and behaviour is byte-for-byte the old level assumption.
+    // (cameraHead.tilt), which sweeps up to +/-54 deg. The full timestamped TF
+    // above now owns the geometric projection (rotation AND lever arm); this
+    // angle stream remains the admission signal for planar SLAM because it is
+    // the platform's authoritative head-angle telemetry.
     // Head-pitch FRAME GATE (2026-07-16, from CHL_Pool ping forensics):
     // bruce-slam's planar registration assumes a near-level fan. During the
     // ±54° head sweep the frame is DOMINATED by the floor bowl — a huge
@@ -420,7 +447,10 @@ private:
     // filter/max_range against multipath needs to see where it already sits,
     // and that a configured max_range above the reported usable range does
     // nothing.
-    const double blank = (ntc_ / 2 + ngc_ / 2) * res;
+    const int border_bins = ntc_ / 2 + ngc_ / 2;
+    const double blank = border_bins * res;
+    const double effective_min = effectiveCfarMinRange(
+      feature_min_range_, range_min, rows, res, border_bins);
     // bind the temporary: a `(... + " m").c_str()` inline in a logging macro
     // hands the sink a pointer into a string that may already be gone
     const std::string max_txt = feature_max_range_ > 0.0
@@ -429,37 +459,99 @@ private:
     RCLCPP_INFO(get_logger(),
                 "sonar geometry: %d bins x %zu beams @ %.3f m; CFAR window "
                 "blanks the inner %.2f m and the outer %.2f m (usable %.2f-"
-                "%.2f m). filter/min_range %.2f m, max_range %s",
+                "%.2f m). filter/min_range %.2f m (effective %.2f m), "
+                "max_range %s",
                 ping.num_ranges, ping.bearings.size(), res, blank, blank,
                 range_min + blank, range_min + rows * res - blank,
-                feature_min_range_, max_txt.c_str());
+                feature_min_range_, effective_min, max_txt.c_str());
   }
 
   void publish_features(const builtin_interfaces::msg::Time& stamp,
-                        const Matrix& points, float phi, bool slam_eligible)
+                        const Matrix& points, bool slam_eligible)
   {
-    // Publish honest planar base_link coordinates: [x, y, 0]. The python
-    // original packed the lateral coordinate into z ([x, 0, y] — a leftover
-    // of bruce's roll-pi rviz static, which this stack does not use); that
-    // drew the fan rolled 90 deg in an ENU viewer. The SLAM node's
-    // consumption is adjusted in lockstep (slam_node.cpp slam_callback),
-    // so the graph math is unchanged.
-    // Rotate the sonar-plane fan (col0 = forward along the bore, col1 =
-    // lateral) by the head pitch about the lateral axis: forward tips into
-    // -z as the head looks down (tilt < 0). Lateral is the pitch axis and is
-    // unchanged. phi == 0 reduces this to the old [x, y, 0]; the caller
-    // interpolates phi at the ping stamp (tilt_at).
-    const float cphi = std::cos(phi);
-    const float sphi = std::sin(phi);
-    Matrix xyz(points.rows(), 3);
-    xyz.col(0) = points.col(0) * cphi;
-    xyz.col(1) = points.col(1);
-    xyz.col(2) = points.col(0) * sphi;
+    // A NaN row is the intentional skip-frame synchronization sentinel. It
+    // has no geometry to transform. Empty feature sets likewise need no TF.
+    const bool input_sentinel =
+      points.rows() == 1 && !std::isfinite(points(0, 0));
+    Matrix xyz;
+    if (input_sentinel) {
+      xyz.resize(1, 3);
+      xyz.setConstant(std::numeric_limits<float>::quiet_NaN());
+      slam_eligible = false;
+    } else if (points.rows() == 0) {
+      xyz.resize(0, 3);
+    } else {
+      try {
+        // Exact ping-time projection, including the sonar mount/head lever
+        // arm. `points` is [forward, lateral], or optical [0, lateral,
+        // forward]; projectSonarPlane applies target <- optical.
+        geometry_msgs::msg::TransformStamped tf;
+        try {
+          tf = tf_buffer_->lookupTransform(
+            base_frame_id_, sonar_frame_id_, rclcpp::Time(stamp),
+            rclcpp::Duration::from_seconds(projection_tf_timeout_));
+        } catch (const std::exception& exact_error) {
+          // During bag replay, /clock and the sonar callback can lead
+          // robot_state_publisher's joint TF by a few milliseconds. Waiting
+          // on simulated time does not reliably close that scheduling gap.
+          // Use the newest transform only when its stamp proves that the
+          // approximation is tightly bounded; stale startup TF still fails.
+          auto latest = tf_buffer_->lookupTransform(
+            base_frame_id_, sonar_frame_id_, tf2::TimePointZero);
+          const rclcpp::Time latest_stamp(latest.header.stamp);
+          const bool timeless =
+            latest_stamp.nanoseconds() == 0;  // an entirely static TF chain
+          const double delta =
+            std::fabs((rclcpp::Time(stamp) - latest_stamp).seconds());
+          if (!timeless && delta > projection_tf_max_delta_) {
+            throw std::runtime_error(
+              std::string(exact_error.what()) +
+              "; latest TF differs by " + std::to_string(delta * 1000.0) +
+              " ms (limit " +
+              std::to_string(projection_tf_max_delta_ * 1000.0) + " ms)");
+          }
+          tf = std::move(latest);
+          RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "Using latest %s <- %s TF for sonar projection (stamp skew %.3f "
+            "ms)",
+            base_frame_id_.c_str(), sonar_frame_id_.c_str(), delta * 1000.0);
+        }
+        const auto& r = tf.transform.rotation;
+        Eigen::Quaternionf q(
+          static_cast<float>(r.w), static_cast<float>(r.x),
+          static_cast<float>(r.y), static_cast<float>(r.z));
+        const float q_norm = q.norm();
+        const auto& t = tf.transform.translation;
+        const Eigen::Vector3f translation(
+          static_cast<float>(t.x), static_cast<float>(t.y),
+          static_cast<float>(t.z));
+        if (!std::isfinite(q_norm) ||
+            q_norm <= std::numeric_limits<float>::epsilon() ||
+            !translation.allFinite())
+          throw std::runtime_error("TF contains a non-finite transform");
+        xyz = projectSonarPlane(
+          points, q.normalized().toRotationMatrix(), translation);
+      } catch (const std::exception& e) {
+        // Never label optical/sonar-local coordinates as base_link. A
+        // sentinel keeps downstream exact-time synchronizers advancing while
+        // making the missing geometry explicit to every cloud consumer.
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "Cannot project sonar features at %.9f s (%s <- %s: %s); "
+          "publishing a NaN sentinel instead of mislabeled geometry",
+          to_sec(stamp), base_frame_id_.c_str(), sonar_frame_id_.c_str(),
+          e.what());
+        xyz.resize(1, 3);
+        xyz.setConstant(std::numeric_limits<float>::quiet_NaN());
+        slam_eligible = false;
+      }
+    }
 
     sensor_msgs::msg::PointCloud2 msg = make_cloud_xyz(xyz);
     // the stamp of the source sonar image is CRITICAL to downstream sync
     msg.header.stamp = stamp;
-    msg.header.frame_id = "base_link";
+    msg.header.frame_id = base_frame_id_;
     feature_pub_->publish(msg);
 
     if (slam_eligible) {
@@ -557,15 +649,16 @@ private:
     // the SLAM node's time synchronizer keeps advancing
     ++frame_count_;
     const int ping_id = ping.ping_id != 0 ? ping.ping_id : frame_count_;
-    // Head pitch AT THE PING STAMP (interpolated) both places the real feature
-    // fan in base_link and determines admission to the planar consumers.
+    // Head pitch AT THE PING STAMP (interpolated) determines admission to the
+    // planar consumers. The full timestamped TF performs the real geometric
+    // projection below.
     const int64_t ping_stamp_ns = rclcpp::Time(ping.stamp).nanoseconds();
     const float phi = apply_head_tilt_
       ? tilt_at(ping_stamp_ns) : 0.0f;
     if (skip_ > 0 && ping_id % skip_ != 0) {
       Matrix nan(1, 2);
       nan.setConstant(std::numeric_limits<float>::quiet_NaN());
-      publish_features(ping.stamp, nan, phi, false);
+      publish_features(ping.stamp, nan, false);
       return;
     }
 
@@ -720,12 +813,23 @@ private:
       //     structure and is necessarily a ghost.
       // Both default to 0 (off), so the shipped behaviour is unchanged and
       // this stays an explicit operator decision made against real imagery.
+      const double effective_min_range = effectiveCfarMinRange(
+        feature_min_range_, range_min_, rows_, res_,
+        ntc_ / 2 + ngc_ / 2);
+      if (effective_min_range < feature_min_range_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 30000,
+          "filter/min_range %.2f m lies beyond this sonar's entire "
+          "CFAR-usable interval; using its inner usable boundary %.2f m for "
+          "this geometry instead of publishing an always-empty cloud",
+          feature_min_range_, effective_min_range);
+      }
       if (points.rows() > 0 &&
-          (feature_min_range_ > 0.0 || feature_max_range_ > 0.0)) {
+          (effective_min_range > 0.0 || feature_max_range_ > 0.0)) {
         long keep = 0;
         for (long i = 0; i < points.rows(); ++i) {
           const double rr = std::hypot(points(i, 0), points(i, 1));
-          if (rr < feature_min_range_) continue;
+          if (rr < effective_min_range) continue;
           if (feature_max_range_ > 0.0 && rr > feature_max_range_) continue;
           points.row(keep++) = points.row(i);
         }
@@ -739,7 +843,7 @@ private:
         points = remove_outlier(points, outlier_filter_radius_,
                                 outlier_filter_min_points_);
 
-      publish_features(ping.stamp, points, phi, slam_eligible);
+      publish_features(ping.stamp, points, slam_eligible);
     } catch (const cv::Exception& e) {
       RCLCPP_WARN(get_logger(), "Dropping sonar ping: OpenCV error: %s", e.what());
     } catch (const std::exception& e) {
@@ -759,6 +863,16 @@ private:
   int skip_ = 5;
   bool compressed_images_ = true;
   int frame_count_ = 0;
+
+  // Exact point projection: base_frame_id_ <- sonar_frame_id_ at each ping
+  // stamp. The source is explicit because legacy bags have blank headers and
+  // some drivers describe optical-axis samples with a sensor-frame header.
+  std::string sonar_frame_id_ = "sonar0/optical_frame";
+  std::string base_frame_id_ = "base_link";
+  double projection_tf_timeout_ = 0.05;
+  double projection_tf_max_delta_ = 0.02;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // remap state
   double res_ = 0.0, range_min_ = -1.0, height_ = 0.0, width_ = 0.0;

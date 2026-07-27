@@ -117,7 +117,7 @@ message; the adapter logs a throttled warning naming the remedy — set
 | --- | --- | --- | --- |
 | `oculus_compressed` | `sonar_oculus/OculusPing` | `sonar_oculus` (vendor) | JPEG-in-message, decoded with a corrupt-frame guard |
 | `oculus_uncompressed` | `sonar_oculus/OculusPingUncompressed` | `sonar_oculus` (vendor) | raw image via cv_bridge |
-| `projected_sonar` | `marine_acoustic_msgs/ProjectedSonarImage` | standard | range-major image, bearings from `beam_directions`, order normalized |
+| `projected_sonar` | `marine_acoustic_msgs/ProjectedSonarImage` | standard | beam-major message payload decoded to the internal range-major image; bearings from `beam_directions`, order normalized |
 | `image` | `sensor_msgs/Image` | standard | plain polar image; needs `sonar/range_resolution` (+ optional `sonar/horizontal_fov`) |
 
 Leaving `sonar/driver` blank auto-selects `oculus_compressed` /

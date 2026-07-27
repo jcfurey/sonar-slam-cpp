@@ -510,8 +510,9 @@ private:
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
 
-    // feature cloud carries true base_link 3D (head tilt folded in by
-    // feature_extraction_node.cpp publish_features). Rotate by the DR
+    // feature cloud carries true base_link 3D (the optical fan is projected
+    // through the exact-stamp base_link <- sonar optical TF, including head
+    // rotation and lever arm, by feature_extraction_node). Rotate by the DR
     // roll/pitch (Ry(p)*Rx(r), yaw excluded) so stored points are
     // horizon-referenced: registration then matches world-horizontal
     // projections even when the vehicle pitches, and col2 carries elevation
