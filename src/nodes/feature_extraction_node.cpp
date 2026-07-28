@@ -6,6 +6,7 @@
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <tf2_ros/buffer.h>
@@ -201,6 +202,14 @@ public:
         throw std::runtime_error(
           "sonar/topic must be set explicitly for sonar driver '" + driver + "'");
     }
+    const int input_queue_depth =
+      std::max(1, get_int("input_queue_depth", 20));
+    const int output_queue_depth =
+      std::max(1, get_int("output_queue_depth", 10));
+    const auto input_qos = rclcpp::SensorDataQoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
+    const auto output_qos = rclcpp::QoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
 
     // SonarPing's planar coordinates follow the optical convention regardless
     // of the transport header: optical +z is the boresight and +y is lateral.
@@ -230,15 +239,15 @@ public:
       projection_tf_timeout_ * 1000.0, projection_tf_max_delta_ * 1000.0);
 
     sonar_sub_ = subscribe_sonar(
-      this, driver, topic, rclcpp::SensorDataQoS(),
+      this, driver, topic, input_qos,
       [this](const SonarPing& ping) { callback(ping); });
 
     feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SONAR_FEATURE_TOPIC, 10);
+      SONAR_FEATURE_TOPIC, output_qos);
     slam_feature_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SONAR_SLAM_FEATURE_TOPIC, 10);
+      SONAR_SLAM_FEATURE_TOPIC, output_qos);
     feature_img_pub_ = create_publisher<sensor_msgs::msg::Image>(
-      SONAR_FEATURE_IMG_TOPIC, 10);
+      SONAR_FEATURE_IMG_TOPIC, output_qos);
 
     // Optional union map stream: republish the (non-sentinel) feature clouds
     // as padded XYZI onto a shared topic with sonar_proc's candidate stream,
@@ -248,7 +257,7 @@ public:
     const std::string map_topic = get_string("map_points_topic", "");
     if (!map_topic.empty())
       map_points_pub_ =
-        create_publisher<sensor_msgs::msg::PointCloud2>(map_topic, 10);
+        create_publisher<sensor_msgs::msg::PointCloud2>(map_topic, output_qos);
     // residual TVG for the map stream (identity at 0) — keep these equal to
     // sonar_proc's values so the union's two intensity sources stay on one
     // radiometric scale
@@ -280,22 +289,33 @@ public:
       const std::string tilt_topic =
         get_string("head_tilt_topic", "/base/sensor_tilt_angle");
       tilt_sub_ = create_subscription<std_msgs::msg::Float32>(
-        tilt_topic, rclcpp::SensorDataQoS(),
+        tilt_topic, input_qos,
         [this](const std_msgs::msg::Float32& m) {
-          // Float32 carries no stamp: pair each sample with its arrival time
-          // so per-ping lookups interpolate at the ping stamp instead of
-          // trusting the latest value — the head sweeps ~0.5 rad/s, and a
-          // lagging latch both admits floor-bowl frames through the pitch
-          // gate with a stale "level" reading and mis-projects z on the
-          // frames it passes
+          // Compatibility fallback for platforms that only publish the
+          // legacy unstamped degrees topic. Once a source-stamped joint sample
+          // arrives, these callback-arrival timestamps are ignored.
           const int64_t t = this->now().nanoseconds();
           const float rad = m.data * static_cast<float>(M_PI) / 180.0f;
-          std::lock_guard<std::mutex> lock(tilt_mutex_);
-          if (!tilt_buf_.empty() && t < tilt_buf_.back().first)
-            tilt_buf_.clear();  // time jumped backwards (bag loop): restart
-          tilt_buf_.emplace_back(t, rad);
-          while (tilt_buf_.size() > kTiltBufMax) tilt_buf_.pop_front();
+          record_tilt(t, rad, false);
         });
+      const std::string stamped_topic =
+        get_string("head_tilt_stamped_topic", "");
+      if (!stamped_topic.empty()) {
+        tilt_stamped_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+          stamped_topic, input_qos,
+          [this](const sensor_msgs::msg::JointState& m) {
+            const auto it = std::find(
+              m.name.begin(), m.name.end(), "pivot_head_joint");
+            if (it == m.name.end()) return;
+            const auto idx = static_cast<std::size_t>(
+              std::distance(m.name.begin(), it));
+            if (idx >= m.position.size() || !std::isfinite(m.position[idx]))
+              return;
+            record_tilt(
+              rclcpp::Time(m.header.stamp).nanoseconds(),
+              static_cast<float>(m.position[idx]), true);
+          });
+      }
     }
 
     RCLCPP_INFO(get_logger(), "Feature extraction node initialized (GPU: %s)",
@@ -303,6 +323,23 @@ public:
   }
 
 private:
+  void record_tilt(const int64_t t_ns, const float rad, const bool source_stamped)
+  {
+    if (t_ns <= 0 || !std::isfinite(rad)) return;
+    std::lock_guard<std::mutex> lock(tilt_mutex_);
+    if (!source_stamped && have_stamped_tilt_) return;
+    if (source_stamped && !have_stamped_tilt_) {
+      // Remove arrival-stamped compatibility samples so interpolation never
+      // mixes two time bases.
+      tilt_buf_.clear();
+      have_stamped_tilt_ = true;
+    }
+    if (!tilt_buf_.empty() && t_ns < tilt_buf_.back().first)
+      tilt_buf_.clear();  // time jumped backwards (bag seek/loop)
+    tilt_buf_.emplace_back(t_ns, rad);
+    while (tilt_buf_.size() > kTiltBufMax) tilt_buf_.pop_front();
+  }
+
   // head pitch (rad) at time t: linear interpolation between the buffered
   // samples bracketing t, clamped to the nearest sample beyond the buffer
   // ends. An empty buffer (topic absent) returns 0 — the level assumption.
@@ -901,12 +938,15 @@ private:
   double tvg_spread_db_ = 0.0;
   double tvg_absorption_db_per_m_ = 0.0;
 
-  // sonar head pitch samples (arrival ns, rad) from /base/sensor_tilt_angle,
-  // interpolated at each ping's stamp by tilt_at(); empty = level (0)
+  // Sonar head pitch samples (source stamp, rad) from the stamped joint-state
+  // topic, with the legacy arrival-stamped Float32 as a compatibility fallback.
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr tilt_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+    tilt_stamped_sub_;
   std::mutex tilt_mutex_;
   std::deque<std::pair<int64_t, float>> tilt_buf_;
   static constexpr std::size_t kTiltBufMax = 1024;
+  bool have_stamped_tilt_ = false;
   bool apply_head_tilt_ = true;
   // Skip planar-consumer frames when |head pitch relative to base_link|
   // exceeds this value (rad); 0 = no gate.

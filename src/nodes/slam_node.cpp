@@ -240,8 +240,16 @@ public:
     // range mid-mission, so reconfigure whenever the ping geometry changes
     const std::string sonar_driver = get_string("sonar/driver", "oculus_compressed");
     const std::string sonar_topic = get_string("sonar/topic", SONAR_TOPIC);
+    const int input_queue_depth =
+      std::max(1, get_int("input_queue_depth", 50));
+    const int output_queue_depth =
+      std::max(1, get_int("output_queue_depth", 10));
+    const auto input_qos = rclcpp::SensorDataQoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
+    const auto output_qos = rclcpp::QoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
     sonar_sub_ = subscribe_sonar(
-      this, sonar_driver, sonar_topic, rclcpp::SensorDataQoS(),
+      this, sonar_driver, sonar_topic, input_qos,
       [this](const SonarPing& ping) {
         std::lock_guard<std::mutex> lock(mutex_);
         slam_.oculus.configure(ping);
@@ -254,7 +262,8 @@ public:
     // without admitting them to planar registration.
     sync_ = std::make_unique<
       ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>(
-      20, feature_odom_sync_max_delay_,
+      static_cast<std::size_t>(input_queue_depth),
+      feature_odom_sync_max_delay_,
       [this](const sensor_msgs::msg::PointCloud2& feature,
              const nav_msgs::msg::Odometry& odom) { slam_callback(feature, odom); });
     // an odom outage silently drops feature frames from the sync queue —
@@ -279,12 +288,13 @@ public:
     });
 
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      SONAR_SLAM_FEATURE_TOPIC, 20,
+      SONAR_SLAM_FEATURE_TOPIC, input_qos,
       [this](const sensor_msgs::msg::PointCloud2& msg) {
         sync_->add_primary(to_sec(msg.header.stamp), msg);
       });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      LOCALIZATION_ODOM_TOPIC, 50, [this](const nav_msgs::msg::Odometry& msg) {
+      LOCALIZATION_ODOM_TOPIC, input_qos,
+      [this](const nav_msgs::msg::Odometry& msg) {
         sync_->add_secondary(to_sec(msg.header.stamp), msg);
       });
 
@@ -311,10 +321,11 @@ public:
     }
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      SLAM_POSE_TOPIC, 10);
-    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(SLAM_ODOM_TOPIC, 10);
+      SLAM_POSE_TOPIC, output_qos);
+    odom_pub_ =
+      create_publisher<nav_msgs::msg::Odometry>(SLAM_ODOM_TOPIC, output_qos);
     traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SLAM_TRAJ_TOPIC, latched_qos());
+      SLAM_TRAJ_TOPIC, latched_qos(output_queue_depth));
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -328,7 +339,7 @@ public:
     // published one within cloud_republish_period seconds (<= 0 disables).
     cloud_republish_period_ = get_double("cloud_republish_period", 5.0);
     if (cloud_republish_period_ > 0.0) {
-      cloud_republish_timer_ = create_wall_timer(
+      cloud_republish_timer_ = create_timer(
         std::chrono::duration<double>(cloud_republish_period_), [this]() {
           // the cached cloud is produced by the viz worker thread — its own
           // mutex, so this timer never contends with the SLAM callback
@@ -354,8 +365,8 @@ public:
     // during a deployment.
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", 10);
-    diag_timer_ = create_wall_timer(std::chrono::seconds(1),
-                                    [this]() { publish_diagnostics(); });
+    diag_timer_ = create_timer(std::chrono::seconds(1),
+                               [this]() { publish_diagnostics(); });
 
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -367,7 +378,7 @@ public:
     tf_publish_period_ = get_double("tf_publish_period", 0.05);  // 20 Hz
     tf_tolerance_ = get_double("tf_tolerance", 0.1);
     if (publish_tf_ && tf_publish_period_ > 0.0)
-      tf_timer_ = create_wall_timer(
+      tf_timer_ = create_timer(
         std::chrono::duration<double>(tf_publish_period_),
         [this]() { republish_map_odom(); });
 

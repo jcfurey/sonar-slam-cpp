@@ -130,15 +130,19 @@ public:
     const std::string sonar_driver = get_string("sonar/driver", "projected_sonar");
     std::string sonar_topic = get_string("sonar/topic", "");
     if (sonar_topic.empty()) sonar_topic = default_sonar_topic(sonar_driver);
+    const int input_queue_depth =
+      std::max(1, get_int("input_queue_depth", 50));
+    const auto input_qos = rclcpp::SensorDataQoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
     sonar_sub_ = subscribe_sonar(
-      this, sonar_driver, sonar_topic, rclcpp::SensorDataQoS(),
+      this, sonar_driver, sonar_topic, input_qos,
       [this](const SonarPing& ping) { on_ping(ping); });
 
     // The correctable occupancy product is planar, so consume the same
     // head-pitch-gated stream as slam_node. The ungated feature topic is
     // visualization-only and may contain floor-dominated swept frames.
     feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      SONAR_SLAM_FEATURE_TOPIC, 20,
+      SONAR_SLAM_FEATURE_TOPIC, input_qos,
       [this](const sensor_msgs::msg::PointCloud2& msg) { on_feature(msg); });
 
     // latched, re-published every keyframe -> our correction trigger
