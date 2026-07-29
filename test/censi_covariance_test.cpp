@@ -16,12 +16,43 @@
 
 #include <Eigen/Dense>
 #include <cstdio>
+#include <limits>
 #include <random>
 
 using sonar_slam::Matrix;
 
 int main()
 {
+  Eigen::Matrix3d compact = Eigen::Matrix3d::Zero();
+  compact.diagonal() << 0.04, 0.09, 0.01;
+  const auto compact_obs =
+    sonar_slam::assess_icp_observability(compact, 0.5, 8.0);
+  if (!compact_obs.observable) {
+    std::printf("compact covariance was rejected\n");
+    return 1;
+  }
+
+  Eigen::Matrix3d uncertain = compact;
+  uncertain(1, 1) = 1.0;
+  if (sonar_slam::assess_icp_observability(uncertain, 0.5, 8.0).observable) {
+    std::printf("high-sigma covariance was admitted\n");
+    return 1;
+  }
+
+  Eigen::Matrix3d elongated = compact;
+  elongated(0, 0) = 1e-6;
+  if (sonar_slam::assess_icp_observability(elongated, 0.5, 8.0).observable) {
+    std::printf("anisotropic covariance was admitted\n");
+    return 1;
+  }
+
+  Eigen::Matrix3d invalid = compact;
+  invalid(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  if (sonar_slam::assess_icp_observability(invalid, 0.5, 8.0).observable) {
+    std::printf("non-finite covariance was admitted\n");
+    return 1;
+  }
+
   std::mt19937 rng(12345);
   std::uniform_real_distribution<double> U(0.0, 8.0);
   const int N = 250;

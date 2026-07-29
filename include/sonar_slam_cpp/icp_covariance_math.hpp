@@ -15,6 +15,37 @@
 
 namespace sonar_slam {
 
+struct IcpObservability
+{
+  bool observable = false;
+  double sigma_max = 0.0;
+  double anisotropy = 0.0;
+};
+
+// Assess the translation block used by both SSM and NSSM. A covariance with
+// non-finite/negative eigenvalues, excessive uncertainty, or a long weak axis
+// is not trustworthy sonar evidence.
+inline IcpObservability assess_icp_observability(
+  const Eigen::Matrix3d& cov, double max_sigma, double max_anisotropy)
+{
+  IcpObservability out;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
+    cov.topLeftCorner<2, 2>());
+  const double ev_lo = es.eigenvalues()[0];
+  const double ev_hi = es.eigenvalues()[1];
+  if (!std::isfinite(ev_lo) || !std::isfinite(ev_hi) ||
+      ev_lo < 0.0 || ev_hi < 0.0)
+    return out;
+
+  out.sigma_max = std::sqrt(ev_hi);
+  const double sigma_min = std::sqrt(std::max(1e-12, ev_lo));
+  out.anisotropy = out.sigma_max / sigma_min;
+  out.observable =
+    (max_sigma <= 0.0 || out.sigma_max <= max_sigma) &&
+    (max_anisotropy <= 0.0 || out.anisotropy <= max_anisotropy);
+  return out;
+}
+
 // Sum_i J_i^T J_i (3x3) for the matched source points p_i at the registration
 // angle theta. Only the source geometry and theta enter the Jacobian.
 inline Eigen::Matrix3d censi_information(const Matrix& src_matched, double theta)

@@ -61,7 +61,10 @@ void configure_slam(Slam& slam)
   // (slam.yaml: cov_samples 30, cov_method sampled). It was 0 here, so the
   // whole ICP-covariance -> degeneracy-gate chain — the subject of the
   // max_sigma / max_anisotropy gates — had NO test coverage at all.
-  slam.ssm_params.min_overlap_ratio = 0.1;   // deployed value
+  // Keep this fixture at its historical ratio so it also exercises the later
+  // NSSM-vs-DR translation rejection branch. The deployed 0.25 contract is
+  // asserted by settings tests; admission/observability have focused tests.
+  slam.ssm_params.min_overlap_ratio = 0.1;
   slam.ssm_params.cov_samples = 30;
   slam.ssm_params.cov_method = sonar_slam::SMParams::SAMPLED;
 
@@ -259,9 +262,15 @@ int main()
   std::printf("    nssm rejects: [%s]\n", reject_summary.c_str());
   CHECK(dr_err > 0.5, "fixture broken: DR did not drift (%.2f m)", dr_err);
   CHECK(slam.nssm_accepted >= 1, "no loop closure was ever accepted");
-  CHECK(reject_summary.find("DR translation") != std::string::npos,
-        "final DR-translation gate was not exercised: [%s]",
-        reject_summary.c_str());
+  // The stricter SSM observability gate can prevent the distorted sequential
+  // state that used to reach the later NSSM-vs-DR translation gate. Require
+  // at least one of those independent defenses to fire; the trajectory still
+  // has to close accurately below.
+  CHECK(reject_summary.find("DR translation") != std::string::npos ||
+          slam.ssm_degenerate_rejected > 0,
+        "neither SSM observability nor final NSSM DR-translation gate was "
+        "exercised (ssm degenerate %d, NSSM rejects [%s])",
+        slam.ssm_degenerate_rejected, reject_summary.c_str());
   CHECK(slam_err < dr_err * 0.7,
         "loop closure did not meaningfully correct (slam %.2f vs dr %.2f)",
         slam_err, dr_err);

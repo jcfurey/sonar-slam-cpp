@@ -7,8 +7,16 @@
     keyframe_duration: 1.0
     keyframe_translation: 3.0
     keyframe_rotation: 0.5235987755982988   # deg(30)
-    # Min candidate points for an intermediate frame to become a keyframe.
-    keyframe_min_points: 10
+    # Open-water admission. Every graph candidate, including the first, must
+    # carry enough finite returns distributed across distinct horizontal cells
+    # and azimuth bins. Rejected pings publish odometry-extrapolated pose only
+    # and never enter keyframe/NSSM history.
+    admission:
+      min_points: 50
+      cell_size: 0.5
+      min_occupied_cells: 8
+      azimuth_bin_size: 0.08726646259971647  # 5 deg
+      min_azimuth_bins: 3
 
     # is the SLAM back-end enabled (vs. pure dead reckoning); overridden from launch
     enable_slam: true
@@ -58,9 +66,16 @@
       max_translation: 3.0    # the max translation allowed
       max_rotation: 0.5235987755982988   # deg(30)
       target_frames: 3        # the number of frames we compare the current frame to
-      # overlap must also reach this fraction of the source cloud, not just the
-      # absolute min_points count above (see the nssm block). 0 disables.
-      min_overlap_ratio: 0.0
+      # Sequential neighbors should share a meaningful fraction of the scan.
+      # This complements the absolute count and rejects accidental overlap in
+      # scattered water-column returns.
+      min_overlap_ratio: 0.25
+      # A converged ICP is admitted only when its covariance is present, finite,
+      # compact and not strongly anisotropic. Failure falls back to fused odom.
+      require_covariance: true
+      max_sigma: 0.5
+      max_anisotropy: 8.0
+      degeneracy_prefloor: true
       initialization: true    # global scan-match init before ICP
       initialization_params: [50.0, 1.0, 0.01]   # [sobol n per iter, iters, refine ftol]
       cov_samples: 0          # >0 -> covariance-estimating ICP over the best init samples

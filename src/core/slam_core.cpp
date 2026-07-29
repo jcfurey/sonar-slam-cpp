@@ -7,6 +7,7 @@
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/global_init.hpp"
 #include "sonar_slam_cpp/icp_covariance.hpp"
+#include "sonar_slam_cpp/icp_covariance_math.hpp"
 #include "sonar_slam_cpp/mcd.hpp"
 
 #include <gtsam/inference/Symbol.h>
@@ -427,7 +428,7 @@ void Slam::add_odometry(const KeyframePtr& keyframe)
   const gtsam::Pose3 dr_odom =
     keyframes.back()->horizon_pose3().between(keyframe->horizon_pose3());
   // Noise scaled to what this link actually spans, not to the nominal
-  // keyframe step. The head-pitch gate (feature.yaml max_head_pitch) forces
+  // keyframe step. Input admission and the head-pitch gate can force
   // status=false for a whole +/-54 deg sweep, during which NO keyframe is
   // created — so the link that closes the sweep can span many metres and
   // must not carry the same 0.2 m sigma as a 0.75 m step.
@@ -644,6 +645,30 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
     if (!ret2.status.description.empty()) ret2.status.description += ", ";
     ret2.status.description += "overlap " + std::to_string(overlap) +
                               " (" + std::to_string(ratio) + " of source)";
+  }
+
+  // A numerically successful ICP is not automatically an observable sonar
+  // measurement. Sparse/scattered water-column returns and line-like geometry
+  // can converge while leaving a large or weak translation axis. Fail closed
+  // and use the fused-odometry factor instead.
+  if (ret2.status) {
+    if (ssm_require_covariance && !ret2.has_cov) {
+      ret2.status = Status(Status::NOT_CONVERGED);
+      ret2.status.description = "degenerate: covariance unavailable";
+      ++ssm_degenerate_rejected;
+    } else if (ret2.has_cov) {
+      const Eigen::Matrix3d& gate_cov =
+        ssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
+      const IcpObservability obs = assess_icp_observability(
+        gate_cov, ssm_max_sigma, ssm_max_anisotropy);
+      if (!obs.observable) {
+        ret2.status = Status(Status::NOT_CONVERGED);
+        ret2.status.description =
+          "degenerate: sigma " + std::to_string(obs.sigma_max) +
+          " aniso " + std::to_string(obs.anisotropy);
+        ++ssm_degenerate_rejected;
+      }
+    }
   }
 
   if (ret2.status) {
@@ -1160,19 +1185,13 @@ bool Slam::add_nonsequential_scan_matching()
     // elongated wall-slide covariances pass this gate.
     const Eigen::Matrix3d& gate_cov =
       nssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
-      gate_cov.topLeftCorner<2, 2>());
-    const double ev_lo = es.eigenvalues()[0];
-    const double ev_hi = es.eigenvalues()[1];
-    const double sig_max = std::sqrt(std::max(0.0, ev_hi));
-    const double sig_min = std::sqrt(std::max(1e-12, ev_lo));
-    // check the RAW eigenvalues for NaN — std::max launders NaN to its other
-    // argument, so a NaN covariance would otherwise sail through as sigma 0
-    if (!std::isfinite(ev_lo) || !std::isfinite(ev_hi) ||
-        sig_max > nssm_max_sigma || sig_max / sig_min > nssm_max_anisotropy) {
+    const IcpObservability obs = assess_icp_observability(
+      gate_cov, nssm_max_sigma, nssm_max_anisotropy);
+    if (!obs.observable) {
       ret2.status = Status(Status::NOT_CONVERGED);
-      ret2.status.description = "degenerate: sigma " + std::to_string(sig_max) +
-                                " aniso " + std::to_string(sig_max / sig_min);
+      ret2.status.description =
+        "degenerate: sigma " + std::to_string(obs.sigma_max) +
+        " aniso " + std::to_string(obs.anisotropy);
     }
   }
 

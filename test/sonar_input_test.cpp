@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 #include "sonar_slam_cpp/sonar_input.hpp"
 
@@ -55,6 +56,69 @@ int main()
   const Eigen::Vector3f after = actual.row(1) - actual.row(0);
   CHECK(std::fabs(before.norm() - after.norm()) < 1e-6f,
         "flash ping was not transformed rigidly");
+
+  Matrix malformed(3, 3);
+  malformed << 1.0f, 0.0f, 0.0f,
+               std::numeric_limits<float>::quiet_NaN(), 1.0f, 0.0f,
+               2.0f, 0.0f, 0.0f;
+  CHECK(sonar_slam::finite_points(malformed).rows() == 2,
+        "non-finite returns were not removed");
+
+  sonar_slam::ScanAdmissionParams gate;
+  gate.min_points = 6;
+  gate.cell_size = 0.5;
+  gate.min_occupied_cells = 4;
+  gate.azimuth_bin_size = 0.1;
+  gate.min_azimuth_bins = 3;
+
+  Matrix too_few(5, 3);
+  too_few << 1.0f, 0.0f, 0.0f,
+             2.0f, 0.2f, 0.0f,
+             3.0f, -0.2f, 0.0f,
+             4.0f, 0.4f, 0.0f,
+             5.0f, -0.4f, 0.0f;
+  auto admission = sonar_slam::assess_scan(too_few, gate);
+  CHECK(!admission.informative &&
+          admission.reason ==
+            sonar_slam::ScanAdmissionReason::NOT_ENOUGH_POINTS,
+        "point-count gate admitted a sparse scan");
+
+  Matrix cluster(6, 3);
+  cluster << 1.01f, 0.01f, 0.0f,
+             1.02f, 0.02f, 0.0f,
+             1.03f, 0.03f, 0.0f,
+             1.04f, 0.04f, 0.0f,
+             1.05f, 0.05f, 0.0f,
+             1.06f, 0.06f, 0.0f;
+  admission = sonar_slam::assess_scan(cluster, gate);
+  CHECK(!admission.informative &&
+          admission.reason ==
+            sonar_slam::ScanAdmissionReason::NOT_ENOUGH_CELLS,
+        "occupied-cell gate admitted a dense blob");
+
+  Matrix one_ray(6, 3);
+  one_ray << 1.0f, 0.0f, 0.0f,
+             2.0f, 0.0f, 0.0f,
+             3.0f, 0.0f, 0.0f,
+             4.0f, 0.0f, 0.0f,
+             5.0f, 0.0f, 0.0f,
+             6.0f, 0.0f, 0.0f;
+  admission = sonar_slam::assess_scan(one_ray, gate);
+  CHECK(!admission.informative &&
+          admission.reason ==
+            sonar_slam::ScanAdmissionReason::NOT_ENOUGH_AZIMUTH,
+        "azimuth gate admitted a single water-column ray");
+
+  Matrix structured(6, 3);
+  structured << 1.0f, 0.0f, 0.0f,
+                2.0f, 0.0f, 0.0f,
+                1.0f, 0.2f, 0.0f,
+                2.0f, 0.4f, 0.0f,
+                1.0f, -0.2f, 0.0f,
+                2.0f, -0.4f, 0.0f;
+  admission = sonar_slam::assess_scan(structured, gate);
+  CHECK(admission.informative, "structured scan was rejected: %s",
+        sonar_slam::scan_admission_reason(admission.reason));
 
   std::printf("PASS\n");
   return 0;

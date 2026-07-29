@@ -35,6 +35,19 @@ then leveled with fused roll/pitch for planar registration. Large head sweeps
 are rejected by boresight elevation while sonar_proc's mapping streams continue
 unaffected.
 
+## Open-water behavior
+
+Sparse sonar is treated as absence of a measurement. Before keyframe selection,
+including the first frame, a ping must have enough finite returns distributed
+across distinct horizontal cells and azimuth bins. Rejected pings never enter
+the graph or loop-closure history; the node continues publishing the fused
+odometry pose through the last `map -> odom` correction.
+
+Sequential scan matching then requires both a meaningful overlap fraction and a
+finite, observable ICP covariance. Failure adds only a span-scaled odometry link.
+Admission counts, rejection reasons, input mode and degenerate SSM rejections are
+published on `/diagnostics`.
+
 ## Public interfaces
 
 Inputs:

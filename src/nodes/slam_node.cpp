@@ -51,9 +51,10 @@ public:
     slam_.keyframe_duration = get_double("keyframe_duration");
     slam_.keyframe_translation = get_double("keyframe_translation");
     slam_.keyframe_rotation = get_double("keyframe_rotation");
-    // A genuinely empty candidate cloud must not become a 0-point keyframe;
-    // odometry still carries the pose across the gap. 0 = off.
-    slam_.keyframe_min_points = get_int("keyframe_min_points", 0);
+    if (has_parameter("keyframe_min_points"))
+      throw std::runtime_error(
+        "keyframe_min_points is obsolete: configure admission.min_points, "
+        "admission.min_occupied_cells and admission.min_azimuth_bins instead");
 
     enable_slam_ = get_bool("enable_slam");
     RCLCPP_INFO(get_logger(), "SLAM STATUS: %s", enable_slam_ ? "true" : "false");
@@ -128,6 +129,35 @@ public:
     slam_.ssm_params.init_ftol = ssm_init[2];
     slam_.ssm_params.cov_samples = get_int("ssm/cov_samples", 0);
     slam_.ssm_params.cov_method = cov_method("ssm/cov_method");
+    slam_.ssm_require_covariance =
+      get_bool("ssm/require_covariance", true);
+    slam_.ssm_max_sigma = get_double("ssm/max_sigma", 0.5);
+    slam_.ssm_max_anisotropy = get_double("ssm/max_anisotropy", 8.0);
+    slam_.ssm_degeneracy_prefloor =
+      get_bool("ssm/degeneracy_prefloor", true);
+
+    // Open-water admission happens before keyframe selection, including the
+    // first frame. Keep the count at least as strict as SSM so a cloud too
+    // sparse to make a sonar factor cannot pollute graph/NSSM history.
+    admission_params_.min_points =
+      get_int("admission/min_points", slam_.ssm_params.min_points);
+    admission_params_.cell_size =
+      get_double("admission/cell_size", 0.5);
+    admission_params_.min_occupied_cells =
+      get_int("admission/min_occupied_cells", 8);
+    admission_params_.azimuth_bin_size =
+      get_double("admission/azimuth_bin_size", 0.08726646259971647);
+    admission_params_.min_azimuth_bins =
+      get_int("admission/min_azimuth_bins", 3);
+    if (admission_params_.min_points < slam_.ssm_params.min_points)
+      throw std::runtime_error(
+        "admission.min_points must be >= ssm.min_points");
+    if (!(admission_params_.cell_size > 0.0) ||
+        admission_params_.min_occupied_cells < 1 ||
+        !(admission_params_.azimuth_bin_size > 0.0) ||
+        admission_params_.min_azimuth_bins < 1)
+      throw std::runtime_error(
+        "admission cell/bin sizes must be positive and minimum counts >= 1");
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
@@ -514,7 +544,8 @@ private:
         gtsam::Rot3::Ypr(0.0, dr_pose3.rotation().pitch(),
                         dr_pose3.rotation().roll())
           .matrix().cast<float>();
-      points = project_flash_ping(xyz_sensor, R_bs, t_bs, R_h);
+      points = finite_points(
+        project_flash_ping(xyz_sensor, R_bs, t_bs, R_h));
       slam_callback(msg.header.stamp, dr_pose3, points, true);
       return;
     }
@@ -530,15 +561,48 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
+    ScanAdmission admission;
+    bool scan_informative = false;
+    if (scan_usable) {
+      admission = assess_scan(points, admission_params_);
+      scan_informative = admission.informative;
+      last_admission_summary_ =
+        std::string(scan_admission_reason(admission.reason)) +
+        " (points " + std::to_string(admission.finite_points) +
+        ", cells " + std::to_string(admission.occupied_cells) +
+        ", azimuth bins " +
+        std::to_string(admission.occupied_azimuth_bins) + ")";
+      if (scan_informative) {
+        ++admitted_scans_;
+        last_input_mode_ = "sonar_eligible";
+      } else {
+        ++sparse_scan_rejections_;
+        if (admission.reason == ScanAdmissionReason::NOT_ENOUGH_POINTS)
+          ++sparse_point_rejections_;
+        else if (admission.reason == ScanAdmissionReason::NOT_ENOUGH_CELLS)
+          ++sparse_cell_rejections_;
+        else if (admission.reason == ScanAdmissionReason::NOT_ENOUGH_AZIMUTH)
+          ++sparse_azimuth_rejections_;
+        last_input_mode_ = "odometry_only_sparse";
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "Sonar ping rejected as graph evidence: %s; publishing fused-odometry "
+          "extrapolation only",
+          last_admission_summary_.c_str());
+      }
+    } else {
+      last_input_mode_ = "odometry_only_head_sweep";
+      last_admission_summary_ = "head pitch outside planar SLAM gate";
+    }
 
     // A loaded map intercepts the pipeline until relocalization lands: the
     // DR chain of this session has no relation to the map frame yet, so no
     // factor may enter and nothing may publish until the global scan match
     // places the vehicle.
     if (slam_.awaiting_relocalization()) {
-      if (scan_usable && points.rows() > 0 &&
+      if (scan_informative &&
           points.rows() >= slam_.nssm_params.min_points &&
-          std::isfinite(points(0, 0))) {
+          points.rows() > 0) {
         frame->status = true;
         frame->points = points;
         bool ok = false;
@@ -566,14 +630,11 @@ private:
       return;
     }
 
-    frame->status = scan_usable && slam_.is_keyframe(*frame);
+    frame->status = scan_informative && slam_.is_keyframe(*frame);
 
-    // A head-swept/invalid candidate frame can arrive before the first usable
-    // keyframe. SLAM still owns map->odom in this mode, so keep the map tree
-    // connected with its initial identity correction. This uses the input data
-    // stamp (not wall/ROS "now"), and stops as soon as the first valid
-    // keyframe publishes the estimated transform. Loaded-map relocalization
-    // returns above and must not use this identity bootstrap.
+    // Open water or a head sweep can precede the first informative keyframe.
+    // Keep map->odom connected and publish the fused-odometry pose, but do not
+    // insert a graph state or retain the cloud as future NSSM evidence.
     if (!frame->status && slam_.keyframes.empty() && publish_tf_) {
       set_map_odom(Eigen::Vector3d::Zero(), Eigen::Quaterniond::Identity(),
                    frame->time);
@@ -582,18 +643,6 @@ private:
         "Publishing identity map->odom while waiting for the first usable "
         "SLAM candidate frame.");
     }
-
-    // 3b: near-empty clouds don't carry enough structure to register — keep
-    // them off the graph (DR odometry bridges the gap). NEVER gate the prior
-    // (keyframes.empty()): is_keyframe() makes the first frame the graph anchor
-    // regardless of density, and without it publish_all() bails, so map->odom
-    // is never broadcast until a >=min_points frame arrives (a cold-start
-    // "Could not transform map to odom" when the run opens on a sparse/
-    // head-swept stretch). The gate is for empty INTERMEDIATE keyframes only.
-    if (frame->status && !slam_.keyframes.empty() &&
-        slam_.keyframe_min_points > 0 &&
-        points.rows() < slam_.keyframe_min_points)
-      frame->status = false;
 
     if (!slam_.keyframes.empty()) {
       const gtsam::Pose2 dr_odom =
@@ -648,8 +697,9 @@ private:
 
   void publish_all()
   {
-    if (slam_.keyframes.empty()) return;
+    if (!slam_.current_frame) return;
     publish_pose();
+    if (slam_.keyframes.empty()) return;
     if (slam_.current_frame->status) {
       publish_trajectory();
       // Constraint markers re-walk the graph history, so rate-limit and build
@@ -708,7 +758,15 @@ private:
     constexpr double kUnobserved = 1e6;
     Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();
     cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
-    const Eigen::Matrix3d& tc = slam_.current_keyframe()->transf_cov;
+    Eigen::Matrix3d tc = Eigen::Matrix3d::Zero();
+    if (slam_.keyframes.empty()) {
+      // No informative sonar frame yet: map == odom and this output is the
+      // fused-odometry extrapolation. TF carries no covariance, so use the
+      // configured DR link noise rather than claiming scan-match confidence.
+      tc = slam_.odom_sigmas.array().square().matrix().asDiagonal();
+    } else {
+      tc = slam_.current_keyframe()->transf_cov;
+    }
     const int map_idx[3] = {0, 1, 5};
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) cov(map_idx[i], map_idx[j]) = tc(i, j);
@@ -718,7 +776,7 @@ private:
     // planar covariance by the DR drift accumulated since the keyframe so
     // fusion does not over-trust the extrapolated pose (the same odometry is
     // already delivered to the EKF directly).
-    if (!frame->status) {
+    if (!frame->status && !slam_.keyframes.empty()) {
       const gtsam::Pose2 dr =
         slam_.current_keyframe()->dr_pose.between(frame->dr_pose);
       const double d = std::hypot(dr.x(), dr.y());
@@ -772,7 +830,8 @@ private:
     // periodic health counters — publish_pose runs per callback (~ping
     // rate), so gate on the keyframe count CHANGING or the same line
     // repeats hundreds of times while the count sits on a multiple of 25
-    if (slam_.current_key() % 25 == 0 && slam_.current_key() != last_logged_key_) {
+    if (!slam_.keyframes.empty() && slam_.current_key() % 25 == 0 &&
+        slam_.current_key() != last_logged_key_) {
       last_logged_key_ = slam_.current_key();
       RCLCPP_INFO(get_logger(),
                   "SLAM status: keyframes %d (last kf %ld pts), SSM factors %d, "
@@ -1120,11 +1179,15 @@ private:
     const std::uint64_t tf_failures = tf_lookup_failures_;
     const std::uint64_t pitch_rejections = pitch_rejections_;
     int reverted = 0;
+    std::string input_mode;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       reverted = slam_.nssm_reverted;
+      input_mode = last_input_mode_;
       add("keyframes", std::to_string(slam_.current_key()));
       add("ssm_factors", std::to_string(slam_.ssm_accepted));
+      add("ssm_degenerate_rejected",
+          std::to_string(slam_.ssm_degenerate_rejected));
       add("nssm_accepted", std::to_string(slam_.nssm_accepted));
       add("nssm_attempts", std::to_string(slam_.nssm_attempts));
       add("nssm_queued", std::to_string(slam_.nssm_queued));
@@ -1145,6 +1208,17 @@ private:
       add("usbl_rejected", std::to_string(usbl_rejected_));
       add("awaiting_relocalization",
           slam_.awaiting_relocalization() ? "true" : "false");
+      add("input_mode", last_input_mode_);
+      add("last_scan_admission", last_admission_summary_);
+      add("admitted_scans", std::to_string(admitted_scans_));
+      add("sparse_scan_rejections",
+          std::to_string(sparse_scan_rejections_));
+      add("sparse_rejections_points",
+          std::to_string(sparse_point_rejections_));
+      add("sparse_rejections_cells",
+          std::to_string(sparse_cell_rejections_));
+      add("sparse_rejections_azimuth",
+          std::to_string(sparse_azimuth_rejections_));
     }
     add("exact_tf_failures", std::to_string(tf_failures));
     add("head_pitch_rejections", std::to_string(pitch_rejections));
@@ -1156,6 +1230,12 @@ private:
     } else if (reverted > diag_prev_reverted_) {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
       st.message = "loop-closure round reverted by post-loop verification";
+    } else if (input_mode == "odometry_only_sparse") {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      st.message = "odometry-only: uninformative sonar";
+    } else if (input_mode == "odometry_only_head_sweep") {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      st.message = "odometry-only: sonar head outside planar gate";
     } else {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       st.message = "running";
@@ -1206,6 +1286,14 @@ private:
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;
   double max_head_pitch_ = 0.52;
+  ScanAdmissionParams admission_params_;
+  std::string last_input_mode_ = "waiting_for_sonar";
+  std::string last_admission_summary_ = "none yet";
+  std::uint64_t admitted_scans_ = 0;
+  std::uint64_t sparse_scan_rejections_ = 0;
+  std::uint64_t sparse_point_rejections_ = 0;
+  std::uint64_t sparse_cell_rejections_ = 0;
+  std::uint64_t sparse_azimuth_rejections_ = 0;
 
   // ---- map->odom republish (rtabmap CoreWrapper's transformThread_) --------
   // The edge used to be broadcast ONLY from the sonar callback, so a sonar or

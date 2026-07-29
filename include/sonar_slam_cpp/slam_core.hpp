@@ -28,11 +28,6 @@ public:
   double keyframe_duration = 1.0;
   double keyframe_translation = 3.0;
   double keyframe_rotation = 0.5;
-  // Minimum feature points for a frame to become a keyframe (0 = off,
-  // upstream parity). Genuinely empty clouds (~8% of pings on the pool bags)
-  // otherwise become 0-point keyframes that dilute the graph and deposit
-  // empty map tiles — MAP_DOUBLING_FIX_PLAN.md fix 3b.
-  int keyframe_min_points = 0;
 
   Eigen::Vector3d prior_sigmas = Eigen::Vector3d(0.1, 0.1, 0.01);
   Eigen::Vector3d odom_sigmas = Eigen::Vector3d(0.2, 0.2, 0.02);
@@ -51,6 +46,14 @@ public:
 
   SMParams ssm_params;
   SMParams nssm_params;
+
+  // SSM must fail closed when sampled/Censi covariance is unavailable or says
+  // the registration has a large/weak translation axis. Sparse/open-water
+  // periods then use only the fused-odometry link.
+  bool ssm_require_covariance = true;
+  double ssm_max_sigma = 0.5;
+  double ssm_max_anisotropy = 8.0;
+  bool ssm_degeneracy_prefloor = true;
 
   int pcm_queue_size = 5;
   int min_pcm = 3;
@@ -136,6 +139,7 @@ public:
   ICP icp;
 
   int ssm_accepted = 0;
+  int ssm_degenerate_rejected = 0;
   int nssm_accepted = 0;
   // most recent SSM outcome ("accepted" or "<Status name>: <description>") —
   // surfaced in the periodic status log so a 0-factor run explains itself
