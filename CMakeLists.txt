@@ -74,7 +74,19 @@ if(SONAR_SLAM_ENABLE_CUDA)
 endif()
 
 # ------------------------------------------------------------------ dependencies
-find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
+# Jazzy provides ament_target_dependencies; newer ament releases replace it
+# with ament_auto_depend_on_packages.
+function(auto_target_dependencies target)
+  if(COMMAND ament_auto_depend_on_packages)
+    ament_auto_depend_on_packages(${target} PACKAGES ${ARGN})
+  else()
+    ament_target_dependencies(${target} ${ARGN})
+  endif()
+endfunction()
+
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -176,7 +188,7 @@ target_link_libraries(sonar_slam_core
   ${PCL_LIBRARIES}
 )
 # the core types carry message stamps/twists (no rclcpp dependency though)
-ament_target_dependencies(sonar_slam_core builtin_interfaces geometry_msgs)
+auto_target_dependencies(sonar_slam_core builtin_interfaces geometry_msgs)
 # libpointmatcher exports either an imported target or classic variables
 if(TARGET libpointmatcher::libpointmatcher)
   target_link_libraries(sonar_slam_core libpointmatcher::libpointmatcher)
@@ -199,7 +211,7 @@ add_library(sonar_slam_ros SHARED
   src/ros/ros_conversions.cpp
 )
 target_link_libraries(sonar_slam_ros sonar_slam_core)
-ament_target_dependencies(sonar_slam_ros
+auto_target_dependencies(sonar_slam_ros
   rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
   builtin_interfaces tf2_ros cv_bridge marine_acoustic_msgs
   ${SONAR_SLAM_VENDOR_MSG_DEPS})
@@ -215,7 +227,7 @@ function(sonar_slam_node name src)
   target_link_libraries(${name} sonar_slam_ros)
   # nodes select drivers by parameter string and never include a vendor header;
   # the vendor message runtime comes transitively through sonar_slam_ros
-  ament_target_dependencies(${name}
+  auto_target_dependencies(${name}
     rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
     nav_msgs visualization_msgs builtin_interfaces tf2_ros cv_bridge
     marine_acoustic_msgs ${SONAR_SLAM_VENDOR_MSG_DEPS} ament_index_cpp)
@@ -249,7 +261,7 @@ sonar_slam_node(sim_payload src/tools/sim_payload.cpp)
 # function-level parity harness against the Python bruce_slam originals
 add_executable(parity_vs_python src/tools/parity_vs_python.cpp)
 target_link_libraries(parity_vs_python sonar_slam_core)
-ament_target_dependencies(parity_vs_python builtin_interfaces geometry_msgs)
+auto_target_dependencies(parity_vs_python builtin_interfaces geometry_msgs)
 install(TARGETS parity_vs_python DESTINATION lib/${PROJECT_NAME})
 
 # --------------------------------------------------------------------------- tests
@@ -316,7 +328,7 @@ if(BUILD_TESTING)
 
   add_executable(test_manual_correction test/test_manual_correction.cpp)
   target_link_libraries(test_manual_correction sonar_slam_core)
-  ament_target_dependencies(test_manual_correction
+  auto_target_dependencies(test_manual_correction
     builtin_interfaces geometry_msgs)
   ament_add_test(test_manual_correction
     COMMAND $<TARGET_FILE:test_manual_correction>
@@ -326,7 +338,8 @@ if(BUILD_TESTING)
   # closure -> persistence -> relocalization -> absolute fixes, no bags/DDS
   add_executable(test_pipeline_e2e test/test_pipeline_e2e.cpp)
   target_link_libraries(test_pipeline_e2e sonar_slam_core)
-  ament_target_dependencies(test_pipeline_e2e builtin_interfaces geometry_msgs)
+  auto_target_dependencies(
+    test_pipeline_e2e builtin_interfaces geometry_msgs)
   target_compile_definitions(test_pipeline_e2e
     PRIVATE TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   ament_add_test(test_pipeline_e2e
@@ -362,4 +375,4 @@ install(TARGETS sonar_slam_core sonar_slam_ros
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
-ament_package()
+ament_auto_package()
