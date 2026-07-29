@@ -8,10 +8,13 @@
      to take it back. -->
 <launch>
   <arg name="rviz" default="true"/>
+  <arg name="use_sim_time" default="$(env use_sim_time 'False')"/>
+  <set_parameter name="use_sim_time" value="$(var use_sim_time)"/>
   <include file="$(find-pkg-share sonar_slam_cpp)/launch/slam.launch.xml">
     <arg name="payload_config"
          value="$(find-pkg-share sonar_slam_cpp)/config/payloads/sim_demo.yaml"/>
     <arg name="enable_gyro" value="false"/>
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
   </include>
   <node pkg="sonar_slam_cpp" exec="sim_payload" name="sim_payload"
         output="screen"/>

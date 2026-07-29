@@ -178,7 +178,7 @@ public:
     // node omitted via enable_gyro:=false while use_gyro is true, a dead
     // driver, a wrong topic) otherwise means localization silently publishes
     // nothing for the whole mission.
-    watchdog_ = create_wall_timer(std::chrono::seconds(10), [this]() {
+    watchdog_ = create_timer(std::chrono::seconds(10), [this]() {
       std::lock_guard<std::mutex> lock(mutex_);
       bool all_seen = true;
       if (!dvl_seen_) {
@@ -219,8 +219,8 @@ public:
     // itself only if features pair — treat long coasts as degraded DR.
     dvl_coast_ = get_double("dvl_coast", 0.0);
     if (dvl_coast_ > 0.0) {
-      coast_timer_ = create_wall_timer(std::chrono::milliseconds(200),
-                                       [this]() { coast_step(); });
+      coast_timer_ = create_timer(std::chrono::milliseconds(200),
+                                  [this]() { coast_step(); });
       RCLCPP_INFO(get_logger(), "DVL coast enabled: up to %.1f s", dvl_coast_);
     }
 
@@ -230,8 +230,8 @@ public:
     // diagnostics viewer), not just in a scrolled-away terminal.
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", 10);
-    diag_timer_ = create_wall_timer(std::chrono::seconds(1),
-                                    [this]() { publish_diagnostics(); });
+    diag_timer_ = create_timer(std::chrono::seconds(1),
+                               [this]() { publish_diagnostics(); });
 
     RCLCPP_INFO(get_logger(), "Localization node is initialized");
   }

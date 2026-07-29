@@ -146,6 +146,9 @@ int main(int argc, char** argv)
   };
 
   const double t0 = steady_now();
+  // Deliberately wall/steady based: this tool measures sensor stamp offset
+  // against host arrival time, so its observation window must not share the
+  // ROS clock being diagnosed.
   auto timer = node->create_wall_timer(std::chrono::milliseconds(500), [&]() {
     try_subscribe();
     if (steady_now() - t0 > window) rclcpp::shutdown();

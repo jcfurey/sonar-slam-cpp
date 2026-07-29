@@ -49,8 +49,11 @@ public:
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/sim/imu", 50);
     depth_pub_ = create_publisher<std_msgs::msg::Float64>("/sim/depth", 10);
 
-    timer_ = create_wall_timer(std::chrono::milliseconds(50),
-                               [this]() { tick(); });
+    // The synthetic vehicle is a simulation, so its dynamics must advance on
+    // the node clock. This preserves the same trajectory when /clock is
+    // paused, slowed, or accelerated.
+    timer_ = create_timer(std::chrono::milliseconds(50),
+                          [this]() { tick(); });
     RCLCPP_INFO(get_logger(),
                 "sim_payload: 20x10 m pool with posts, %.2f m/s lap, DVL "
                 "bias (%.3f, %.3f) m/s",
