@@ -13,7 +13,6 @@
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
 #include "sonar_slam_cpp/keyframe.hpp"
-#include "sonar_slam_cpp/sonar_geometry.hpp"
 
 namespace sonar_slam {
 
@@ -47,7 +46,7 @@ public:
   // across an OpenMP per-thread ICP engine pool instead of one core
   // sequentially. Per-guess results are unchanged (deterministic chain); the
   // only divergence is that the 2 s cap rarely fires, so MCD sees the full
-  // sample set. See docs/DIVERGENCES.md.
+  // sample set.
   bool parallel_cov_samples = true;
 
   SMParams ssm_params;
@@ -124,7 +123,11 @@ public:
   // 0 disables.
   double post_loop_max_link_error_sigma = 3.0;  // sigma
 
-  OculusProperty oculus;
+  // Physical fan bounds used only to preselect loop-closure target points.
+  // sonar_proc owns the live ping geometry; conservative static bounds keep
+  // this back-end independent of raw sonar messages.
+  double sonar_max_range = 30.0;
+  double sonar_horizontal_aperture = 2.2689280275926285;  // radians(130)
 
   // ----------------------------------------------------------------- state
   std::vector<KeyframePtr> keyframes;

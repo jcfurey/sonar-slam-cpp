@@ -1,458 +1,66 @@
 # sonar_slam_cpp
 
-[![ci](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/jcfurey/sonar-slam-cpp/actions/workflows/ci.yml)
+Sonar scan matching and pose-graph optimization for ROS 2.
 
-All-C++/CUDA runtime port of the `bruce_slam` sonar SLAM stack — nodes are
-`rclcpp` and the launch files are XML. Python is used only by the optional
-cross-project parity harness under `test/`, never at runtime. Every GPU kernel
-has a CPU twin selected at runtime, so the same binary runs on the
-Jetson/desktop GPU or on a CPU-only machine with identical behavior.
+This package intentionally owns only:
 
-## Quick demo (no hardware, no bags)
+- keyframe selection;
+- sequential and non-sequential scan matching;
+- ICP covariance, degeneracy gates, PCM and ISAM2 optimization;
+- relocalization, graph persistence and absolute/operator priors;
+- `map -> odom`, optimized pose, odometry, trajectory and graph constraints.
 
-```bash
-ros2 launch sonar_slam_cpp demo.launch.xml
-```
+The surrounding workspace owns the rest:
 
-A synthetic pool simulator (`sim_payload`) drives the full standard pipeline
-— CFAR feature extraction, dead reckoning, scan matching, loop closures,
-mapping — with RViz up. The simulated DVL carries a small bias, so dead
-reckoning drifts visibly and loop closures pull the trajectory back. Use the
-RViz **2D Pose Estimate** button for a live hand correction;
-`ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger` takes
-it back. The same synthetic world backs the end-to-end pipeline test
-(`test/test_pipeline_e2e.cpp`), which CI runs on pushes to `main` and on
-pull requests — **not** on pushes to work branches, and not at all when this
-package is built as part of `nautilus_ws` (see *Tests* below).
+- `sonar_proc` decodes sonar images, suppresses artifacts, selects candidate
+  returns and publishes `/sensor/sonar/sonar0/proc_points`;
+- the fused odometry stack publishes timestamped `odom -> base_link` TF;
+- `vdb_mapping_ros2` consumes `map_points`, `survey_points`, `free_points` and
+  the optimized trajectory to produce corrected occupancy and survey maps.
 
-## Drop-in compatibility
+## Timing model
 
-Topic names and YAML layouts are **identical** to the Python `bruce_slam`
-package, and every parameter the Python stack has keeps its name and meaning
-— so the configs under `config/` are drop-in compatible and existing tuning
-(including `src/settings/params/localization/sonar_slam/*.yaml`) applies
-unchanged. The two stacks are interchangeable per-node: you can run the C++
-feature extractor against the Python SLAM node or vice versa.
+Oculus is a flash-imaging sonar. Every point in one `proc_points` message is
+treated as one rigid acquisition at `header.stamp`; there is no invented
+per-point scan time and no nearest-odometry-message approximation.
 
-The C++ stack is a strict **superset**: it adds parameters the Python
-original has no equivalent for — the NSSM degeneracy and compass gates
-(`nssm/max_sigma`, `max_anisotropy`, `degeneracy_prefloor`,
-`max_yaw_vs_compass`, `max_translation_vs_dr`, `min_revisit_sep`,
-`min_overlap_ratio`), the post-loop verification (`post_loop_max_yaw_rms`,
-`post_loop_max_link_error_sigma`), the front-end range gate
-(`filter/min_range`, `max_range`, `extract_polar`), map persistence, USBL
-input, operator hand correction, and the `map->odom` republish timer. Those are additive; a Python
-config simply leaves them at their defaults.
+For each ping, `slam_node` requests both:
 
-| executable | ports | Python original |
-| --- | --- | --- |
-| `feature_extraction_node` | CFAR + polar→Cartesian + cloud filtering | `feature_extraction.py` |
-| `slam_node` | SSM/NSSM/PCM/ISAM2 back-end | `slam.py`, `slam_ros.py` |
-| `dead_reckoning_node` | DVL+IMU/FOG dead reckoning (4 modes) | `dead_reckoning.py` |
-| `gyro_node` | FOG delta-angle integration | `gyro.py` |
-| `kalman_node` | 12-state Kalman filter | `kalman.py` |
-| `enu_odom_relay_node` | ENU→z-down odometry relay | `scripts/enu_odom_relay.py` |
-| `mapping_node` | keyframe-anchored, loop-closure-correctable occupancy grid + intensity/backscatter mosaic | `mapping.py` |
-| `parity_check` | CPU/GPU parity + perf self-test | — |
-| `map_metrics` | map-quality metrics (wall thickness, doubled-wall fraction) over the slam cloud | — |
-| `stamp_probe` | cross-device stamp-offset measurement (prints the `stamp_offset` lines to set) | — |
-| `sim_payload` | synthetic pool payload simulator for `demo.launch.xml` | — |
+- `base_link <- cloud frame` at the ping stamp; and
+- `odom <- base_link` at the same stamp.
 
-`mapping_node` consumes the latched `/bruce/slam/slam/traj` (whole optimized
-trajectory) plus the ping + feature cloud, and re-renders its 2D map products
-when a loop closure moves keyframes (`dec`/`inc` per moved tile) — the map
-correction the live accumulator lacks.
-Its `mapping/enu_world` MUST match `slam/enu_world` (both ship `true`; the
-`bluerov_legacy` payload flips both to the legacy z-down convention). Under
-`bringup_localization_erdc` this is no longer left to two separate YAMLs
-agreeing by hand — both nodes take the value from one `slam_enu_world` launch
-argument, declared after the YAML loads, the same interlock pattern used for
-`publish_tf`. A silent mismatch mirrors every map product about the x axis
-while the SLAM pose stays correct, so it reads as a calibration fault rather
-than a config one.
+If either exact transform is unavailable, the ping is dropped and reported on
+`/diagnostics`. The input cloud is projected once through the sensor transform,
+then leveled with fused roll/pitch for planar registration. Large head sweeps
+are rejected by boresight elevation while sonar_proc's mapping streams continue
+unaffected.
 
-Not ported: the offline bag-pump mode (use `ros2 bag play` instead).
+## Public interfaces
 
-## GPU acceleration & CPU fallback
+Inputs:
 
-CUDA kernels (compiled only when a CUDA toolchain exists; the build degrades
-to CPU-only silently otherwise):
+- `/sensor/sonar/sonar0/proc_points` (`sensor_msgs/PointCloud2`);
+- timestamped TF for the cloud frame, `base_link`, and `odom`;
+- optional `/initialpose` and USBL/LBL position fixes.
 
-- **CFAR** (CA/SOCA/GOCA/OS) over the polar image — one thread per pixel.
-- **Polar→Cartesian remap** (`cv::remap` semantics): nearest-neighbour for the
-  binary detection mask and bilinear for grayscale visualization/intensity.
-- **Batched global scan-match cost** — all Sobol candidate poses of the
-  SSM/NSSM initialization evaluated in one launch.
-- **Overlap/correspondence 1-NN** (`cloud_ops match()`) — exact brute force,
-  same id/-1 + dist²/inf contract as the KDTree; serves the SSM/NSSM overlap
-  gates, the NSSM target-key refinement, and the Censi correspondences.
-  Size-gated (small queries stay on the CPU KDTree).
+Outputs:
 
-Not a kernel but related: `parallel_cov_samples` (default true) runs the
-"sampled" covariance method's 30 registrations per scan match across a
-per-thread pool of identically-configured libpointmatcher engines instead of
-one core sequentially — per-guess results unchanged (deterministic chain);
-see `docs/DIVERGENCES.md` #8. The registrations themselves stay on the CPU by
-decision — GPU ICP would rewrite deployed registration math.
+- `/bruce/slam/slam/pose`;
+- `/bruce/slam/slam/odom`;
+- `/bruce/slam/slam/traj`;
+- `/bruce/slam/slam/constraint`;
+- `map -> odom` TF when `publish_tf` is enabled.
 
-Runtime dispatch: `gpu::available()` = built with CUDA ∧ device present ∧
-`SONAR_SLAM_FORCE_CPU` unset. CPU twins are OpenMP-parallel and are the same
-arithmetic (the parity_check tool verifies mask equality per pixel). Any
-runtime CUDA failure (allocation, copy, launch) makes the wrapper return
-false and that call falls back to the CPU twin — a GPU error degrades, it
-never corrupts the output. Device buffers are cached and reused across calls,
-and the remap coordinate maps stay device-resident until the sonar geometry
-changes. The CFAR kernel folds the intensity gate in (no separate host-side
-compare + bitwise-and pass), and the binary detection mask is remapped with
-nearest-neighbour so the GPU and CPU paths are bit-identical. On the CPU, the
-CA/SOCA/GOCA detectors use an exact integer prefix-sum fast path for uint8
-images — O(1) per pixel and provably bit-identical to the sliding-window
-reference (11× in the documented four-core reference measurement; benchmark
-results vary by host and OpenMP configuration; proofs in `docs/MATH_NOTES.md`).
+Mapping clouds and occupancy grids are deliberately not published here.
 
-Deferred GPU work (needs on-hardware benchmarking to land safely): fusing the
-whole per-ping feature pipeline (CFAR → mask → remap) into one device
-round-trip; page-locked host buffers + CUDA streams to overlap copy and
-compute; and a device-resident grid for the Nelder-Mead scan-match refinement
-(only worthwhile alongside batched multi-candidate evaluation — see
-`global_init.cpp`).
-
-Python→C++ library replacements (no Python deps remain):
-
-| Python | C++ replacement |
-| --- | --- |
-| `scipy.optimize.shgo` (sobol) | 3-dim Sobol sequence + Nelder–Mead refine (`global_init.cpp`) |
-| `sklearn.covariance.MinCovDet` | compact FAST-MCD w/ consistency correction + reweighting (`mcd.cpp`) |
-| `scipy.optimize.root` (CFAR τ) | bracketed bisection (`cfar.cpp`) |
-| `scipy.interpolate.interp1d` | linear / not-a-knot cubic spline (`interp.hpp`) |
-| `networkx`-style `find_cliques` | Bron–Kerbosch with pivoting (`slam_core.cpp`) |
-| `message_filters` (Python ATS) | slop-based `ApproxSync2/3` (`approx_sync.hpp`) |
-| gtsam (Python wheel) | libgtsam-dev 4.2 (system) |
-| `bruce_slam.pcl` pybind module | direct libpointmatcher/PCL calls (`cloud_ops.cpp`) |
-
-ICP factor covariance is estimated with sampled registrations + FAST-MCD, from
-the **Sobol** population only. Nelder–Mead refinement probes used to be
-recorded alongside them; because NM converges toward the optimum its probes
-carried the lowest costs and sorted to the front of the cost-ordered seed
-list, so the covariance measured sensitivity to a *tiny* perturbation rather
-than to real initialization uncertainty. The resulting over-confidence drove
-ISAM2 indeterminate and silently dropped keyframes (7/67 in the end-to-end
-test). `result.delta` still comes from the refined NM optimum, so
-registration quality is unchanged — only the covariance population moved.
-
-`cov_method: censi` is gated on the **loaded** ICP chain rather than assumed.
-The Censi helper builds a point-to-**point** J'J Hessian, so it is valid only
-against a point-to-point minimizer: `config/icp.yaml` (this package's default)
-is `PointToPlaneErrorMinimizer` and rejects it, while
-`settings_erdc/params/localization/sonar_slam/icp.yaml` is
-`PointToPointErrorMinimizer` and accepts it. `sampled` remains the default
-either way — censi is selectable, not validated.
-
-Note that Censi is **not** a degeneracy detector here. With correspondences
-held fixed its translation block is `N·I` regardless of geometry, so it rates
-a flat wall as *better* conditioned than an L-corner (measured 2.92 vs 3.15);
-only a point-to-plane information matrix goes singular on the wall. Sampling
-detects sliding precisely because restarting ICP lets the data association
-change — which is why the sampled path, not a closed form, feeds the
-`nssm/max_sigma` + `max_anisotropy` gates.
-
-## Build
-
-Inside the `nautilus-robot-gpu-1` container (ROS 2 Jazzy, CUDA 12.8 toolkit —
-nvidia-smi's "13.x" is the driver UMD version, not nvcc — RTX 3090 = `sm_86`):
-
-```bash
-source /opt/ros/jazzy/setup.bash && source install/setup.bash
-colcon build --packages-select sonar_slam_cpp --merge-install
-```
-
-The CUDA architecture defaults to `86-real;86-virtual`; a stale cached
-`CMAKE_CUDA_ARCHITECTURES` below sm_75 (the observed case: 52, which nvcc 12.8
-still accepts and ships as PTX the sm_86 device must JIT) self-heals to 86 on
-reconfigure.
-
-Requires standard ROS 2 messages (`marine_acoustic_msgs`, `sensor_msgs`,
-`geometry_msgs`, `nav_msgs`, `std_msgs`) plus system
-`ros-jazzy-libpointmatcher`, `libgtsam-dev`, PCL and OpenCV. The legacy
-BlueROV driver message stubs (`sonar_oculus`, `rti_dvl`, `bar30_depth`,
-`kvh_gyro`) are **optional** — `find_package(... QUIET)` compiles their
-adapters when present and the build degrades to standard-message drivers
-otherwise, so a standard-payload deployment needs none of them.
-
-### Tests — skipped by the nautilus_ws build
-
-`.github/workflows/ci.yml` builds and runs the suite on pushes to `main` and
-on every pull request, so the tests are healthy upstream.
-
-They are **silently skipped when built as part of `nautilus_ws`**: that
-workspace's `colcon_defaults.yaml` sets `-DBUILD_TESTING=OFF`, and
-`CMakeLists.txt` gates every test on `BUILD_TESTING`, so `ctest -N` in
-`build/sonar_slam_cpp` reports **`Total Tests: 0`**. Since this package is
-consumed there as a submodule pinned to a work branch (`cam_wip`), and CI
-triggers only on `main`/PRs, day-to-day integration work runs against no
-tests at all unless they are asked for explicitly:
+## Build and test
 
 ```bash
 colcon build --packages-select sonar_slam_cpp \
-    --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON
-colcon test --merge-install --packages-select sonar_slam_cpp
+  --cmake-args -DBUILD_TESTING=ON
+colcon test --packages-select sonar_slam_cpp
 colcon test-result --all --verbose
 ```
 
-`colcon_defaults.test.yaml` in the workspace root carries the same settings
-if you would rather swap profiles (the pattern `Release.Dockerfile` uses for
-`colcon_defaults.release.yaml`).
-
-Eight tests, ~10 s total. `test_pipeline_e2e` is the one that matters most:
-it drives a synthetic rectangular pool through CFAR, SSM, NSSM (every
-defence gate), ISAM2, map save/load + relocalization, and a USBL-style
-position prior, asserting that the loop closes and the trajectory error
-beats raw dead reckoning. It runs with the **deployed** covariance settings
-(`cov_samples: 30`, `sampled`, `min_overlap_ratio: 0.1`) so the
-ICP-covariance → degeneracy-gate chain is actually exercised — it used to
-run at `cov_samples: 0`, leaving that whole chain untested.
-
-`nautilus_ws/.gitlab-ci.yml` is docker-buildx-bake only and has no colcon
-stage, so nothing runs the suite on the integration side.
-
-## Sensor payloads
-
-Nodes pick their sensor drivers by parameter, so different vehicles are
-supported with a config overlay, not code changes. Ready presets live in
-`config/payloads/`; e.g. the **Deep Trekker Revolution** (Water Linked
-DVL-A50, Blueprint Oculus, ENU AHRS, pressure depth) runs entirely on standard
-messages with no vendor packages:
-
-```bash
-ros2 launch sonar_slam_cpp slam.launch.xml \
-  payload_config:=$(ros2 pkg prefix --share sonar_slam_cpp)/config/payloads/deeptrekker_revolution.yaml \
-  enable_gyro:=false
-```
-
-The full driver matrix and how to add a payload are in `docs/PAYLOADS.md`.
-
-## Bag replay — time discipline (required)
-
-Replay MUST run in bag time on every node, or arrival-stamped data, republish
-stamps, and TF lookups split across two clock domains:
-
-```bash
-ros2 bag play <bag> --clock
-ros2 launch sonar_slam_cpp slam.launch.xml use_sim_time:=true [...]
-```
-
-Inside `nautilus_ws` this is handled for you, but conditionally: a shell hook
-(`bashrc.d/pre/98-PS1_state_icon.bashrc`) exports `use_sim_time=True` when it
-detects a running `rosbag2_transport/player`, and the bag launch reads that
-env var. It is evaluated **per prompt**, so a shell opened before the player
-started — or a non-interactive script — sees `False`. Export
-`USE_SIM_TIME=True` to lock it on rather than relying on the detection.
-
-The `map->odom` republish timer does not depend on getting this right: it
-stamps in the DATA clock domain (last frame stamp advanced by elapsed node
-time) rather than at `now()`, so it stays consistent with the rest of TF in
-either domain.
-
-The sensor drivers stamp from independent device clocks. If the sync layers
-report no-match starvation (an ERROR naming `stamp_offset`), MEASURE the
-offset instead of guessing:
-
-```bash
-ros2 run sonar_slam_cpp stamp_probe --topics /oculus/sonar_image /dvl/data
-```
-
-reports each stream's median stamp-vs-arrival offset, jitter, and drift, and
-prints the exact `<sensor>.stamp_offset` value to set (a constant offset δ
-otherwise biases every keyframe pose by v·δ / ω·δ, silently — see
-`docs/SLAM_EFFECTIVENESS_AUDIT.md`). It works live and against
-`ros2 bag play` at rate 1.0. If the probe reports a DRIFTING offset, a
-constant `stamp_offset` cannot fully fix that stream.
-
-## Run
-
-```bash
-ros2 launch sonar_slam_cpp slam.launch.xml
-# CPU-only forcing (e.g. to A/B against the GPU path):
-SONAR_SLAM_FORCE_CPU=1 ros2 launch sonar_slam_cpp slam.launch.xml
-# self-test:
-ros2 run sonar_slam_cpp parity_check
-```
-
-`parity_check` exits `0` when every CPU/GPU comparison passed (it prints the
-count), `1` on a mismatch, and `2` when **nothing was compared** — a CPU-only
-build or no visible device. Exit 2 is deliberately not a pass: a green light
-from a tool that compared nothing is worse than no answer. The registered
-`test_runtime_parity` test invokes it with `--smoke-ok`, which downgrades 2 to
-0 so the suite stays green where parity is unobservable (CI builds
-`-DSONAR_SLAM_ENABLE_CUDA=OFF`); a real mismatch still fails. Run it without
-the flag to actually certify a GPU build.
-
-### Hand correction
-
-The operator can correct the SLAM estimate live: use RViz's **2D Pose
-Estimate** button (publishes `/initialpose` in the `map` frame) to place the
-vehicle where it actually is. The fix is applied as a position-tight,
-yaw-soft prior on the newest keyframe; the trajectory re-optimizes, the
-`map->odom` TF jumps, and the mapping node re-renders its tiles from the
-republished trajectory. Topic and trust sigmas are `manual_correction_topic`
-/ `manual_correction_sigmas` in `config/slam.yaml`.
-
-A mis-click is not permanent — corrections form an undo stack:
-
-```bash
-ros2 service call /bruce/slam/slam/undo_manual_correction std_srvs/srv/Trigger
-```
-
-removes the most recent manual prior and relaxes the trajectory back; call
-repeatedly to peel earlier corrections.
-
-### Field diagnostics
-
-`slam_node` and `dead_reckoning_node` publish `/diagnostics`
-(`diagnostic_msgs/DiagnosticArray`, 1 Hz): sync pairing health (the
-stamp-offset starvation signature raises ERROR), the NSSM
-accept/reject/revert funnel, and the manual-correction counters — watch with
-`rqt_runtime_monitor` instead of grepping logs mid-deployment.
-
-### DVL-outage coast
-
-`dvl_coast` (dead reckoning, seconds; 0 = off) bridges DVL dropouts —
-bottom-lock loss, `require_valid` drops, a stalled secondary stream — by
-dead-reckoning on the last good body velocity rotated through the live
-attitude stream, then holding when the budget is spent. Without it the
-estimate freezes for the whole outage while the vehicle keeps moving. The
-Revolution preset arms 3 s.
-
-### Map persistence & relocalization (multi-session)
-
-```bash
-ros2 service call /bruce/slam/slam/save_map std_srvs/srv/Trigger   # end of mission 1
-# mission 2:
-ros2 launch sonar_slam_cpp slam.launch.xml ... # with slam/map_load_path set
-```
-
-`save_map` serializes the whole keyframe map (poses + clouds) to
-`map_save_path`; loading it on a later mission restores the map and arms
-relocalization — the first dense feature frame is globally scan-matched
-against the loaded map (start near previously mapped area), then SLAM
-continues in the SAME map frame, closing loops against the previous
-session's keyframes.
-
-### USBL / acoustic absolute positioning
-
-Point `usbl/topic` (slam.yaml) at a map-frame position feed
-(`PoseWithCovarianceStamped` or `Odometry`). Each fix becomes a
-position-only prior on the stamp-nearest keyframe — innovation-gated
-(multipath outliers rejected), one per keyframe — turning bounded-drift
-SLAM into globally-anchored SLAM. Heading is never taken from USBL.
-
-### Georeferenced deliverables
-
-Give the mapping node a survey `datum` (`[lat, lon, bearing-of-map-x]`,
-mapping.yaml) and call `/bruce/slam/mapping/export_map` (Trigger): the occupancy and
-intensity grids are written as PNG + UTM world files (`.pgw` + `.prj` —
-QGIS/ArcGIS open them as georeferenced rasters) and the trajectory as a
-WGS84 GeoJSON LineString.
-
-### Live CFAR tuning
-
-The feature node's `CFAR.*` and `filter.threshold` parameters are dynamic:
-`ros2 param set /bruce/slam/feature_extraction CFAR.Pfa 0.005` rebuilds the detector on
-the next ping — tune at sea without relaunching. Match the declared types:
-`Pfa` takes a double literal (`0.005`), `Ntc`/`Ngc`/`rank`/`filter.threshold`
-take integers.
-
-### Map-quality metrics
-
-`ros2 run sonar_slam_cpp map_metrics` subscribes to the aggregated SLAM
-cloud (latched — works live or against `ros2 bag play` of a recorded run)
-and prints one line per map update: total wall length, local wall thickness
-(median / p95), the doubled-wall fraction at the 0.3–3 m probe scale, and the
-skeleton cell count — the `docs/MAP_DOUBLING_FIX_PLAN.md` §5 numbers, so
-before/after replays compare as numbers instead of screenshots.
-
-The measurement was **wrong in both directions before 2026-07-27** and is now
-accurate to under 2% at any wall orientation. Two defects, one root cause —
-Zhang–Suen thinning cannot thin the 2-cell-wide band an oblique wall
-rasterises into:
-
-| input (`--grid 0.05`) | was | now | truth |
-| --- | --- | --- | --- |
-| horizontal 10 m wall | 10.00 m | 10.00 m | 10 m |
-| single 45° 10 m wall | 9.97 m | 9.97 m | 10 m |
-| 30° 10 m wall | 13.15 m (**+32%**) | 9.93 m (−0.7%) | 10 m |
-| two parallel 45° walls, 1 m apart | **0.00 m, 0% doubled** | 19.96 m, 100% doubled | 20 m, doubled |
-
-The last row is the one that mattered: on the exact geometry this tool exists
-to detect, Zhang–Suen ate the walls end-first (it can only delete their
-terminal pixels), leaving 2 skeleton cells from 566 occupied — so a perfectly
-doubled map scored a **perfect 0% doubled**. Thinning is now Guo–Hall, which
-thins the band properly, and wall length applies a per-corner correction
-(`n_axis + √2·n_diag − 0.108·n_corner`) that keeps the raw staircase sum's
-+7.9% orientation bias under 1.9% while staying exact at 0°/45°/90°.
-
-`test_map_metrics` locks this in against synthetic walls of known length and
-known doubling, including both former failures; the collapse WARNING stays as
-a backstop, and `skel=` is still worth a glance on an unfamiliar cloud.
-
-## Parity verification against the Python stack
-
-`test/parity_driver.py` (dev-only; requires the Python bruce_slam workspace)
-feeds identical fixtures through the original pybind/scipy functions and the
-C++ ports:
-
-```bash
-python3 test/parity_driver.py gen /tmp/slam_parity
-ros2 run sonar_slam_cpp parity_vs_python /tmp/slam_parity
-python3 test/parity_driver.py compare /tmp/slam_parity
-```
-
-Verified 2026-07-10 (GPU and CPU-forced): CFAR masks, cloud ops, KNN match,
-full ICP and the global scan-match cost are **bit-exact** vs the originals;
-threshold factors match scipy; FAST-MCD agrees with the planted ground truth.
-
-## Detection front-end (CFAR) — operating point
-
-`docs/SONAR_FRONTEND_REVIEW.md` reviews the CFAR stage and the polar image
-path against the sonar literature, with measurements taken on this code. The
-short version: the detector implements its own model correctly (realized
-false-alarm rate tracks nominal to 3% on exponential clutter), but the shipped
-operating point is looser than sonar practice (`Pfa: 0.1` vs ~2%) and is
-effectively set by the *fixed* `filter/threshold`, which is not range-adaptive
-and therefore moves with gain and TVG. **If you tune one, tune both** — that
-is the one open item, and it needs a bag.
-
-Applied from that review: `CFAR/rank` is now `30` (Rohling's 3N/4 — the
-inherited `10` realizes 13% more false alarms than nominal on uint8 input;
-`alg: OS` only, inert for the `SOCA` default); `test_cfar_math` stage [5] now
-asserts realized false-alarm rate through `detect()` on exponential clutter,
-which the previous continuous-domain Monte Carlo could not see; and
-`filter/extract_polar` (default true) extracts detections from the polar mask
-instead of from a Cartesian remap of it, which used to discard most near-field
-polar cells outright — see `docs/DIVERGENCES.md` #11.
-
-Because that last change recovers near-field returns, and the near field is
-also where **thruster wake, ringdown and multipath** live, `filter/min_range`
-and `filter/max_range` (metres, 0 = off, both dynamic) gate the cloud
-explicitly. Wake and ringdown pass CFAR honestly — they really are bright —
-but they are *body*-fixed, so scan matching reads them as structure moving
-with the vehicle and biases ICP toward its own motion. In confined water
-`max_range` is a principled multipath filter: a surface or bottom bounce
-travels a longer path than the direct return, so in a pool of known size any
-echo beyond the largest direct-path dimension cannot be structure. The node
-logs the blanking the CFAR window already imposes (2.08 m inner *and* outer on
-the Revolution preset) on the first ping of each geometry, so you can see where
-the implicit exclusion sits before setting an explicit one.
-
-## Intentional deviations from the Python stack
-
-- `shgo` is replaced by Sobol sampling + Nelder–Mead: same sample budget
-  (`initialization_params`), same cost function, but the local-refine path
-  differs numerically. Both stacks feed the sampled poses into the same
-  covariance-ICP machinery, so behavior is equivalent in practice.
-- `MinCovDet` is a reimplementation of FAST-MCD, deterministic (fixed seed)
-  rather than sklearn's randomized subsets.
-- `cv2.applyColorMap(img, 2)` → `cv::COLORMAP_JET` (same map, same id).
-- Python's `ApproximateTimeSynchronizer` is replaced by an explicit
-  primary-stream synchronizer (DVL paces dead reckoning; the feature cloud
-  paces SLAM), matching the effective pairing of the original.
+CUDA accelerates only global-initialization cost evaluation and nearest-neighbor
+matching. Set `SONAR_SLAM_FORCE_CPU=1` to force their CPU equivalents.

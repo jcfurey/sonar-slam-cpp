@@ -7,24 +7,16 @@
     keyframe_duration: 1.0
     keyframe_translation: 3.0
     keyframe_rotation: 0.5235987755982988   # deg(30)
-    # min feature points for a frame to become a keyframe (0 = off). Empty
-    # clouds (~8% of pool pings) otherwise become 0-point keyframes that
-    # dilute the graph and deposit empty map tiles (MAP_DOUBLING_FIX_PLAN 3b).
+    # Min candidate points for an intermediate frame to become a keyframe.
     keyframe_min_points: 10
 
     # is the SLAM back-end enabled (vs. pure dead reckoning); overridden from launch
     enable_slam: true
 
-    # World convention of the published pose/TF/trajectory: true = ENU
-    # (REP-105), false = the legacy z-down graph convention. MUST match
-    # mapping.yaml's enu_world (mapping reconstructs the sonar fan in this
-    # chirality); the bluerov_legacy payload overlay flips BOTH to false.
-    enu_world: true
     # false when an external node (e.g. a robot_localization map EKF fusing
     # the SLAM pose) owns the map->odom transform
     publish_tf: true
-    # min seconds between rebuilds of the O(history) viz outputs (constraint
-    # markers + aggregated map cloud); <= 0 rebuilds every keyframe
+    # min seconds between O(history) graph-constraint marker rebuilds
     viz_min_period: 2.0
 
     # define the noise models
@@ -37,12 +29,15 @@
     # the node falls back to the installed package share copy of icp.yaml.
     icp_config: ""
 
-    # Raw sonar keeps the sonar geometry current (max range / aperture bound
-    # the loop-closure search); range changes mid-mission are picked up. Keep
-    # consistent with feature.yaml (which defaults to uncompressed images).
-    sonar:
-      driver: oculus_uncompressed   # oculus_compressed | oculus_uncompressed | image
-      topic: /sonar_oculus_node/ping
+    # sonar_proc candidate cloud + exact-stamp TF contract
+    points_topic: /sensor/sonar/sonar0/proc_points
+    odom_frame: odom
+    base_frame: base_link
+    tf_lookup_timeout: 0.05
+    max_head_pitch: 0.52
+    # conservative physical fan used only for NSSM target preselection
+    sonar_max_range: 30.0
+    sonar_horizontal_aperture: 2.2689280275926285
 
     # Downsample points for ICP/publishing
     point_resolution: 0.5
@@ -53,18 +48,8 @@
     # ICP chain (see the cov_method notes below) — not on a fixed assumption.
     censi_sensor_noise: 0.1
     # run the "sampled" method's cov_samples registrations across an OpenMP
-    # per-thread ICP engine pool instead of one core sequentially (per-guess
-    # results unchanged; the 2 s cap rarely fires — see docs/DIVERGENCES.md)
+    # per-thread ICP engine pool instead of one core sequentially
     parallel_cov_samples: true
-
-    # max stamp difference (s) when pairing feature clouds with odometry
-    feature_odom_sync_max_delay: 0.5
-
-    # re-emit the cached aggregated map cloud when no keyframe published one
-    # within this many seconds (<= 0 disables). Volatile-QoS consumers (e.g. a
-    # nav2 STVL costmap) miss the transient_local sample on join, and a
-    # stationary vehicle produces no keyframes to re-mark their voxels.
-    cloud_republish_period: 5.0
 
     # Sequential scan matching (SSM)
     ssm:
@@ -87,8 +72,7 @@
       # censi is rejected by default; a point-to-point override accepts it.
       # Even when the objectives match, Bonnabel et al. (ACC 2016) show the
       # closed form is optimistic for point-to-point ICP because it ignores
-      # rematching — so censi is selectable, not validated
-      # (docs/LITERATURE_REVIEW_2026.md Part 2.6).
+      # rematching — so censi is selectable, not validated.
       cov_method: sampled
 
     # Non-sequential scan matching
@@ -121,10 +105,9 @@
       # censi is rejected by default; a point-to-point override accepts it.
       # Even when the objectives match, Bonnabel et al. (ACC 2016) show the
       # closed form is optimistic for point-to-point ICP because it ignores
-      # rematching — so censi is selectable, not validated
-      # (docs/LITERATURE_REVIEW_2026.md Part 2.6).
+      # rematching — so censi is selectable, not validated.
       cov_method: sampled
-      # -- loop-closure defense gates (see MAP_DOUBLING_FIX_PLAN.md) --
+      # -- loop-closure defense gates --
       # covariance degeneracy gate: reject closures whose sampled/Censi
       # covariance is too large or too elongated (wall-sliding signature)
       max_sigma: 0.5          # max sqrt(largest translation eigenvalue), m
@@ -145,8 +128,8 @@
       min_overlap_ratio: 0.0
       # Revisit FLOOR: a loop-closure target must be at least this many
       # keyframes older than the source, which excludes the current pass's own
-      # trail. This is the primary half of the clustered-revisit fix
-      # (docs/DIVERGENCES.md #9); the contiguous-run clustering refines it, but
+      # trail. This is the primary half of the clustered-revisit fix; the
+      # contiguous-run clustering refines it, but
       # the floor is what works when the sonar sees the whole venue and the
       # candidates form one unbroken run (a small pool).
       # COUPLED TO min_st_sep above: the exclusion zone builds the candidate
@@ -199,7 +182,7 @@
     # Operator hand-correction: a map-frame planar pose published here
     # (RViz "2D Pose Estimate" publishes /initialpose) becomes a prior on the
     # NEWEST keyframe; the elastic DR chain distributes the correction
-    # backwards and the mapping node re-renders from the republished
+    # backwards and the graph assembler re-renders from the republished
     # trajectory. Empty string disables the subscription (and the paired
     # undo service /bruce/slam/slam/undo_manual_correction, which pops the most recent
     # manual prior and relaxes the trajectory back).
@@ -213,7 +196,7 @@
     # /bruce/slam/slam/save_map (std_srvs/Trigger) serializes the whole keyframe map
     # (poses + clouds) here; set map_load_path to that file on a later
     # mission to restore it. A loaded map arms RELOCALIZATION: nothing is
-    # published and no factor enters until the first dense feature frame
+    # published and no factor enters until the first dense candidate frame
     # globally scan-matches into the loaded map (start near previously
     # mapped area). Loop closures then tie the new pass to the old map.
     map_save_path: /tmp/sonar_slam_map.ssm
@@ -225,7 +208,7 @@
     # ---- USBL / LBL absolute position input ----
     # Map-frame position fixes become gated position-only priors on the
     # stamp-nearest keyframe (one per keyframe). The fix must be in the SLAM
-    # map frame (same convention as the published pose; ENU when enu_world).
+    # map frame (ENU, matching the rest of the workspace).
     usbl:
       driver: pose_cov     # pose_cov (PoseWithCovarianceStamped) | odom
       topic: ""            # empty disables

@@ -1,13 +1,12 @@
 // End-to-end pipeline test on a synthetic rectangular pool: no bags, no DDS,
 // no proprietary data — pure algorithmic coverage of the paths a field run
 // exercises.
-//  [1] CFAR detects the wall returns in a synthetic polar image.
-//  [2] A drifted perimeter loop through the SLAM core (SSM registration,
+//  [1] A drifted perimeter loop through the SLAM core (SSM registration,
 //      NSSM loop closure through every defense gate, ISAM2) ends with a
 //      loop closure accepted and the trajectory error reduced vs raw DR.
-//  [3] The map survives save -> load, and a new session relocalizes into it
+//  [2] The map survives save -> load, and a new session relocalizes into it
 //      by global scan match within tolerance.
-//  [4] A USBL-style absolute position prior pulls the estimate toward truth.
+//  [3] A USBL-style absolute position prior pulls the estimate toward truth.
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -16,11 +15,9 @@
 #include <string>
 #include <system_error>
 
-#include "sonar_slam_cpp/cfar.hpp"
 #include "sonar_slam_cpp/slam_core.hpp"
 #include "sonar_slam_cpp/synthetic_world.hpp"
 
-using sonar_slam::CFAR;
 using sonar_slam::Keyframe;
 using sonar_slam::KeyframePtr;
 using sonar_slam::Matrix;
@@ -206,41 +203,7 @@ int main()
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);
   std::mt19937 rng(42);
 
-  // ---- [1] CFAR on a synthetic polar image --------------------------------
-  {
-    std::vector<int> wall_rows;
-    const cv::Mat img = world.polar_image(gtsam::Pose2(10.0, 5.0, 0.0),
-                                          kAperture, 128, 200, kMaxRange, rng,
-                                          &wall_rows);
-    const CFAR cfar(40, 10, 1e-2);
-    const cv::Mat mask = cfar.detect(img, CFAR::CA, 60.0f);
-    int cols_with_wall = 0, cols_detected = 0;
-    long stray = 0;
-    for (int b = 0; b < img.cols; ++b) {
-      const int wr = wall_rows[static_cast<std::size_t>(b)];
-      if (wr < 0) continue;
-      ++cols_with_wall;
-      bool hit = false;
-      for (int r = 0; r < img.rows; ++r) {
-        if (!mask.at<std::uint8_t>(r, b)) continue;
-        if (std::abs(r - wr) <= 3)
-          hit = true;
-        else
-          ++stray;
-      }
-      if (hit) ++cols_detected;
-    }
-    std::printf("[1] CFAR: %d/%d wall beams detected, %ld stray detections\n",
-                cols_detected, cols_with_wall, stray);
-    CHECK(cols_with_wall > 60, "fixture broken: only %d wall beams",
-          cols_with_wall);
-    CHECK(cols_detected > cols_with_wall * 7 / 10,
-          "CFAR missed the walls (%d/%d)", cols_detected, cols_with_wall);
-    CHECK(stray < static_cast<long>(cols_with_wall) * 2,
-          "CFAR false-alarm rate implausible (%ld stray)", stray);
-  }
-
-  // ---- [2] drifted perimeter loop: SSM + NSSM close it --------------------
+  // ---- [1] drifted perimeter loop: SSM + NSSM close it --------------------
   Slam slam;
   configure_slam(slam);
 
@@ -288,7 +251,7 @@ int main()
   const double slam_err =
     std::hypot(slam.keyframes[last]->pose.x() - truth_last.x(),
                slam.keyframes[last]->pose.y() - truth_last.y());
-  std::printf("[2] loop: %d keyframes, ssm %d, nssm accepted %d (reverted "
+  std::printf("[1] loop: %d keyframes, ssm %d, nssm accepted %d (reverted "
               "%d); final err slam %.2f m vs dr %.2f m\n",
               slam.current_key(), slam.ssm_accepted, slam.nssm_accepted,
               slam.nssm_reverted, slam_err, dr_err);
@@ -303,7 +266,7 @@ int main()
         "loop closure did not meaningfully correct (slam %.2f vs dr %.2f)",
         slam_err, dr_err);
 
-  // ---- [3] persistence roundtrip + relocalization --------------------------
+  // ---- [2] persistence roundtrip + relocalization --------------------------
   // Unique per run, for the same reason the ICP fixtures above are: two runs
   // sharing a working directory otherwise interleave on one file, and
   // save_map's write-temp-then-rename means the loser can load the winner's
@@ -330,13 +293,13 @@ int main()
   const double reloc_err =
     std::hypot(frame2->pose.x() - reloc_truth.x(),
                frame2->pose.y() - reloc_truth.y());
-  std::printf("[3] persistence: %d keyframes reloaded; relocalized %.2f m "
+  std::printf("[2] persistence: %d keyframes reloaded; relocalized %.2f m "
               "from truth\n",
               s2.loaded_keyframes(), reloc_err);
   CHECK(reloc_err < 0.8, "relocalization landed %.2f m from truth", reloc_err);
   std::remove(map_path.c_str());
 
-  // ---- [3b] session-2 rounds after the load: the boundary link joins two
+  // ---- [2b] session-2 rounds after the load: the boundary link joins two
   // DR epochs, and its meaningless "tear" must not leak into the post-loop
   // verification (it used to revert + quarantine genuine closures)
   //
@@ -361,7 +324,7 @@ int main()
       const gtsam::Pose2 d2(t2.x() - 6.0 + d2x, t2.y() - 2.0 + d2y, 0.0);
       if (feed(s2, 1000 + k, t2, d2, world, rng)) ++ok2;
     }
-    std::printf("[3b] session-2: %d/12 rounds ok, nssm accepted %d, "
+    std::printf("[2b] session-2: %d/12 rounds ok, nssm accepted %d, "
                 "reverted %d (was %d)\n",
                 ok2, s2.nssm_accepted, s2.nssm_reverted, reverted_before);
     CHECK(ok2 >= 10, "session-2 rounds failing (%d/12)", ok2);
@@ -376,7 +339,7 @@ int main()
           reverted_before, s2.nssm_reverted);
   }
 
-  // ---- [4] USBL-style absolute position prior ------------------------------
+  // ---- [3] USBL-style absolute position prior ------------------------------
   const double before =
     std::hypot(slam.keyframes[last]->pose.x() - truth_last.x(),
                slam.keyframes[last]->pose.y() - truth_last.y());
@@ -385,7 +348,7 @@ int main()
   const double after =
     std::hypot(slam.keyframes[last]->pose.x() - truth_last.x(),
                slam.keyframes[last]->pose.y() - truth_last.y());
-  std::printf("[4] position prior: newest keyframe error %.3f -> %.3f m\n",
+  std::printf("[3] position prior: newest keyframe error %.3f -> %.3f m\n",
               before, after);
   CHECK(after <= before + 1e-6, "position prior made the estimate worse");
   CHECK(slam.position_priors_applied == 1, "prior counter wrong");

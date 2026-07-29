@@ -4,10 +4,8 @@
   <name>sonar_slam_cpp</name>
   <version>0.1.0</version>
   <description>
-    All-C++/CUDA port of the bruce_slam sonar SLAM stack (feature extraction,
-    dead reckoning, gyro integration, Kalman filter, ISAM2 back-end) with full
-    CPU fallback for every GPU kernel. Topic names and parameter schemas are
-    identical to the Python bruce_slam package, so configs are interchangeable.
+    Sonar scan matching and GTSAM pose-graph back-end. Consumes sonar_proc
+    candidate point clouds and the workspace fused-odometry TF.
   </description>
   <maintainer email="jcameronfurey@gmail.com">jcfurey</maintainer>
   <license>MIT</license>
@@ -24,29 +22,8 @@
   <depend>nav_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>builtin_interfaces</depend>
+  <depend>tf2</depend>
   <depend>tf2_ros</depend>
-  <depend>cv_bridge</depend>
-  <depend>marine_acoustic_msgs</depend>
-
-  <!-- Optional legacy BlueROV-payload driver message stubs (built from the
-       sonar-SLAM repo). The build finds them QUIET and degrades to standard
-       message drivers when they are absent, so a standard-only payload (e.g.
-       the Deep Trekker Revolution) needs none of them; see docs/PAYLOADS.md.
-       Kept as build dependencies so colcon orders them first when they ARE
-       present; a standard-only workspace passes rosdep the skip-keys flag. -->
-  <depend>sonar_oculus</depend>
-  <depend>rti_dvl</depend>
-  <depend>bar30_depth</depend>
-  <depend>kvh_gyro</depend>
-  <!-- Optional native Water Linked A50 messages (paagutie/ndahn dvl_msgs);
-       enables the 'dvl_a50' driver. Declared like the other optional vendor
-       packages so colcon builds it FIRST when it is in the workspace —
-       without the ordering edge, find_package(dvl_msgs QUIET) races the
-       build order and HAVE_DVL_MSGS flips nondeterministically. Absent from
-       the workspace it resolves like any external dependency (the standard
-       'dvl_standard' path needs no extra package either way). -->
-  <depend>dvl_msgs</depend>
-
 
   <depend>libpointmatcher</depend>
   <!-- libpointmatcher's exported target references yaml-cpp but rosdep must

@@ -5,7 +5,7 @@
 // Both agree with scipy to ~1e-15, validated on uniform and non-uniform grids
 // (test/interp_spline_test.cpp). x must be ascending; out-of-range queries
 // return fill_value (default -1). Only LINEAR is exercised at runtime here;
-// CUBIC is kept scipy-faithful for the sonar.py bearing<->column remap.
+// CUBIC is kept scipy-faithful for persisted back-end compatibility.
 #pragma once
 
 #include <Eigen/Dense>

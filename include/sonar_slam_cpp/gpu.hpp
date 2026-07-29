@@ -1,6 +1,4 @@
-// Runtime GPU dispatch. Every CUDA kernel in this package has a bit-exact (or
-// numerically equivalent) CPU twin; gpu::available() decides once per process
-// which path runs. Force the CPU path with SONAR_SLAM_FORCE_CPU=1.
+// Runtime dispatch for scan-matching cost and nearest-neighbor kernels.
 //
 // All CUDA wrappers return false when the GPU could not produce a result
 // (allocation/copy/launch failure, or an unsupported configuration) so the
@@ -34,40 +32,6 @@ bool available();
 void disable(const char* why);
 
 #ifdef SONAR_SLAM_WITH_CUDA
-
-// Upper bound of the OS-CFAR training window supported by the kernel (size of
-// its per-thread selection buffer). cfar_cuda returns false for larger
-// windows so the CPU twin runs instead of silently truncating.
-inline constexpr int kMaxOsTrainCells = 128;
-
-// --- raw kernel entry points (defined in src/cuda/*.cu) ----------------------
-// CFAR over a polar image (row-major, rows = range bins, cols = beams).
-// alg: 0=CA 1=SOCA 2=GOCA 3=OS. A detection also requires cell > threshold
-// (the intensity gate, folded in so the kernel matches the CPU twin). Output
-// mask is 0/1 uint8.
-bool cfar_cuda(const float* img, int rows, int cols, int alg, int train_hs,
-               int guard_hs, int rank, double tau, float threshold,
-               std::uint8_t* mask_out);
-
-// Same detector over a NATIVE uint8 polar image — what every sonar adapter
-// actually delivers. Widening to float on the host first cost a full-image
-// conversion pass plus allocation per ping and quadrupled the host->device
-// traffic for data the kernel immediately widens back; uint8 -> float is
-// exact, so this produces the identical mask. The float entry point above
-// stays for the parity tooling, which compares against the float CPU twin.
-bool cfar_u8_cuda(const std::uint8_t* img, int rows, int cols, int alg,
-                  int train_hs, int guard_hs, int rank, double tau,
-                  float threshold, std::uint8_t* mask_out);
-
-// Nearest / bilinear remap of a uint8 image with float32 maps (cv::remap
-// semantics, constant 0 border). interp: 0=nearest, 1=linear.
-// map_version tags the (map_x, map_y) pair so the wrapper can keep the maps
-// device-resident across calls: pass the same non-negative value while the
-// maps are unchanged and bump it whenever they are rebuilt. A negative
-// version disables caching (maps are re-uploaded on every call).
-bool remap_u8_cuda(const std::uint8_t* src, int src_rows, int src_cols,
-                   const float* map_x, const float* map_y, int dst_rows,
-                   int dst_cols, int interp, int map_version, std::uint8_t* dst);
 
 // Batched grid-overlap cost for the global scan-match initialization.
 // transforms: n_samples x 6 row-major [r00 r01 r10 r11 tx ty]; grid is a 0/255

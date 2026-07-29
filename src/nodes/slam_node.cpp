@@ -1,13 +1,12 @@
-// SLAM node: port of bruce_slam slam_ros.py + slam_node.py. Synchronizes the
-// sonar feature clouds with dead-reckoning odometry, runs the SSM/NSSM/ISAM2
-// back-end, and publishes pose, odometry, trajectory, constraints, the
-// registered map cloud and the map->odom TF.
+// Sonar pose-graph node. sonar_proc supplies one flash-ping candidate cloud;
+// exact-stamp TF supplies the sensor extrinsic and fused odometry pose.
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2/exceptions.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
@@ -26,12 +25,11 @@
 #include <utility>
 #include <vector>
 
-#include "sonar_slam_cpp/approx_sync.hpp"
 #include "sonar_slam_cpp/gpu.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/node_base.hpp"
 #include "sonar_slam_cpp/ros_conversions.hpp"
-#include "sonar_slam_cpp/sensors.hpp"
+#include "sonar_slam_cpp/sonar_input.hpp"
 #include "sonar_slam_cpp/slam_core.hpp"
 
 namespace sonar_slam {
@@ -53,22 +51,18 @@ public:
     slam_.keyframe_duration = get_double("keyframe_duration");
     slam_.keyframe_translation = get_double("keyframe_translation");
     slam_.keyframe_rotation = get_double("keyframe_rotation");
-    // MAP_DOUBLING_FIX_PLAN.md 3b: a genuinely empty feature cloud must not
-    // become a 0-point keyframe (dilutes the graph, deposits an empty map
-    // tile); odometry still carries the pose across the gap. 0 = off.
+    // A genuinely empty candidate cloud must not become a 0-point keyframe;
+    // odometry still carries the pose across the gap. 0 = off.
     slam_.keyframe_min_points = get_int("keyframe_min_points", 0);
 
     enable_slam_ = get_bool("enable_slam");
     RCLCPP_INFO(get_logger(), "SLAM STATUS: %s", enable_slam_ ? "true" : "false");
 
-    // emit the map->odom TF in ENU (REP-105) instead of the graph's z-down
-    // convention — pair with the enu_odom_relay feeding the odom input
-    enu_world_ = get_bool("enu_world", false);
     // false when an external node (e.g. the map robot_localization EKF
     // fusing /bruce/slam/slam/pose) owns the map->odom transform
     publish_tf_ = get_bool("publish_tf", true);
-    // min seconds between rebuilds of the O(history) viz outputs
-    // (constraint markers + aggregated map cloud); <= 0 -> every keyframe
+    // min seconds between rebuilds of the O(history) constraint markers;
+    // <= 0 -> every keyframe
     viz_min_period_ = get_double("viz_min_period", 2.0);
 
     const auto prior = get_double_array("prior_sigmas");
@@ -80,8 +74,14 @@ public:
 
     slam_.point_resolution = get_double("point_resolution");
     slam_.point_noise = get_double("point_noise", 0.5);
-    feature_odom_sync_max_delay_ =
-      get_double("feature_odom_sync_max_delay", 0.5);
+    slam_.sonar_max_range = get_double("sonar_max_range", 30.0);
+    slam_.sonar_horizontal_aperture =
+      get_double("sonar_horizontal_aperture", 2.2689280275926285);
+    points_topic_ = get_string("points_topic", SONAR_POINTS_TOPIC);
+    odom_frame_ = get_string("odom_frame", "odom");
+    base_frame_ = get_string("base_frame", "base_link");
+    tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
+    max_head_pitch_ = get_double("max_head_pitch", 0.52);
 
     // [sobol samples per iteration, iterations, local-refine ftol]
     const auto init_params = [this](const char* name,
@@ -235,11 +235,6 @@ public:
     }
     slam_.icp.load_from_yaml(icp_config);
 
-    // raw sonar keeps the Oculus geometry (max range / aperture, bounding the
-    // NSSM loop-closure search) current — the operator can change the sonar
-    // range mid-mission, so reconfigure whenever the ping geometry changes
-    const std::string sonar_driver = get_string("sonar/driver", "oculus_compressed");
-    const std::string sonar_topic = get_string("sonar/topic", SONAR_TOPIC);
     const int input_queue_depth =
       std::max(1, get_int("input_queue_depth", 50));
     const int output_queue_depth =
@@ -248,54 +243,17 @@ public:
       rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
     const auto output_qos = rclcpp::QoS(
       rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
-    sonar_sub_ = subscribe_sonar(
-      this, sonar_driver, sonar_topic, input_qos,
-      [this](const SonarPing& ping) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        slam_.oculus.configure(ping);
-      });
-
-    // Pitch-gated feature cloud (primary) + dead-reckoning odometry,
-    // approx-time synced. The ungated SONAR_FEATURE_TOPIC is reserved for
-    // honest 3D visualization; swept/floor-dominated frames arrive as NaN
-    // sentinels only on SONAR_SLAM_FEATURE_TOPIC, so the synchronizer advances
-    // without admitting them to planar registration.
-    sync_ = std::make_unique<
-      ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>(
-      static_cast<std::size_t>(input_queue_depth),
-      feature_odom_sync_max_delay_,
-      [this](const sensor_msgs::msg::PointCloud2& feature,
-             const nav_msgs::msg::Odometry& odom) { slam_callback(feature, odom); });
-    // an odom outage silently drops feature frames from the sync queue —
-    // surface it instead of losing keyframes with no log line
-    sync_->set_overflow_callback([this](std::size_t dropped) {
-      sync_dropped_total_ += dropped;
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 10000,
-        "feature<->odom sync dropped %zu unmatched feature frame(s) — "
-        "odometry stalled or lagging beyond feature_odom_sync_max_delay",
-        dropped);
-    });
-    sync_->set_nomatch_callback([this](std::size_t n) {
-      sync_nomatch_total_ += n;
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 10000,
-        "feature frames are being passed by the odometry stream with no "
-        "sample within feature_odom_sync_max_delay — sonar and DVL driver "
-        "clocks likely disagree (cross-device stamp offset). Every keyframe "
-        "would carry a stale pose; measure the offset and set "
-        "sonar.stamp_offset / dvl.stamp_offset.");
-    });
-
-    feature_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      SONAR_SLAM_FEATURE_TOPIC, input_qos,
+    // Oculus is a flash-imaging sonar: a cloud is one rigid ping, not a
+    // spinning scan, so per-point "deskew" is fictitious. Resolve both the
+    // sensor extrinsic and odom pose at the cloud's acquisition stamp instead
+    // of pairing it to a nearest odometry message with a 0.5 s slop.
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ =
+      std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, true);
+    points_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic_, input_qos,
       [this](const sensor_msgs::msg::PointCloud2& msg) {
-        sync_->add_primary(to_sec(msg.header.stamp), msg);
-      });
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      LOCALIZATION_ODOM_TOPIC, input_qos,
-      [this](const nav_msgs::msg::Odometry& msg) {
-        sync_->add_secondary(to_sec(msg.header.stamp), msg);
+        points_callback(msg);
       });
 
     // Operator hand-correction: RViz's "2D Pose Estimate" button publishes a
@@ -328,41 +286,9 @@ public:
       SLAM_TRAJ_TOPIC, latched_qos(output_queue_depth));
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
-    cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SLAM_CLOUD_TOPIC, latched_qos());
 
-    // The graph cloud doubles as the persistent map for volatile-QoS
-    // consumers (nav2's STVL global costmap): they miss the transient_local
-    // sample on join, and between keyframes (a hovering vehicle) nothing
-    // re-marks their voxels, so STVL's voxel_decay would fade the whole
-    // costmap to empty. Re-emit the cached cloud whenever no keyframe has
-    // published one within cloud_republish_period seconds (<= 0 disables).
-    cloud_republish_period_ = get_double("cloud_republish_period", 5.0);
-    if (cloud_republish_period_ > 0.0) {
-      cloud_republish_timer_ = create_timer(
-        std::chrono::duration<double>(cloud_republish_period_), [this]() {
-          // the cached cloud is produced by the viz worker thread — its own
-          // mutex, so this timer never contends with the SLAM callback
-          std::lock_guard<std::mutex> lock(viz_mutex_);
-          if (last_cloud_msg_.data.empty()) return;
-          // negative elapsed = the node clock jumped backwards (bag loop
-          // under sim time): treat as expired instead of suppressing the
-          // republish for the entire looped pass
-          const double since = (now() - last_cloud_pub_).seconds();
-          if (since >= 0.0 && since < cloud_republish_period_) return;
-          // KEEP the cloud's original (data-domain) stamp: restamping with
-          // now() put wall time on bag-time data, and TF-timed consumers
-          // (rviz, STVL) reject a cloud whose stamp has no transform. The
-          // cloud is latched state, not a new observation.
-          cloud_pub_->publish(last_cloud_msg_);
-          last_cloud_pub_ = now();
-        });
-    }
-
-    // Field diagnostics: the SLAM status line and sync-health ERRORs exist
-    // only as logs — mirror the funnel counters on /diagnostics so pairing
-    // starvation and the NSSM accept/reject balance are visible in rqt
-    // during a deployment.
+    // Mirror the graph funnel and exact-stamp input health on /diagnostics so
+    // TF starvation and the NSSM accept/reject balance are visible in rqt.
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", 10);
     diag_timer_ = create_timer(std::chrono::seconds(1),
@@ -371,7 +297,7 @@ public:
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     // map->odom republish timer (rtabmap tf_delay / tf_tolerance). Decouples
-    // the edge from the sensor callback so a sonar dropout or sync starvation
+    // the edge from the sensor callback so a sonar or input-TF dropout
     // no longer starves every map-frame consumer, and future-dates it to
     // match the odom EKF's transform_time_offset. <= 0 restores the old
     // publish-inline-from-the-callback behaviour.
@@ -401,7 +327,7 @@ public:
       if (slam_.load_map(load_path))
         RCLCPP_INFO(get_logger(),
                     "loaded %d keyframes from '%s' — relocalizing on the "
-                    "first dense feature frame",
+                    "first dense candidate frame",
                     slam_.loaded_keyframes(), load_path.c_str());
       else
         RCLCPP_ERROR(get_logger(),
@@ -419,12 +345,6 @@ public:
     usbl_max_stamp_delta_ = get_double("usbl/max_stamp_delta", 1.0);
     usbl_frame_id_ = get_string("usbl/frame_id", "");
     if (!usbl_topic.empty()) {
-      // TF listener for the transponder lever arm (see usbl_lever_arm).
-      // Created only when USBL is wired — it is the sole TF *consumer* in
-      // this node, everything else only broadcasts.
-      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
-      tf_listener_ =
-        std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this);
       if (usbl_driver == "pose_cov") {
         usbl_sub_ = create_subscription<
           geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -450,8 +370,8 @@ public:
       }
     }
 
-    // observability parity with the feature node: scan-match global init
-    // batches its cost evaluation on the GPU when present (override with
+    // Scan-match global initialization batches its cost evaluation on the GPU
+    // when present (override with
     // SONAR_SLAM_FORCE_CPU=1); libpointmatcher ICP itself is CPU
     RCLCPP_INFO(get_logger(), "SLAM node is initialized (GPU: %s)",
                 gpu::available() ? "on" : "off");
@@ -472,7 +392,7 @@ private:
                     const builtin_interfaces::msg::Time& data_stamp)
   {
     if (tf_publish_period_ <= 0.0) {
-      tf_->sendTransform(make_transform(t, q, data_stamp, "map", "odom"));
+      tf_->sendTransform(make_transform(t, q, data_stamp, "map", odom_frame_));
       return;
     }
     std::lock_guard<std::mutex> lock(tf_mutex_);
@@ -508,55 +428,119 @@ private:
       c.data_stamp +
       rclcpp::Duration::from_seconds((elapsed > 0.0 ? elapsed : 0.0) +
                                      tf_tolerance_);
-    tf_->sendTransform(make_transform(c.t, c.q, stamp, "map", "odom"));
+    tf_->sendTransform(make_transform(c.t, c.q, stamp, "map", odom_frame_));
   }
 
-  void slam_callback(const sensor_msgs::msg::PointCloud2& feature_msg,
-                     const nav_msgs::msg::Odometry& odom_msg)
+  static gtsam::Pose3 pose_from_transform(
+    const geometry_msgs::msg::TransformStamped& tf)
+  {
+    const auto& t = tf.transform.translation;
+    const auto& q = tf.transform.rotation;
+    return gtsam::Pose3(gtsam::Rot3::Quaternion(q.w, q.x, q.y, q.z),
+                        gtsam::Point3(t.x, t.y, t.z));
+  }
+
+  void points_callback(const sensor_msgs::msg::PointCloud2& msg)
+  {
+    if (msg.header.frame_id.empty()) {
+      ++tf_lookup_failures_;
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Dropping sonar points with an empty frame_id");
+      return;
+    }
+
+    geometry_msgs::msg::TransformStamped base_sensor;
+    geometry_msgs::msg::TransformStamped odom_base;
+    try {
+      const auto stamp = rclcpp::Time(msg.header.stamp);
+      const auto timeout = rclcpp::Duration::from_seconds(tf_lookup_timeout_);
+      base_sensor =
+        tf_buffer_->lookupTransform(base_frame_, msg.header.frame_id, stamp, timeout);
+      odom_base =
+        tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp, timeout);
+    } catch (const tf2::TransformException& e) {
+      ++tf_lookup_failures_;
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Dropping sonar ping at %.6f: exact-stamp TF unavailable (%s <- %s "
+        "and %s <- %s): %s",
+        to_sec(msg.header.stamp), base_frame_.c_str(),
+        msg.header.frame_id.c_str(), odom_frame_.c_str(),
+        base_frame_.c_str(), e.what());
+      return;
+    }
+
+    const auto& q_msg = base_sensor.transform.rotation;
+    Eigen::Quaternionf q_bs(
+      static_cast<float>(q_msg.w), static_cast<float>(q_msg.x),
+      static_cast<float>(q_msg.y), static_cast<float>(q_msg.z));
+    if (!(q_bs.norm() > 1e-6f)) {
+      ++tf_lookup_failures_;
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Dropping sonar ping: %s <- %s has an invalid rotation",
+        base_frame_.c_str(), msg.header.frame_id.c_str());
+      return;
+    }
+    q_bs.normalize();
+    const Eigen::Matrix3f R_bs = q_bs.toRotationMatrix();
+
+    // Optical +Z is the sonar boresight. Its elevation in base_link gives the
+    // head gate without another joint-state subscription or arrival-time latch.
+    const double head_pitch = optical_boresight_pitch(R_bs);
+    const bool scan_usable =
+      max_head_pitch_ <= 0.0 || std::fabs(head_pitch) <= max_head_pitch_;
+    if (!scan_usable) {
+      ++pitch_rejections_;
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Planar SLAM is skipping head-swept ping (boresight %.1f deg, limit "
+        "%.1f deg); sonar_proc mapping streams remain unaffected",
+        head_pitch * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
+    }
+
+    Matrix points;
+    if (scan_usable) {
+      const Matrix xyz_sensor = cloud_to_xyz(msg);
+      const auto& tr = base_sensor.transform.translation;
+      const Eigen::RowVector3f t_bs(
+        static_cast<float>(tr.x), static_cast<float>(tr.y),
+        static_cast<float>(tr.z));
+      // Store returns in the gravity-horizontal vehicle frame. This is a
+      // single rigid ping transform, not per-point deskew.
+      const gtsam::Pose3 dr_pose3 = pose_from_transform(odom_base);
+      const Eigen::Matrix3f R_h =
+        gtsam::Rot3::Ypr(0.0, dr_pose3.rotation().pitch(),
+                        dr_pose3.rotation().roll())
+          .matrix().cast<float>();
+      points = project_flash_ping(xyz_sensor, R_bs, t_bs, R_h);
+      slam_callback(msg.header.stamp, dr_pose3, points, true);
+      return;
+    }
+
+    points.resize(0, 3);
+    slam_callback(msg.header.stamp, pose_from_transform(odom_base), points, false);
+  }
+
+  void slam_callback(const builtin_interfaces::msg::Time& time,
+                     const gtsam::Pose3& dr_pose3, const Matrix& points,
+                     bool scan_usable)
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    const auto time = feature_msg.header.stamp;
-    const gtsam::Pose3 dr_pose3 = r2g(odom_msg.pose.pose);
-
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
-
-    // feature cloud carries true base_link 3D (the optical fan is projected
-    // through the exact-stamp base_link <- sonar optical TF, including head
-    // rotation and lever arm, by feature_extraction_node). Rotate by the DR
-    // roll/pitch (Ry(p)*Rx(r), yaw excluded) so stored points are
-    // horizon-referenced: registration then matches world-horizontal
-    // projections even when the vehicle pitches, and col2 carries elevation
-    // relative to the vehicle for the 3D map cloud. A level vehicle
-    // (roll=pitch=0) reduces col0/col1 to the old planar values byte-for-byte.
-    // dr_pose3 arrives through enu_odom_relay's roll-pi conjugation, so its
-    // euler attitude is (roll, -pitch, -yaw) of the ENU vehicle attitude and
-    // its z is +depth (down-positive). Undo the pitch flip to rotate the
-    // ENU-frame base_link cloud; the resulting elevation column is ENU
-    // up-positive relative to the vehicle.
-    const Matrix xyz = cloud_to_xyz(feature_msg);
-    const Eigen::Matrix3f R_h = gtsam::Rot3::Ypr(0.0,
-                                                 -dr_pose3.rotation().pitch(),
-                                                 dr_pose3.rotation().roll())
-                                  .matrix()
-                                  .cast<float>();
-    const Matrix xyz_h = xyz * R_h.transpose();
-    Matrix points(xyz.rows(), 3);
-    points.col(0) = xyz_h.col(0);
-    points.col(1) = -xyz_h.col(1);
-    points.col(2) = xyz_h.col(2);
 
     // A loaded map intercepts the pipeline until relocalization lands: the
     // DR chain of this session has no relation to the map frame yet, so no
     // factor may enter and nothing may publish until the global scan match
     // places the vehicle.
     if (slam_.awaiting_relocalization()) {
-      if (points.rows() > 0 &&
+      if (scan_usable && points.rows() > 0 &&
           points.rows() >= slam_.nssm_params.min_points &&
-          !std::isnan(points(0, 0))) {
+          std::isfinite(points(0, 0))) {
         frame->status = true;
         frame->points = points;
-        frame->twist = odom_msg.twist.twist;
         bool ok = false;
         try {
           ok = slam_.relocalize(frame);
@@ -582,16 +566,12 @@ private:
       return;
     }
 
-    // NaN cloud means feature extraction skipped this frame
-    if (points.rows() > 0 && std::isnan(points(0, 0)))
-      frame->status = false;
-    else
-      frame->status = slam_.is_keyframe(*frame);
+    frame->status = scan_usable && slam_.is_keyframe(*frame);
 
-    // A head-swept/invalid feature frame can arrive before the first usable
+    // A head-swept/invalid candidate frame can arrive before the first usable
     // keyframe. SLAM still owns map->odom in this mode, so keep the map tree
-    // connected with its initial identity correction. This uses synchronized
-    // data stamps (not wall/ROS "now"), and stops as soon as the first valid
+    // connected with its initial identity correction. This uses the input data
+    // stamp (not wall/ROS "now"), and stops as soon as the first valid
     // keyframe publishes the estimated transform. Loaded-map relocalization
     // returns above and must not use this identity bootstrap.
     if (!frame->status && slam_.keyframes.empty() && publish_tf_) {
@@ -600,7 +580,7 @@ private:
       RCLCPP_INFO_ONCE(
         get_logger(),
         "Publishing identity map->odom while waiting for the first usable "
-        "SLAM feature frame.");
+        "SLAM candidate frame.");
     }
 
     // 3b: near-empty clouds don't carry enough structure to register — keep
@@ -614,8 +594,6 @@ private:
         slam_.keyframe_min_points > 0 &&
         points.rows() < slam_.keyframe_min_points)
       frame->status = false;
-
-    frame->twist = odom_msg.twist.twist;
 
     if (!slam_.keyframes.empty()) {
       const gtsam::Pose2 dr_odom =
@@ -674,12 +652,8 @@ private:
     publish_pose();
     if (slam_.current_frame->status) {
       publish_trajectory();
-      // The constraint markers and the aggregated map cloud re-walk the
-      // ENTIRE keyframe history (O(n) per keyframe, growing for the whole
-      // mission) — they are pure viz, so rebuild them at most every
-      // viz_min_period seconds, and on a WORKER THREAD: on a loop-closure
-      // correction the O(map) rebuild + octree downsample otherwise stalls
-      // this callback for the whole sweep.
+      // Constraint markers re-walk the graph history, so rate-limit and build
+      // them off the sensor callback.
       const auto now = this->now();
       const double since = (now - last_viz_publish_).seconds();
       // since < 0 = clock jumped backwards (bag loop): rebuild rather than
@@ -690,14 +664,11 @@ private:
     }
   }
 
-  // Snapshot of the per-keyframe state the viz products need — tiny (poses +
-  // loop-closure links); kf->points is immutable after keyframe creation, so
-  // the worker reads the clouds through the shared_ptr without the lock.
+  // Snapshot of the per-keyframe state the constraint visualization needs.
   struct VizKeyframe
   {
-    KeyframePtr kf;
     gtsam::Pose2 pose;
-    double p3x, p3y, p3z, dr_z;
+    double z;
     std::vector<std::pair<int, gtsam::Pose2>> constraints;
   };
 
@@ -711,8 +682,7 @@ private:
     std::vector<VizKeyframe> snap;
     snap.reserve(slam_.keyframes.size());
     for (const auto& kf : slam_.keyframes)
-      snap.push_back({kf, kf->pose, kf->pose3.x(), kf->pose3.y(),
-                      kf->pose3.z(), kf->dr_pose3.z(), kf->constraints});
+      snap.push_back({kf->pose, kf->pose3.z(), kf->constraints});
     const auto stamp = slam_.current_keyframe()->time;
 
     viz_thread_ = std::thread([this, snap = std::move(snap), stamp]() {
@@ -720,16 +690,6 @@ private:
       viz_busy_ = false;
     });
     return true;
-  }
-
-  // conjugation by the roll-pi transform: flip a z-down graph-frame pose
-  // back to ENU (REP-105) for external consumers
-  static void flip_pose_enu(geometry_msgs::msg::Pose& p)
-  {
-    p.position.y = -p.position.y;
-    p.position.z = -p.position.z;
-    p.orientation.y = -p.orientation.y;
-    p.orientation.z = -p.orientation.z;
   }
 
   void publish_pose()
@@ -782,13 +742,6 @@ private:
       cov(0, 0) = cov(1, 1) = cov(5, 5) = 1e-3;
       cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
     }
-    if (enu_world_) {
-      flip_pose_enu(pose_msg.pose.pose);
-      // conjugate the covariance by the roll-pi sign signature
-      static const double S[6] = {1, -1, -1, 1, -1, -1};
-      for (int i = 0; i < 6; ++i)
-        for (int j = 0; j < 6; ++j) cov(i, j) *= S[i] * S[j];
-    }
     for (int i = 0; i < 36; ++i) pose_msg.pose.covariance[i] = cov(i / 6, i % 6);
     pose_pub_->publish(pose_msg);
 
@@ -799,10 +752,6 @@ private:
       double tx = o2m_msg.position.x, ty = o2m_msg.position.y, tz = o2m_msg.position.z;
       double qx = o2m_msg.orientation.x, qy = o2m_msg.orientation.y,
              qz = o2m_msg.orientation.z, qw = o2m_msg.orientation.w;
-      if (enu_world_) {
-        ty = -ty; tz = -tz;
-        qy = -qy; qz = -qz;
-      }
       set_map_odom(Eigen::Vector3d(tx, ty, tz),
                    Eigen::Quaterniond(qw, qx, qy, qz), frame->time);
     }
@@ -812,19 +761,12 @@ private:
     // copy the FULL PoseWithCovariance, not just the pose — otherwise the
     // covariance built above never reaches this topic and fusion reads zeros
     odom_msg.pose = pose_msg.pose;
-    odom_msg.child_frame_id = "base_link";
+    odom_msg.child_frame_id = base_frame_;
     odom_msg.twist.twist = frame->twist;
     // twist is not estimated here (the DR/Kalman upstream leave it zero), so
     // advertise a large twist covariance; the all-zero default would read as
     // zero-velocity-with-infinite-confidence to a fusing EKF.
     for (int i = 0; i < 6; ++i) odom_msg.twist.covariance[i * 6 + i] = 1e6;
-    if (enu_world_) {
-      // twist arrives z-down from the relay; flip it back out
-      odom_msg.twist.twist.linear.y = -odom_msg.twist.twist.linear.y;
-      odom_msg.twist.twist.linear.z = -odom_msg.twist.twist.linear.z;
-      odom_msg.twist.twist.angular.y = -odom_msg.twist.twist.angular.y;
-      odom_msg.twist.twist.angular.z = -odom_msg.twist.twist.angular.z;
-    }
     odom_pub_->publish(odom_msg);
 
     // periodic health counters — publish_pose runs per callback (~ping
@@ -848,30 +790,23 @@ private:
     }
   }
 
-  // Worker-thread body: builds and publishes the constraint markers and the
-  // aggregated map cloud from the snapshot — no slam_ / mutex_ access.
-  // rclcpp publishers are thread-safe; the cached-cloud fields for the
-  // republish timer live under viz_mutex_.
+  // Worker-thread body: build the graph constraint markers from a snapshot.
   void build_and_publish_viz(const std::vector<VizKeyframe>& snap,
                              const builtin_interfaces::msg::Time& stamp)
   {
-    // ---- constraint markers (viz follows the ENU convention when set) ----
-    const double sy = enu_world_ ? -1.0 : 1.0;
-    auto P = [&](double x, double y, double z) {
-      return Eigen::Vector3d(x, sy * y, sy * z);
-    };
     std::vector<ConstraintLink> links;
     for (std::size_t x = 1; x < snap.size(); ++x) {
       const auto& prev = snap[x - 1];
       const auto& curr = snap[x];
-      const Eigen::Vector3d p1 = P(prev.p3x, prev.p3y, prev.dr_z);
-      const Eigen::Vector3d p2 = P(curr.p3x, curr.p3y, curr.dr_z);
+      const Eigen::Vector3d p1(prev.pose.x(), prev.pose.y(), prev.z);
+      const Eigen::Vector3d p2(curr.pose.x(), curr.pose.y(), curr.z);
       links.push_back({{p1, p2}, "green"});
 
       for (const auto& [k, _] : curr.constraints) {
         if (k < 0 || k >= static_cast<int>(snap.size())) continue;
         const auto& target = snap[k];
-        const Eigen::Vector3d p0 = P(target.p3x, target.p3y, target.dr_z);
+        const Eigen::Vector3d p0(
+          target.pose.x(), target.pose.y(), target.z);
         links.push_back({{p0, p2}, "red"});
       }
     }
@@ -880,54 +815,11 @@ private:
       msg.header.stamp = stamp;
       constraint_pub_->publish(msg);
     }
-
-    // ---- aggregated map cloud ----
-    long total = 0;
-    for (const auto& s : snap) total += s.kf->points.rows();
-    Matrix all_points(total, 3), all_keys(total, 1);
-    long at = 0;
-    for (std::size_t key = 0; key < snap.size(); ++key) {
-      const auto& s = snap[key];
-      const long n = s.kf->points.rows();
-      // x/y through the optimized SE2 pose; z in ENU world = the point's
-      // up-positive elevation (col2) minus vehicle depth (pose3.z carries the
-      // relay's down-positive z across updates). The graph corrects x/y/yaw;
-      // z and attitude ride from dead-reckoning.
-      all_points.middleRows(at, n).leftCols(2) =
-        Keyframe::transform_points(s.kf->points, s.pose);
-      all_points.middleRows(at, n).col(2) =
-        s.kf->points.col(2).array() - static_cast<float>(s.p3z);
-      all_keys.middleRows(at, n).setConstant(static_cast<float>(key));
-      at += n;
-    }
-
-    // 3D octree downsample (OctreeGridDataPointsFilter is dimension-agnostic)
-    auto [pts, keys] =
-      downsample(all_points, all_keys, static_cast<float>(slam_.point_resolution));
-    if (pts.rows() == 0) return;
-
-    // [x, y, z, key] — col2 was built ENU (up-positive); the non-ENU (slam
-    // z-down) output flips it along with y, completing the roll-pi transform
-    Matrix xyzi(pts.rows(), 4);
-    xyzi.col(0) = pts.col(0);
-    xyzi.col(1) = enu_world_ ? Matrix(-pts.col(1)) : Matrix(pts.col(1));
-    xyzi.col(2) = enu_world_ ? Matrix(pts.col(2)) : Matrix(-pts.col(2));
-    xyzi.col(3) = keys.col(0);
-
-    sensor_msgs::msg::PointCloud2 msg = make_cloud({"x", "y", "z", "i"}, xyzi);
-    msg.header.stamp = stamp;
-    msg.header.frame_id = "map";
-    cloud_pub_->publish(msg);
-    // cache for the periodic republish timer (see constructor)
-    std::lock_guard<std::mutex> lock(viz_mutex_);
-    last_cloud_msg_ = std::move(msg);
-    last_cloud_pub_ = now();
   }
 
   void publish_trajectory()
   {
     // [x, y, z, roll, pitch, yaw, index]
-    const float sy = enu_world_ ? -1.0f : 1.0f;
     // `t` is the keyframe stamp RELATIVE to this message's stamp (float32
     // seconds since epoch cannot hold ms precision) — consumers recover the
     // absolute stamp as msg.stamp + t. Lets the map assembler associate
@@ -938,11 +830,11 @@ private:
     for (int k = 0; k < slam_.current_key(); ++k) {
       const auto& kf = slam_.keyframes[k];
       traj(k, 0) = static_cast<float>(kf->pose3.x());
-      traj(k, 1) = sy * static_cast<float>(kf->pose3.y());
-      traj(k, 2) = sy * static_cast<float>(kf->pose3.z());
+      traj(k, 1) = static_cast<float>(kf->pose3.y());
+      traj(k, 2) = static_cast<float>(kf->pose3.z());
       traj(k, 3) = static_cast<float>(kf->pose3.rotation().roll());
-      traj(k, 4) = sy * static_cast<float>(kf->pose3.rotation().pitch());
-      traj(k, 5) = sy * static_cast<float>(kf->pose3.rotation().yaw());
+      traj(k, 4) = static_cast<float>(kf->pose3.rotation().pitch());
+      traj(k, 5) = static_cast<float>(kf->pose3.rotation().yaw());
       traj(k, 6) = static_cast<float>(k);
       traj(k, 7) = static_cast<float>(to_sec(kf->time) - msg_stamp_s);
     }
@@ -977,9 +869,6 @@ private:
                   "loaded map — wait for relocalization to land");
       return;
     }
-    // RViz publishes in the DISPLAYED map frame; in ENU mode the graph runs
-    // z-down, so flip back into the graph frame (flip_pose_enu is involutive)
-    if (enu_world_) flip_pose_enu(msg.pose.pose);
     const gtsam::Pose3 p = r2g(msg.pose.pose);
     gtsam::Pose2 fix(p.x(), p.y(), p.rotation().yaw());
     // The click marks the vehicle's CURRENT pose, which can be up to a full
@@ -1100,39 +989,40 @@ private:
     return p0.compose(gtsam::Pose2::Expmap(a * gtsam::Pose2::Logmap(d)));
   }
 
-  // Transponder offset in base_link, from TF. Cached after the first success:
+  // Transponder offset in the configured base frame, from TF. Cached after the first success:
   // the mount is static, so one lookup is enough and a later TF hiccup must
   // not silently drop the correction. Returns false until it resolves.
   bool usbl_lever_arm(const std::string& frame, Eigen::Vector2d& r_bt)
   {
     if (usbl_lever_arm_valid_) { r_bt = usbl_lever_arm_; return true; }
     const std::string src = usbl_frame_id_.empty() ? frame : usbl_frame_id_;
-    if (src.empty() || src == "base_link") {
+    if (src.empty() || src == base_frame_) {
       usbl_lever_arm_ = Eigen::Vector2d::Zero();
       usbl_lever_arm_valid_ = true;
       r_bt = usbl_lever_arm_;
       return true;
     }
     try {
-      const auto tf = tf_buffer_->lookupTransform("base_link", src,
+      const auto tf = tf_buffer_->lookupTransform(base_frame_, src,
                                                   tf2::TimePointZero);
       usbl_lever_arm_ =
         Eigen::Vector2d(tf.transform.translation.x, tf.transform.translation.y);
       usbl_lever_arm_valid_ = true;
       RCLCPP_INFO(get_logger(),
-                  "USBL transponder '%s' is (%.3f, %.3f) m from base_link — "
+                  "USBL transponder '%s' is (%.3f, %.3f) m from %s — "
                   "lever arm will be removed from every fix",
-                  src.c_str(), usbl_lever_arm_.x(), usbl_lever_arm_.y());
+                  src.c_str(), usbl_lever_arm_.x(), usbl_lever_arm_.y(),
+                  base_frame_.c_str());
       r_bt = usbl_lever_arm_;
       return true;
     } catch (const tf2::TransformException& e) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 10000,
-        "USBL lever arm unavailable (base_link <- %s: %s). Fixes are being "
-        "applied AS IF the transponder were at base_link — on a masted "
+        "USBL lever arm unavailable (%s <- %s: %s). Fixes are being "
+        "applied AS IF the transponder were at %s — on a masted "
         "transponder that injects a heading-correlated position bias. Set "
         "usbl/frame_id or publish the mount TF.",
-        src.c_str(), e.what());
+        base_frame_.c_str(), src.c_str(), e.what(), base_frame_.c_str());
       return false;
     }
   }
@@ -1143,8 +1033,6 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (slam_.keyframes.empty() || slam_.awaiting_relocalization()) return;
-    if (enu_world_) y = -y;  // displayed map frame -> graph z-down chart
-
     const double t = to_sec(stamp);
     int best = -1;
     double best_dt = usbl_max_stamp_delta_;
@@ -1171,12 +1059,7 @@ private:
     }
     if (usbl_applied_.count(best)) return;
 
-    // ---- corrections rtabmap applies to a global-pose prior and this did
-    // not (CoreWrapper.cpp globalPose: `globalPose *= sensorToBase` then
-    // `globalPose *= correction`). Both are applied in the GRAPH frame, so
-    // body-frame FLU vectors get their y negated first (the roll-pi chart).
-    //
-    // 1. LEVER ARM. The fix locates the TRANSPONDER, not base_link. A masted
+    // 1. LEVER ARM. The fix locates the TRANSPONDER, not the base frame. A masted
     //    transponder's offset rotates with vehicle heading, so leaving it in
     //    is a heading-CORRELATED bias, not a constant one that calibrates
     //    out.
@@ -1188,9 +1071,8 @@ private:
     const double c = std::cos(dr_fix.theta()), sn = std::sin(dr_fix.theta());
     Eigen::Vector2d r_bt;
     if (usbl_lever_arm(frame_id, r_bt) && r_bt.squaredNorm() > 0.0) {
-      const double by = enu_world_ ? -r_bt.y() : r_bt.y();  // FLU -> graph body
-      x -= c * r_bt.x() - sn * by;
-      y -= sn * r_bt.x() + c * by;
+      x -= c * r_bt.x() - sn * r_bt.y();
+      y -= sn * r_bt.x() + c * r_bt.y();
     }
     const gtsam::Pose2 motion = dr_fix.between(dr_pose_at(to_sec(slam_.keyframes[best]->time)));
     x += c * motion.x() - sn * motion.y();
@@ -1222,10 +1104,7 @@ private:
       best, inno, sigma, slam_.position_priors_applied);
   }
 
-  // 1 Hz /diagnostics snapshot of the SLAM funnel + sync health. Level
-  // logic: pairing starvation since the last tick is ERROR (keyframes stop
-  // silently while streams look alive — the stamp-offset signature);
-  // sync drops or a verification revert since the last tick are WARN.
+  // 1 Hz /diagnostics snapshot of the SLAM funnel and exact-stamp input health.
   void publish_diagnostics()
   {
     diagnostic_msgs::msg::DiagnosticStatus st;
@@ -1238,8 +1117,8 @@ private:
       st.values.push_back(kv);
     };
 
-    const std::uint64_t nomatch = sync_nomatch_total_;
-    const std::uint64_t dropped = sync_dropped_total_;
+    const std::uint64_t tf_failures = tf_lookup_failures_;
+    const std::uint64_t pitch_rejections = pitch_rejections_;
     int reverted = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1267,17 +1146,13 @@ private:
       add("awaiting_relocalization",
           slam_.awaiting_relocalization() ? "true" : "false");
     }
-    add("sync_nomatch_total", std::to_string(nomatch));
-    add("sync_dropped_total", std::to_string(dropped));
+    add("exact_tf_failures", std::to_string(tf_failures));
+    add("head_pitch_rejections", std::to_string(pitch_rejections));
     add("gpu", gpu::available() ? "on" : "off");
 
-    if (nomatch > diag_prev_nomatch_) {
+    if (tf_failures > diag_prev_tf_failures_) {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-      st.message = "feature<->odom no-match starvation: no keyframes are "
-                   "forming — measure and set sonar/dvl stamp_offset";
-    } else if (dropped > diag_prev_dropped_) {
-      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      st.message = "odometry stalling: unmatched feature frames dropped";
+      st.message = "exact ping-time sensor/odometry TF unavailable";
     } else if (reverted > diag_prev_reverted_) {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
       st.message = "loop-closure round reverted by post-loop verification";
@@ -1285,8 +1160,7 @@ private:
       st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       st.message = "running";
     }
-    diag_prev_nomatch_ = nomatch;
-    diag_prev_dropped_ = dropped;
+    diag_prev_tf_failures_ = tf_failures;
     diag_prev_reverted_ = reverted;
 
     diagnostic_msgs::msg::DiagnosticArray arr;
@@ -1319,26 +1193,23 @@ private:
 
   Slam slam_;
   std::mutex mutex_;
-  // background viz rebuild (see schedule_viz_rebuild); viz_mutex_ guards the
-  // cached republish cloud shared between the worker and the timer
+  // Background graph-marker rebuild (see schedule_viz_rebuild).
   std::thread viz_thread_;
   std::atomic<bool> viz_busy_{false};
-  std::mutex viz_mutex_;
   bool enable_slam_ = true;
-  bool enu_world_ = false;
   bool publish_tf_ = true;
   double viz_min_period_ = 2.0;
   int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
-  double feature_odom_sync_max_delay_ = 0.5;
-  double cloud_republish_period_ = 5.0;
-  sensor_msgs::msg::PointCloud2 last_cloud_msg_;
-  rclcpp::Time last_cloud_pub_{0, 0, RCL_ROS_TIME};
-  rclcpp::TimerBase::SharedPtr cloud_republish_timer_;
+  std::string points_topic_;
+  std::string odom_frame_ = "odom";
+  std::string base_frame_ = "base_link";
+  double tf_lookup_timeout_ = 0.05;
+  double max_head_pitch_ = 0.52;
 
   // ---- map->odom republish (rtabmap CoreWrapper's transformThread_) --------
-  // The edge used to be broadcast ONLY from the synced feature+odom callback,
-  // so a sonar dropout or sync starvation stopped it entirely and every
+  // The edge used to be broadcast ONLY from the sonar callback, so a sonar or
+  // input-TF dropout stopped it entirely and every
   // map-frame consumer (nav2 global costmap, bt_navigator, the accumulator
   // chain, RViz) starved. It also carried no future-dating while the odom EKF
   // future-dates odom->base_link by transform_time_offset 0.1, leaving the
@@ -1356,16 +1227,15 @@ private:
   };
   std::mutex tf_mutex_;
   MapOdomTf map_odom_tf_;
-  // TF consumer, created only when USBL is enabled (transponder lever arm)
+  // Exact-stamp sensor and odometry transforms; also serves the optional USBL
+  // transponder lever arm.
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   double tf_publish_period_ = 0.05;  // s; <= 0 -> publish inline (old behavior)
   double tf_tolerance_ = 0.1;        // s of future-dating
   rclcpp::TimerBase::SharedPtr tf_timer_;
 
-  rclcpp::SubscriptionBase::SharedPtr sonar_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr feature_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     manual_correction_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undo_srv_;
@@ -1384,22 +1254,17 @@ private:
   bool usbl_lever_arm_valid_ = false;
   std::set<int> usbl_applied_;
   std::uint64_t usbl_rejected_ = 0;
-  // diagnostics: sync counters bump on the subscription path while the 1 Hz
-  // timer reads them — atomics keep this executor-agnostic (slam_ state is
-  // snapshotted under mutex_ instead)
-  std::atomic<std::uint64_t> sync_nomatch_total_{0}, sync_dropped_total_{0};
-  std::uint64_t diag_prev_nomatch_ = 0, diag_prev_dropped_ = 0;
+  // Subscription counters are atomic because the TF listener has its own
+  // thread while diagnostics run on the executor.
+  std::atomic<std::uint64_t> tf_lookup_failures_{0}, pitch_rejections_{0};
+  std::uint64_t diag_prev_tf_failures_ = 0;
   int diag_prev_reverted_ = 0;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
   rclcpp::TimerBase::SharedPtr diag_timer_;
-  std::unique_ptr<ApproxSync2<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>
-    sync_;
-
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr traj_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr constraint_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
 };
 

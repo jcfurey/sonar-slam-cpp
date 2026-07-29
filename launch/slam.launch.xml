@@ -1,90 +1,16 @@
-<!-- All-C++ sonar SLAM launch (no Python anywhere, including this file).
-     Mirrors bruce_slam/launch/slam.launch.py online mode: gyro + dead
-     reckoning (or Kalman), feature extraction, SLAM back-end and the static
-     world->map flip. Params files are drop-in compatible with bruce_slam. -->
+<?xml version="1.0"?>
 <launch>
-  <arg name="enable_slam" default="true"/>
-  <!-- MUST be true for bag replay (play the bag with the clock option so
-       /clock is published): every node clock then follows bag time, keeping
-       arrival-stamped data (head tilt), republish stamps, and TF lookups in
-       ONE time domain. Without it, node clocks run on wall time while all
-       data/TF sit at bag time. See the README replay section. -->
   <arg name="use_sim_time" default="false"/>
-  <arg name="kalman_dead_reckoning" default="false"/>
-  <!-- Omit the FOG gyro integration node. Set false for a payload with no
-       fibre-optic gyro (e.g. the Deep Trekker Revolution). MUST match the
-       localization config: with enable_gyro:=false, use_gyro must also be
-       false (the payload presets set it), or dead reckoning would wait forever
-       for gyro input — its startup watchdog reports exactly this condition. -->
-  <arg name="enable_gyro" default="true"/>
-  <arg name="config_dir" default="$(find-pkg-share sonar_slam_cpp)/config"/>
-  <!-- Sensor-payload overlay applied on top of the per-node base configs. It
-       overrides only driver/topic/frame parameters. The default (none.yaml) is
-       a no-op, so the base configs (legacy BlueROV) apply unchanged. For the
-       Deep Trekker Revolution:
-         payload_config:=$(var config_dir)/payloads/deeptrekker_revolution.yaml
-         enable_gyro:=false
-       See docs/PAYLOADS.md for the full matrix. -->
-  <arg name="payload_config" default="$(var config_dir)/payloads/none.yaml"/>
+  <arg name="config_dir"
+       default="$(find-pkg-share sonar_slam_cpp)/config"/>
+  <arg name="points_topic"
+       default="/sensor/sonar/sonar0/proc_points"/>
 
-  <!-- Keyframe-anchored, loop-closure-correctable occupancy + backscatter
-       mosaic maps (port of bruce_slam mapping.py). Consumes the SLAM
-       trajectory, so it corrects the map when a loop closure moves keyframes. -->
-  <arg name="enable_mapping" default="true"/>
-
-  <group unless="$(var kalman_dead_reckoning)">
-    <node pkg="sonar_slam_cpp" exec="gyro_node" name="gyro_fusion"
-          namespace="bruce/slam" output="screen" if="$(var enable_gyro)">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-      <param from="$(var config_dir)/gyro.yaml"/>
-      <param from="$(var payload_config)"/>
-    </node>
-    <node pkg="sonar_slam_cpp" exec="dead_reckoning_node" name="localization"
-          namespace="bruce/slam" output="screen">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-      <param from="$(var config_dir)/dead_reckoning.yaml"/>
-      <param from="$(var payload_config)"/>
-    </node>
-  </group>
-
-  <group if="$(var kalman_dead_reckoning)">
-    <node pkg="sonar_slam_cpp" exec="kalman_node" name="kalman"
-          namespace="bruce/slam" output="screen">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-      <param from="$(var config_dir)/kalman.yaml"/>
-      <param from="$(var payload_config)"/>
-    </node>
-  </group>
-
-  <node pkg="sonar_slam_cpp" exec="feature_extraction_node"
-        name="feature_extraction" namespace="bruce/slam" output="screen">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-    <param from="$(var config_dir)/feature.yaml"/>
-    <param from="$(var payload_config)"/>
-  </node>
-
-  <node pkg="sonar_slam_cpp" exec="slam_node" name="slam" namespace="bruce/slam"
-        output="screen">
+  <node pkg="sonar_slam_cpp" exec="slam_node" name="slam"
+        namespace="/bruce/slam" output="screen">
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var config_dir)/slam.yaml"/>
-    <!-- slam_node also subscribes to the sonar (for the fan geometry), so it
-         needs the payload's sonar driver/topic like every other node -->
-    <param from="$(var payload_config)"/>
-    <param name="enable_slam" value="$(var enable_slam)"/>
+    <param name="points_topic" value="$(var points_topic)"/>
     <param name="icp_config" value="$(var config_dir)/icp.yaml"/>
   </node>
-
-  <node pkg="sonar_slam_cpp" exec="mapping_node" name="mapping"
-        namespace="bruce/slam" output="screen" if="$(var enable_mapping)">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-    <param from="$(var config_dir)/mapping.yaml"/>
-    <!-- mapping subscribes to the sonar for the ping image, so it needs the
-         payload's sonar driver/topic like feature_extraction and slam -->
-    <param from="$(var payload_config)"/>
-  </node>
-
-  <!-- map -> world so everything is visualized in a z-down frame -->
-  <node pkg="tf2_ros" exec="static_transform_publisher"
-        name="map_to_world_tf_publisher"
-        args="--x 0 --y 0 --z 0 --yaw 0 --pitch 0 --roll 3.14159 --frame-id world --child-frame-id map"/>
 </launch>

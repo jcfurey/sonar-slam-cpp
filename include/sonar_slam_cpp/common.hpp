@@ -1,6 +1,4 @@
-// Shared small types and constants for sonar_slam_cpp.
-// Topic names mirror bruce_slam/utils/topics.py verbatim so the two stacks are
-// drop-in interchangeable.
+// Shared small types and the public sonar-SLAM topic contract.
 #pragma once
 
 #include <builtin_interfaces/msg/time.hpp>
@@ -8,34 +6,15 @@
 
 namespace sonar_slam {
 
-// ---------------------------------------------------------------- input topics
-inline const char* IMU_TOPIC = "/vn100/imu/raw";
-inline const char* IMU_TOPIC_MK_II = "/vectornav/IMU";
-inline const char* IMU_TOPIC_ENU = "/imu/data";
-inline const char* DVL_TOPIC = "/rti/body_velocity/raw";
-inline const char* DEPTH_TOPIC = "/bar30/depth/raw";
-inline const char* SONAR_TOPIC = "/sonar_oculus_node/M750d/ping";
-inline const char* SONAR_TOPIC_UNCOMPRESSED = "/sonar_oculus_node/ping";
-inline const char* GYRO_TOPIC = "/gyro";
+// sonar_proc owns image decoding, artifact suppression, feature selection and
+// ping-time projection. Its candidate cloud is the only SLAM sensor input.
+inline const char* SONAR_POINTS_TOPIC = "/sensor/sonar/sonar0/proc_points";
 
-// --------------------------------------------------------------- output topics
 inline const char* SLAM_NS = "/bruce/slam/";
-inline const std::string GYRO_INTEGRATION_TOPIC = std::string(SLAM_NS) + "gyro_integrated";
-inline const std::string LOCALIZATION_ODOM_TOPIC = std::string(SLAM_NS) + "localization/odom";
 inline const std::string SLAM_POSE_TOPIC = std::string(SLAM_NS) + "slam/pose";
 inline const std::string SLAM_ODOM_TOPIC = std::string(SLAM_NS) + "slam/odom";
 inline const std::string SLAM_TRAJ_TOPIC = std::string(SLAM_NS) + "slam/traj";
-inline const std::string SLAM_CLOUD_TOPIC = std::string(SLAM_NS) + "slam/cloud";
 inline const std::string SLAM_CONSTRAINT_TOPIC = std::string(SLAM_NS) + "slam/constraint";
-inline const std::string SONAR_FEATURE_TOPIC = std::string(SLAM_NS) + "feature_extraction/feature";
-// Pitch-gated synchronization stream for planar SLAM/mapping consumers.
-// SONAR_FEATURE_TOPIC remains the always-real 3D visualization stream.
-inline const std::string SONAR_SLAM_FEATURE_TOPIC =
-  std::string(SLAM_NS) + "feature_extraction/slam_feature";
-inline const std::string SONAR_FEATURE_IMG_TOPIC = std::string(SLAM_NS) + "feature_extraction/feature_img";
-// keyframe-anchored, loop-closure-correctable map products (mapping_node)
-inline const std::string MAPPING_INTENSITY_TOPIC = std::string(SLAM_NS) + "mapping/intensity";
-inline const std::string MAPPING_OCCUPANCY_TOPIC = std::string(SLAM_NS) + "mapping/occupancy";
 
 inline double to_sec(const builtin_interfaces::msg::Time& t)
 {

@@ -703,7 +703,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // but both stacks assign current_frame only AFTER this runs, so it points at
   // the previous callback's frame — offsetting the global-init search from its
   // own geometry by up to a keyframe step. Intentional divergence from
-  // bruce_slam that fixes that latent bug (see docs/DIVERGENCES.md).
+  // bruce_slam that fixes that latent bug.
   ret.source_pose = keyframes[ret.source_key]->pose;
   ret.estimated_source_pose = ret.source_pose;
   ret.has_estimated_source_pose = false;
@@ -731,7 +731,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // keep only points that could be inside the sonar fan of a source frame,
   // padded by the pose uncertainty.
   // NOTE: update_factor_graph only refreshes the newest keyframe's covariance
-  // (carried from slam.py; see docs/DIVERGENCES.md), so the older source
+  // (carried from slam.py), so the older source
   // frames' stored covariances are stale — and typically over-confident, which
   // would UNDER-pad the fan and drop overlapping target points (missed
   // closures). Instead of the stale per-frame cov we take the freshly
@@ -739,7 +739,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // bounded drift rates (fan_drift_trans/rot). This only sets the candidate
   // pre-selection PADDING, and inflation can only widen the fan, so it errs
   // toward over-selection (a bit more ICP work, never a missed overlap).
-  // Intentional divergence from bruce_slam — see docs/DIVERGENCES.md.
+  // Intentional divergence from bruce_slam.
   const long n_target_all = static_cast<long>(target_points_all.rows());
   std::vector<char> sel(n_target_all, 0);
   long n_sel = 0;
@@ -762,9 +762,9 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
     const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());
     const double rotation_std = std::sqrt(cov(2, 2));
-    const double range_bound = translation_std * 5.0 + oculus.max_range;
+    const double range_bound = translation_std * 5.0 + sonar_max_range;
     const double bearing_bound =
-      rotation_std * 5.0 + oculus.horizontal_aperture * 0.5;
+      rotation_std * 5.0 + sonar_horizontal_aperture * 0.5;
 
     const Matrix local_points =
       Keyframe::transform_points(target_points_all, pose.inverse());
@@ -817,7 +817,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   }
 
   // Revisit selection (intentional divergence from bruce_slam, which took the
-  // raw argmax-overlap frame as the target — see docs/DIVERGENCES.md). The
+  // raw argmax-overlap frame as the target). The
   // in-fan candidates include the current pass's own recent trail (the
   // keyframes just outside the min_st_sep exclusion), which carry the most
   // overlap. argmax therefore anchors the loop factor to a near-sequential
@@ -942,7 +942,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // (ret.cov == keyframes[source_key], the newest source frame), so the search
   // bounds match ret.source_pose; its marginal was just refreshed by
   // update_factor_graph, so it is current. (Intentional divergence from
-  // bruce_slam — see docs/DIVERGENCES.md.)
+  // bruce_slam.)
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(ret.cov.topLeftCorner<2, 2>());
   const double translation_std = std::sqrt(es.eigenvalues().maxCoeff());
   const double rotation_std = std::sqrt(ret.cov(2, 2));
@@ -1924,8 +1924,8 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // Only the latest keyframe's covariance is refreshed — a known limitation
   // carried from slam.py (its own "TODO propagate cov from previous keyframe"),
   // so older keyframes keep stale marginals. Recomputing every keyframe's
-  // marginal each step is O(n^2) and would starve the callback; deferred (see
-  // docs/DIVERGENCES.md). marginalCovariance can throw on a weakly-constrained
+  // marginal each step is O(n^2) and would starve the callback.
+  // marginalCovariance can throw on a weakly-constrained
   // variable (IndeterminantLinearSystem); keep the optimized pose and skip the
   // covariance update rather than propagating the failure out of the callback.
   try {

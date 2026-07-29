@@ -19,10 +19,7 @@ jobs:
         run: |
           apt-get update
           rosdep update || true
-          # vendor driver message packages are OPTIONAL (the build degrades
-          # to standard-message drivers); skip their rosdep keys
-          rosdep install --from-paths src --ignore-src -y \
-            --skip-keys "sonar_oculus rti_dvl bar30_depth kvh_gyro dvl_msgs"
+          rosdep install --from-paths src --ignore-src -y
 
       - name: Build (CPU-only)
         shell: bash

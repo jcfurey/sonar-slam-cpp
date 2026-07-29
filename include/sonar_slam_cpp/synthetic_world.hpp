@@ -1,10 +1,8 @@
-// Synthetic rectangular-pool sonar world — shared by the end-to-end pipeline
-// test and the demo simulator (sim_payload). Deterministic: callers own the
-// RNG, so identical seeds give identical worlds on every platform.
+// Synthetic rectangular-pool point-cloud fixture for the SLAM back-end test.
+// Deterministic: callers own the RNG.
 #pragma once
 
 #include <gtsam/geometry/Pose2.h>
-#include <opencv2/core.hpp>
 
 #include <cmath>
 #include <random>
@@ -64,7 +62,7 @@ struct SyntheticWorld
     return best;
   }
 
-  // Planar feature cloud in the VEHICLE frame at a (ground-truth) pose:
+  // Planar candidate cloud in the VEHICLE frame at a (ground-truth) pose:
   // one point per beam that hits a wall within range, with isotropic noise.
   // Layout matches Keyframe::points (N x 3, col2 = elevation = 0).
   Matrix scan_cloud(const gtsam::Pose2& pose, double aperture, int beams,
@@ -92,36 +90,6 @@ struct SyntheticWorld
     return m;
   }
 
-  // Polar intensity image (rows = range bins, cols = beams, uint8): noisy
-  // background with a bright ~2-bin wall return per beam — the CFAR test
-  // fixture. wall_rows_out (optional) receives the true wall bin per beam
-  // (-1 = no return).
-  cv::Mat polar_image(const gtsam::Pose2& pose, double aperture, int beams,
-                      int bins, double max_range, std::mt19937& rng,
-                      std::vector<int>* wall_rows_out = nullptr) const
-  {
-    std::normal_distribution<double> bg(30.0, 6.0);
-    std::normal_distribution<double> wall(190.0, 15.0);
-    cv::Mat img(bins, beams, CV_8UC1);
-    if (wall_rows_out) wall_rows_out->assign(static_cast<std::size_t>(beams), -1);
-    const double res = max_range / static_cast<double>(bins);
-    for (int b = 0; b < beams; ++b) {
-      const double bearing =
-        -aperture / 2.0 + aperture * (b + 0.5) / static_cast<double>(beams);
-      const double d =
-        raycast(pose.x(), pose.y(), pose.theta() + bearing, max_range);
-      const int wall_bin = d > 0.0 ? static_cast<int>(d / res) : -1;
-      if (wall_rows_out && wall_bin >= 0 && wall_bin < bins)
-        (*wall_rows_out)[static_cast<std::size_t>(b)] = wall_bin;
-      for (int r = 0; r < bins; ++r) {
-        double v = bg(rng);
-        if (wall_bin >= 0 && r >= wall_bin && r <= wall_bin + 1) v = wall(rng);
-        img.at<std::uint8_t>(r, b) = static_cast<std::uint8_t>(
-          std::min(255.0, std::max(0.0, v)));
-      }
-    }
-    return img;
-  }
 };
 
 }  // namespace sonar_slam

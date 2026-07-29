@@ -38,7 +38,7 @@ int run_node(int argc, char** argv)
       "parses as UNSET in rcl, not as an empty array, and parameter "
       "auto-declaration rejects it at startup.\n"
       "  Fix: give the key a value, or comment it out entirely if you meant "
-      "'not configured' (see the optional `datum` in mapping.yaml).",
+      "'not configured'.",
       e.what());
     rc = 1;
   }
@@ -162,8 +162,7 @@ protected:
     // `key: []` in YAML reaches rcl as NOT_SET, not as an empty array, so
     // as_double_array() would throw. For a DEFAULTED lookup that is exactly
     // "not configured" — which is what someone writing `datum: []` means —
-    // so fall back rather than killing the node. (mapping.yaml documents the
-    // optional `datum` by commenting the key out for this reason.)
+    // so fall back rather than killing the node.
     if (p.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET)
       return default_value;
     return as_double_array(p);
