@@ -43,6 +43,12 @@
     base_frame: base_link
     tf_lookup_timeout: 0.05
     max_head_pitch: 0.52
+    # DR yaw spike gate (rad/s over the inter-ping gap; 0 disables): drop a
+    # ping whose odom yaw stepped faster than the vehicle can physically
+    # turn — a compass/EKF glitch would otherwise become a hard yaw
+    # odometry factor and a poisoned scan-match prior
+    dr:
+      max_yaw_rate: 1.5
     # conservative physical fan used only for NSSM target preselection
     sonar_max_range: 30.0
     sonar_horizontal_aperture: 2.2689280275926285

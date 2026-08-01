@@ -49,6 +49,27 @@ inline const char* scan_admission_reason(ScanAdmissionReason reason)
   return "unknown";
 }
 
+// Dead-reckoning yaw spike gate. A heading step the vehicle cannot
+// physically have turned in the gap between two DR samples is a compass/
+// EKF glitch, not motion; ingesting it mints a hard yaw odometry factor
+// that drags the whole graph, and the scan matcher then initializes from
+// the same poisoned prior. max_yaw_rate <= 0 disables. dt is floored so
+// duplicate stamps judge the step itself instead of dividing by zero;
+// non-finite inputs are implausible by definition. The comparison
+// baseline is the last ACCEPTED yaw, so a genuine step change (heading
+// reset) self-heals: the gap grows until the implied rate passes.
+inline bool yaw_step_plausible(
+  double previous_yaw, double yaw, double dt_seconds, double max_yaw_rate)
+{
+  if (max_yaw_rate <= 0.0) return true;
+  if (!std::isfinite(previous_yaw) || !std::isfinite(yaw) ||
+      !std::isfinite(dt_seconds))
+    return false;
+  const double step =
+    std::fabs(std::remainder(yaw - previous_yaw, 2.0 * M_PI));
+  return step <= max_yaw_rate * std::max(dt_seconds, 1e-3);
+}
+
 // sonar_proc clouds use optical axes: +Z is boresight. Return its elevation
 // relative to the base_link horizontal plane after applying base <- sensor.
 inline double optical_boresight_pitch(const Eigen::Matrix3f& R_base_sensor)
