@@ -154,6 +154,12 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_sonar_input>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_cloud_ops test/cloud_ops_test.cpp)
+  target_link_libraries(test_cloud_ops sonar_slam_core)
+  ament_add_test(test_cloud_ops
+    COMMAND $<TARGET_FILE:test_cloud_ops>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_isam_recovery test/test_isam_recovery.cpp)
   target_include_directories(
     test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
