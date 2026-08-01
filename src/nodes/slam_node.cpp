@@ -83,6 +83,9 @@ public:
     base_frame_ = get_string("base_frame", "base_link");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
     max_head_pitch_ = get_double("max_head_pitch", 0.52);
+    // DR yaw spike gate (rad/s over the inter-ping gap; 0 disables) — see
+    // yaw_step_plausible in sonar_input.hpp
+    max_dr_yaw_rate_ = get_double("dr/max_yaw_rate", 1.5);
 
     // [sobol samples per iteration, iterations, local-refine ftol]
     const auto init_params = [this](const char* name,
@@ -501,6 +504,34 @@ private:
       return;
     }
 
+    const gtsam::Pose3 dr_pose3 = pose_from_transform(odom_base);
+    {
+      const rclcpp::Time stamp(msg.header.stamp);
+      // looped/restarted bag: fresh baseline, not a spike verdict
+      if (have_last_dr_yaw_ && stamp < last_dr_yaw_stamp_)
+        have_last_dr_yaw_ = false;
+      const double dr_yaw = dr_pose3.rotation().yaw();
+      if (have_last_dr_yaw_ &&
+          !yaw_step_plausible(last_dr_yaw_, dr_yaw,
+                              (stamp - last_dr_yaw_stamp_).seconds(),
+                              max_dr_yaw_rate_)) {
+        ++yaw_pose_rejections_;
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "Dropping sonar ping at %.6f: DR yaw stepped %.1f deg in %.3f s "
+          "(dr/max_yaw_rate %.2f rad/s) — compass/EKF glitch suspected; the "
+          "last accepted heading stays the comparison baseline",
+          to_sec(msg.header.stamp),
+          std::fabs(std::remainder(dr_yaw - last_dr_yaw_, 2.0 * M_PI)) *
+            180.0 / M_PI,
+          (stamp - last_dr_yaw_stamp_).seconds(), max_dr_yaw_rate_);
+        return;
+      }
+      last_dr_yaw_ = dr_yaw;
+      last_dr_yaw_stamp_ = stamp;
+      have_last_dr_yaw_ = true;
+    }
+
     const auto& q_msg = base_sensor.transform.rotation;
     Eigen::Quaternionf q_bs(
       static_cast<float>(q_msg.w), static_cast<float>(q_msg.x),
@@ -539,7 +570,6 @@ private:
         static_cast<float>(tr.z));
       // Store returns in the gravity-horizontal vehicle frame. This is a
       // single rigid ping transform, not per-point deskew.
-      const gtsam::Pose3 dr_pose3 = pose_from_transform(odom_base);
       const Eigen::Matrix3f R_h =
         gtsam::Rot3::Ypr(0.0, dr_pose3.rotation().pitch(),
                         dr_pose3.rotation().roll())
@@ -551,7 +581,7 @@ private:
     }
 
     points.resize(0, 3);
-    slam_callback(msg.header.stamp, pose_from_transform(odom_base), points, false);
+    slam_callback(msg.header.stamp, dr_pose3, points, false);
   }
 
   void slam_callback(const builtin_interfaces::msg::Time& time,
@@ -1222,6 +1252,8 @@ private:
     }
     add("exact_tf_failures", std::to_string(tf_failures));
     add("head_pitch_rejections", std::to_string(pitch_rejections));
+    add("dr_yaw_rejections",
+        std::to_string(yaw_pose_rejections_.load()));
     add("gpu", gpu::available() ? "on" : "off");
 
     if (tf_failures > diag_prev_tf_failures_) {
@@ -1286,6 +1318,12 @@ private:
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;
   double max_head_pitch_ = 0.52;
+  // DR yaw spike gate (see yaw_step_plausible). last_* only touched from
+  // the points callback (default mutually-exclusive group).
+  double max_dr_yaw_rate_ = 1.5;
+  double last_dr_yaw_ = 0.0;
+  rclcpp::Time last_dr_yaw_stamp_;
+  bool have_last_dr_yaw_ = false;
   ScanAdmissionParams admission_params_;
   std::string last_input_mode_ = "waiting_for_sonar";
   std::string last_admission_summary_ = "none yet";
@@ -1345,6 +1383,7 @@ private:
   // Subscription counters are atomic because the TF listener has its own
   // thread while diagnostics run on the executor.
   std::atomic<std::uint64_t> tf_lookup_failures_{0}, pitch_rejections_{0};
+  std::atomic<std::uint64_t> yaw_pose_rejections_{0};
   std::uint64_t diag_prev_tf_failures_ = 0;
   int diag_prev_reverted_ = 0;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;

@@ -120,6 +120,28 @@ int main()
   CHECK(admission.informative, "structured scan was rejected: %s",
         sonar_slam::scan_admission_reason(admission.reason));
 
+  // ---- yaw_step_plausible: the DR yaw spike gate
+  CHECK(sonar_slam::yaw_step_plausible(0.0, 3.0, 0.01, 0.0),
+        "disabled gate rejected");
+  CHECK(sonar_slam::yaw_step_plausible(
+          0.0, 5.0 * M_PI / 180.0, 0.1, 1.5),
+        "ordinary turn rejected (5 deg in 100 ms)");
+  CHECK(!sonar_slam::yaw_step_plausible(
+          0.0, 40.0 * M_PI / 180.0, 0.1, 1.5),
+        "compass spike admitted (40 deg in 100 ms)");
+  CHECK(sonar_slam::yaw_step_plausible(
+          179.0 * M_PI / 180.0, -179.0 * M_PI / 180.0, 0.1, 1.5),
+        "wrap across +/-pi counted as a spike");
+  CHECK(!sonar_slam::yaw_step_plausible(0.0, 0.5, 0.0, 1.5),
+        "large step at duplicate stamp admitted (dt floor)");
+  CHECK(sonar_slam::yaw_step_plausible(0.0, 1e-6, 0.0, 1.5),
+        "microscopic step at duplicate stamp rejected");
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  CHECK(!sonar_slam::yaw_step_plausible(nan, 0.0, 0.1, 1.5) &&
+          !sonar_slam::yaw_step_plausible(0.0, nan, 0.1, 1.5) &&
+          !sonar_slam::yaw_step_plausible(0.0, 0.0, nan, 1.5),
+        "non-finite input admitted");
+
   std::printf("PASS\n");
   return 0;
 }
