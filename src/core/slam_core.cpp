@@ -148,6 +148,20 @@ void Slam::configure()
   if (nssm_params.source_frames >= nssm_params.min_st_sep)
     throw std::invalid_argument(
       "nssm/source_frames must be < nssm/min_st_sep");
+  // require_covariance is only satisfiable when a covariance is actually
+  // produced, and run_scan_match_icp produces one ONLY when cov_samples > 0
+  // (the sampled AND censi paths are both behind that gate). The contradictory
+  // pair would silently reject every SSM registration as "degenerate:
+  // covariance unavailable" — an all-odometry graph that still burns the full
+  // global-init + ICP compute per keyframe, distinguishable from a healthy
+  // run only by reading the reject counters. Refuse to start instead.
+  if (ssm_params.enable && ssm_require_covariance && ssm_params.cov_samples <= 0)
+    throw std::invalid_argument(
+      "ssm/require_covariance needs ssm/cov_samples > 0: no covariance is "
+      "estimated at cov_samples 0, so every sequential scan match would be "
+      "rejected as 'covariance unavailable' and the graph would silently "
+      "degrade to odometry-only. Set ssm/cov_samples (e.g. 30, matching "
+      "nssm), or set ssm/require_covariance: false.");
   // 6D lifts of the configured planar sigmas (see the chart note above):
   // prior/odometry constrain chart roll/pitch (0) and depth (absolute for the
   // prior, DR delta for odometry); ICP factors are wide in everything the

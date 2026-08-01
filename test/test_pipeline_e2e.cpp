@@ -172,6 +172,10 @@ int main()
       Slam s;
       s.icp.load_from_yaml(icp_path);
       s.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
+      // isolate the censi/minimizer contract from the SSM covariance
+      // contract: a default Slam has require_covariance true with
+      // cov_samples 0, which configure() (correctly) rejects first
+      s.ssm_require_covariance = false;
       try {
         s.configure();
       } catch (const std::invalid_argument&) {
@@ -201,6 +205,45 @@ int main()
 
     CHECK(reported == "PointToPlaneErrorMinimizer",
           "error_minimizer_name reported '%s'", reported.c_str());
+  }
+
+  // require_covariance is satisfiable only when a covariance is produced,
+  // and both covariance paths (sampled, censi) are behind cov_samples > 0.
+  // The contradictory pair once SHIPPED in config/slam.yaml (cov_samples: 0
+  // predates the gate, when no-covariance still meant "fixed noise model"):
+  // every SSM registration was rejected as "covariance unavailable" and the
+  // graph silently degraded to odometry-only while still paying the full
+  // scan-match compute. configure() must refuse the pair at startup.
+  {
+    Slam s;
+    s.ssm_params.enable = true;
+    s.ssm_require_covariance = true;
+    s.ssm_params.cov_samples = 0;
+    bool threw = false;
+    try {
+      s.configure();
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw,
+          "configure accepted require_covariance with cov_samples 0 (the "
+          "silently-dead SSM configuration)");
+    s.ssm_params.cov_samples = 30;
+    try {
+      s.configure();
+    } catch (const std::exception& e) {
+      CHECK(false, "configure rejected a satisfiable covariance contract: %s",
+            e.what());
+    }
+    // an explicit opt-out must also remain legal
+    s.ssm_require_covariance = false;
+    s.ssm_params.cov_samples = 0;
+    try {
+      s.configure();
+    } catch (const std::exception& e) {
+      CHECK(false, "configure rejected require_covariance: false with "
+                   "cov_samples 0: %s", e.what());
+    }
   }
 
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);
