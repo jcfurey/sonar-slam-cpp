@@ -62,6 +62,9 @@ int main()
   slam.prior_sigmas = Eigen::Vector3d(0.1, 0.1, 0.01);
   slam.odom_sigmas = Eigen::Vector3d(0.2, 0.2, 0.02);
   slam.icp_odom_sigmas = Eigen::Vector3d(0.1, 0.1, 0.01);
+  // this test drives odometry + manual priors only; say so, or configure()
+  // (correctly) rejects the default require_covariance/cov_samples=0 pair
+  slam.ssm_params.enable = false;
   slam.configure();
 
   // keyframes at x = 0..9, 1 m apart, straight line

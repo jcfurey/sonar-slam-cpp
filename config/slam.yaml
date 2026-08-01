@@ -78,7 +78,12 @@
       degeneracy_prefloor: true
       initialization: true    # global scan-match init before ICP
       initialization_params: [50.0, 1.0, 0.01]   # [sobol n per iter, iters, refine ftol]
-      cov_samples: 0          # >0 -> covariance-estimating ICP over the best init samples
+      # Must be > 0 while require_covariance is true: the sampled/censi
+      # covariance only exists when cov_samples registrations run, and
+      # Slam::configure() rejects the contradictory pair at startup (a 0 here
+      # used to mean "fixed noise model", but that fallback no longer enters
+      # the graph under require_covariance). 30 matches nssm and the e2e test.
+      cov_samples: 30
       # sampled = many ICPs + FAST-MCD (default, and the recommended path).
       # `censi` is the point-to-point closed form; Slam::configure() gates it
       # on the LOADED ICP chain via ICP::error_minimizer_name(), so it is
