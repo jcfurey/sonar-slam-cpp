@@ -160,6 +160,13 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_cloud_ops>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_icp_wrapper test/icp_wrapper_test.cpp)
+  target_link_libraries(test_icp_wrapper sonar_slam_core)
+  ament_add_test(test_icp_wrapper
+    COMMAND $<TARGET_FILE:test_icp_wrapper>
+    ENV ICP_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/icp.yaml
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_isam_recovery test/test_isam_recovery.cpp)
   target_include_directories(
     test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
