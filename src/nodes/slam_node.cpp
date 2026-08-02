@@ -87,6 +87,11 @@ public:
     // node follows (sonar_proc, vdb_mapping, the assembler).
     reset_on_time_rewind_ = get_bool("reset_on_time_rewind", true);
     time_rewind_tolerance_ = get_double("time_rewind_tolerance", 0.5);
+    // !(x >= 0) also rejects NaN. A negative tolerance makes every normal
+    // forward step read as a rewind — the node would silently reset the
+    // session on every ping.
+    if (!(time_rewind_tolerance_ >= 0.0))
+      throw std::invalid_argument("time_rewind_tolerance must be >= 0");
     odom_frame_ = get_string("odom_frame", "odom");
     base_frame_ = get_string("base_frame", "base_link");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
@@ -629,6 +634,25 @@ private:
         {
           std::lock_guard<std::mutex> tf_lock(tf_mutex_);
           map_odom_tf_ = MapOdomTf{};
+        }
+        // Refresh the transient-local latches NOW: both publishers latch
+        // depth 1, so without this the dead session's full-history snapshot
+        // stays the retained sample until the first post-reset keyframe —
+        // and in a looped replay pass-2 stamps EQUAL pass-1 stamps, so a
+        // late-joining consumer would associate new evidence to pre-reset
+        // poses. An empty trajectory and a DELETEALL marker are the correct
+        // "no session yet" statements.
+        {
+          sensor_msgs::msg::PointCloud2 empty = make_cloud(
+            {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
+          empty.header.stamp = time;
+          empty.header.frame_id = "map";
+          traj_pub_->publish(empty);
+          visualization_msgs::msg::Marker clear;
+          clear.header.stamp = time;
+          clear.header.frame_id = "map";
+          clear.action = visualization_msgs::msg::Marker::DELETEALL;
+          constraint_pub_->publish(clear);
         }
       }
     }
