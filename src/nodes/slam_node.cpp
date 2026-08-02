@@ -1013,6 +1013,17 @@ private:
     geometry_msgs::msg::PoseWithCovarianceStamped msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // The pose is applied as a MAP-frame prior regardless of the stamp; an
+    // RViz click made with the fixed frame on odom arrives offset by the
+    // entire accumulated map->odom correction and would silently drag the
+    // graph. Warn — the click may still be intentional from a non-RViz
+    // publisher that simply left the frame blank or wrong.
+    if (!msg.header.frame_id.empty() && msg.header.frame_id != "map")
+      RCLCPP_WARN(get_logger(),
+                  "manual correction stamped in frame '%s' but applied as a "
+                  "map-frame pose — set the RViz fixed frame to 'map' before "
+                  "clicking, or expect the prior to be offset",
+                  msg.header.frame_id.c_str());
     if (slam_.keyframes.empty()) {
       RCLCPP_WARN(get_logger(),
                   "manual correction ignored: no keyframes in the graph yet");
@@ -1155,6 +1166,25 @@ private:
     if (usbl_lever_arm_valid_) { r_bt = usbl_lever_arm_; return true; }
     const std::string src = usbl_frame_id_.empty() ? frame : usbl_frame_id_;
     if (src.empty() || src == base_frame_) {
+      usbl_lever_arm_ = Eigen::Vector2d::Zero();
+      usbl_lever_arm_valid_ = true;
+      r_bt = usbl_lever_arm_;
+      return true;
+    }
+    // A fix stamped with a position-REFERENCE frame is telling us where the
+    // position is expressed, not where the transponder is mounted. Looking
+    // one of these up against the live TF tree "succeeds" — and permanently
+    // caches the vehicle's current offset from that frame's origin as a
+    // bogus static lever arm, corrupting every subsequent fix. Mount frames
+    // must come from usbl/frame_id or a genuine sensor frame.
+    if (src == "map" || src == odom_frame_ || src == "earth" || src == "utm") {
+      RCLCPP_WARN_ONCE(
+        get_logger(),
+        "USBL fixes are stamped with reference frame '%s', which cannot be a "
+        "transponder mount frame — applying a ZERO lever arm. Set "
+        "usbl/frame_id to the mount frame if the transponder is offset from "
+        "%s.",
+        src.c_str(), base_frame_.c_str());
       usbl_lever_arm_ = Eigen::Vector2d::Zero();
       usbl_lever_arm_valid_ = true;
       r_bt = usbl_lever_arm_;
