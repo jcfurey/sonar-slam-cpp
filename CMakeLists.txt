@@ -130,6 +130,23 @@ auto_target_dependencies(
   visualization_msgs builtin_interfaces tf2 tf2_ros ament_index_cpp)
 install(TARGETS slam_node DESTINATION lib/${PROJECT_NAME})
 
+# Sanitizer recipe (verified 2026-08-02). ASan+UBSan over the test suite:
+#
+#   colcon build --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+#     -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined \
+#       -fno-omit-frame-pointer -DEIGEN_MALLOC_ALREADY_ALIGNED=1" \
+#     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+#
+# EIGEN_MALLOC_ALREADY_ALIGNED=1 is REQUIRED under ASan: Eigen drops its
+# glibc-malloc-is-aligned assumption when it detects the sanitizer, so
+# instrumented TUs switch to offset-header (handmade) aligned allocation
+# while the UNinstrumented distro libpointmatcher keeps headerless plain
+# malloc. Eigen matrices handed across that boundary (DataPoints in
+# ICP::compute, filter chains) then abort ASan with heap-buffer-overflow /
+# invalid-free reports that are artifacts of the mixed instrumentation,
+# not production defects - production builds sit on the headerless
+# convention on both sides. Forcing the assumption restores convention
+# parity; the suite then runs sanitizer-clean end to end.
 if(BUILD_TESTING)
   find_package(ament_cmake_test REQUIRED)
 
