@@ -83,6 +83,10 @@ public:
     slam_.sonar_horizontal_aperture =
       get_double("sonar_horizontal_aperture", 2.2689280275926285);
     points_topic_ = get_string("points_topic", SONAR_POINTS_TOPIC);
+    // Bag-rewind session reset, matching the convention every other stateful
+    // node follows (sonar_proc, vdb_mapping, the assembler).
+    reset_on_time_rewind_ = get_bool("reset_on_time_rewind", true);
+    time_rewind_tolerance_ = get_double("time_rewind_tolerance", 0.5);
     odom_frame_ = get_string("odom_frame", "odom");
     base_frame_ = get_string("base_frame", "base_link");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
@@ -357,6 +361,21 @@ public:
 
     slam_.configure();
 
+    // Censi is a RESEARCH option (deployed config uses "sampled"): its
+    // closed-form Hessian is built from a fixed point_noise-radius,
+    // untrimmed correspondence set, while the ICP chain minimizes with its
+    // own matcher distance and trimmed outlier filters — so the reported
+    // covariance is not the covariance of the objective actually minimized.
+    // Valid for relative comparisons; do not treat its absolute scale as
+    // calibrated without aligning the correspondence set first.
+    if (slam_.ssm_params.cov_method == SMParams::CENSI ||
+        slam_.nssm_params.cov_method == SMParams::CENSI)
+      RCLCPP_WARN(get_logger(),
+                  "cov_method 'censi' is experimental: its Hessian uses a "
+                  "point_noise-radius untrimmed correspondence set, not the "
+                  "loaded ICP chain's matcher/trim configuration — treat its "
+                  "covariance scale as uncalibrated relative to 'sampled'");
+
     // Map persistence: ~/save_map serializes the whole keyframe map;
     // map_load_path restores a previous session at startup and arms
     // relocalization (the first dense frame is globally scan-matched
@@ -590,6 +609,31 @@ private:
                      bool scan_usable)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Bag rewind: a backward ping stamp means a looped/seeked replay. The
+    // graph is a single-session estimator — mixing two passes cross-
+    // contaminates keyframes and permanently breaks the assembler's evidence
+    // association (it resets and re-associates; this node previously did
+    // not). Reset like every other stateful node in the stack.
+    if (reset_on_time_rewind_ && last_ping_stamp_valid_) {
+      const double dt = (rclcpp::Time(time) - last_ping_stamp_).seconds();
+      if (dt < -time_rewind_tolerance_) {
+        RCLCPP_WARN(get_logger(),
+                    "Ping time moved backwards %.2f s — resetting the SLAM "
+                    "session (looped/seeked replay). A loaded map does not "
+                    "survive the reset.",
+                    -dt);
+        slam_.resetSession();
+        usbl_applied_.clear();
+        last_logged_key_ = -1;
+        {
+          std::lock_guard<std::mutex> tf_lock(tf_mutex_);
+          map_odom_tf_ = MapOdomTf{};
+        }
+      }
+    }
+    last_ping_stamp_ = rclcpp::Time(time);
+    last_ping_stamp_valid_ = true;
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
     ScanAdmission admission;
@@ -1313,6 +1357,10 @@ private:
   int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
   std::string points_topic_;
+  bool reset_on_time_rewind_ = true;
+  double time_rewind_tolerance_ = 0.5;
+  rclcpp::Time last_ping_stamp_{0, 0, RCL_ROS_TIME};
+  bool last_ping_stamp_valid_ = false;
   std::string odom_frame_ = "odom";
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;

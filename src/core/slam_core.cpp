@@ -2062,6 +2062,41 @@ void Slam::rollback_pending_loops(bool quarantine, long culprit_link)
   pending_loops_.clear();
 }
 
+void Slam::resetSession()
+{
+  keyframes.clear();
+  current_frame.reset();
+  isam_ = gtsam::ISAM2(make_isam2_params());
+  graph_.resize(0);
+  values_.clear();
+  committed_graph_ = gtsam::NonlinearFactorGraph();
+  pending_loops_.clear();
+  nssm_queue_.clear();
+  consecutive_links_.clear();
+  tear_baseline_.clear();
+  manual_prior_indices_.clear();
+  force_converge_ = false;
+  loaded_key_count_ = 0;
+  awaiting_relocalization_ = false;
+  ssm_accepted = 0;
+  ssm_degenerate_rejected = 0;
+  nssm_accepted = 0;
+  nssm_attempts = 0;
+  nssm_queued = 0;
+  nssm_best_clique = 0;
+  nssm_reverted = 0;
+  nssm_reject_hist.clear();
+  last_nssm_inserted_geom.clear();
+  last_ssm_status = "none yet";
+  last_nssm_status = "none yet";
+  last_pcm_min_md = -1.0;
+  last_pcm_edges = 0;
+  manual_corrections_applied = 0;
+  manual_corrections_undone = 0;
+  position_priors_applied = 0;
+  last_error_.clear();
+}
+
 void Slam::rebuild_isam()
 {
   // Reconstruct the estimator from the committed factor mirror, linearizing at
