@@ -354,6 +354,13 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   const Eigen::Vector3d floor_var = icp_odom_sigmas.array().square().matrix();
   {
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov.topLeftCorner<2, 2>());
+    // A failed eigensolve leaves eigenvalues/vectors unspecified; flooring
+    // with garbage would fabricate a confident covariance. Report failure —
+    // the caller falls back to the fixed model (SSM) or rejects (NSSM).
+    if (es.info() != Eigen::Success) {
+      result.message = "Failed to calculate covariance";
+      return result;
+    }
     const double vmin = std::min(floor_var[0], floor_var[1]);
     const Eigen::Vector2d ev = es.eigenvalues().cwiseMax(vmin);
     cov.topLeftCorner<2, 2>() =

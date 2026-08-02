@@ -31,6 +31,10 @@ inline IcpObservability assess_icp_observability(
   IcpObservability out;
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
     cov.topLeftCorner<2, 2>());
+  // A failed eigensolve leaves the eigenvalues unspecified — they can be
+  // finite and positive garbage that would pass every test below. This is
+  // the loop-closure degeneracy gate: fail closed.
+  if (es.info() != Eigen::Success) return out;
   const double ev_lo = es.eigenvalues()[0];
   const double ev_hi = es.eigenvalues()[1];
   if (!std::isfinite(ev_lo) || !std::isfinite(ev_hi) ||

@@ -41,6 +41,13 @@ int run_node(int argc, char** argv)
       "'not configured'.",
       e.what());
     rc = 1;
+  } catch (const std::exception& e) {
+    // Constructor validation throws std::runtime_error (require_param, the
+    // config sanity checks); without this catch those abort via std::terminate
+    // instead of taking the clean exit path this wrapper exists to provide.
+    RCLCPP_FATAL(rclcpp::get_logger("sonar_slam"),
+                 "Terminating after unrecoverable error: %s", e.what());
+    rc = 1;
   }
   rclcpp::shutdown();
   return rc;
