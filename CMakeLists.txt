@@ -160,6 +160,18 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_cloud_ops>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_slam_node test/slam_node_test.cpp)
+  target_link_libraries(test_slam_node sonar_slam_ros)
+  auto_target_dependencies(
+    test_slam_node
+    rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
+    nav_msgs visualization_msgs builtin_interfaces tf2 tf2_ros
+    ament_index_cpp)
+  ament_add_test(test_slam_node
+    COMMAND $<TARGET_FILE:test_slam_node>
+    ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_icp_wrapper test/icp_wrapper_test.cpp)
   target_link_libraries(test_icp_wrapper sonar_slam_core)
   ament_add_test(test_icp_wrapper
