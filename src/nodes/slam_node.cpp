@@ -46,7 +46,8 @@ rclcpp::QoS latched_qos(int depth = 1)
 class SlamNode : public SlamNodeBase
 {
 public:
-  SlamNode() : SlamNodeBase("slam")
+  explicit SlamNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+    : SlamNodeBase("slam", options)
   {
     slam_.keyframe_duration = get_double("keyframe_duration");
     slam_.keyframe_translation = get_double("keyframe_translation");
