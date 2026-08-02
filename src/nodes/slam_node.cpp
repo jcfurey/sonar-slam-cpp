@@ -75,6 +75,10 @@ public:
 
     slam_.point_resolution = get_double("point_resolution");
     slam_.point_noise = get_double("point_noise", 0.5);
+    // The global-init cost grid divides its resolution and dilation radius
+    // by point_noise; zero/negative is a config error, not a tunable.
+    if (!(slam_.point_noise > 0.0))
+      throw std::runtime_error("point_noise must be > 0");
     slam_.sonar_max_range = get_double("sonar_max_range", 30.0);
     slam_.sonar_horizontal_aperture =
       get_double("sonar_horizontal_aperture", 2.2689280275926285);
@@ -269,8 +273,15 @@ public:
       std::max(1, get_int("input_queue_depth", 50));
     const int output_queue_depth =
       std::max(1, get_int("output_queue_depth", 10));
-    const auto input_qos = rclcpp::SensorDataQoS(
+    // Best-effort by default: live prioritizes latency and the sonar_proc
+    // publisher is best-effort there anyway. The replay overlay raises
+    // input_queue_depth expecting a LOSSLESS stream, which best-effort cannot
+    // promise even against a reliable publisher — so it also sets
+    // input_reliable true (sonar_proc's replay overlay makes the producer
+    // reliable), which is what actually makes the deep queue deliver.
+    auto input_qos = rclcpp::SensorDataQoS(
       rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
+    if (get_bool("input_reliable", false)) input_qos.reliable();
     const auto output_qos = rclcpp::QoS(
       rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
     // Oculus is a flash-imaging sonar: a cloud is one rigid ping, not a
@@ -312,8 +323,14 @@ public:
       SLAM_POSE_TOPIC, output_qos);
     odom_pub_ =
       create_publisher<nav_msgs::msg::Odometry>(SLAM_ODOM_TOPIC, output_qos);
+    // Depth 1 deliberately, decoupled from output_queue_depth: each
+    // trajectory message carries the FULL keyframe history and fully
+    // supersedes its predecessor, so a late joiner needs exactly one. A
+    // deeper transient-local writer only retains stale snapshots — under the
+    // replay overlay's output_queue_depth 256 it dumped 256 full-trajectory
+    // clouds to every late-joining assembler.
     traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SLAM_TRAJ_TOPIC, latched_qos(output_queue_depth));
+      SLAM_TRAJ_TOPIC, latched_qos(1));
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
 
@@ -431,10 +448,11 @@ private:
 
   // Timer body: re-broadcast the cached correction, future-dated.
   //
-  // Stamping is done in the DATA clock domain, not the node's: bag replay in
-  // this workspace defaults to use_sim_time=False (bag/play.launch.xml), so
-  // now() is wall time while frames carry bag time — stamping with now()
-  // directly would inject transforms decades away from the rest of TF.
+  // Stamping is done in the DATA clock domain, not the node's. The robot
+  // stack sets use_sim_time = is_sim or is_bag (bringup_robot.launch.xml),
+  // but a standalone/harness replay can run this node on wall time while
+  // frames carry bag time — stamping with now() directly would then inject
+  // transforms decades away from the rest of TF.
   // Advancing the last data stamp by the node-clock interval since it was
   // cached is correct in BOTH domains: under sim time the two clocks are the
   // same and this reduces to now() + tolerance (rtabmap's form), and under
@@ -484,11 +502,24 @@ private:
     geometry_msgs::msg::TransformStamped odom_base;
     try {
       const auto stamp = rclcpp::Time(msg.header.stamp);
+      // ONE deadline shared by both lookups: under single-threaded spin these
+      // block the executor, and two full budgets back to back doubled the
+      // worst-case stall per ping (0.4 s at the replay overlay's 0.20 s).
+      // The second lookup gets whatever the first left unspent — both
+      // transforms describe the same instant, so once the buffer has caught
+      // up to the stamp the second lookup is typically immediate.
+      const auto lookup_start = std::chrono::steady_clock::now();
       const auto timeout = rclcpp::Duration::from_seconds(tf_lookup_timeout_);
       base_sensor =
         tf_buffer_->lookupTransform(base_frame_, msg.header.frame_id, stamp, timeout);
+      const double spent =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      lookup_start)
+          .count();
+      const auto remaining = rclcpp::Duration::from_seconds(
+        std::max(0.0, tf_lookup_timeout_ - spent));
       odom_base =
-        tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp, timeout);
+        tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp, remaining);
     } catch (const tf2::TransformException& e) {
       ++tf_lookup_failures_;
       RCLCPP_ERROR_THROTTLE(
