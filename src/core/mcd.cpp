@@ -155,7 +155,14 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
       for (int step = 0; step < 30 && ok; ++step) {
         ok = c_step(X, h, est, scratch);
         if (!ok) break;
-        if (std::abs(prev_det - est.det) < 1e-12) break;  // converged
+        // RELATIVE tolerance: det(cov) of the deployed input (30 ICP
+        // (x, y, theta) samples at sigma ~1e-2 m / 5e-3 rad) is itself
+        // ~1e-12, so an absolute 1e-12 test declared convergence after the
+        // first C-step on essentially every chain — the "converged FAST-MCD
+        // chains" were near-elemental estimates.
+        if (std::abs(prev_det - est.det) <
+            1e-6 * std::max(std::abs(prev_det), std::abs(est.det)))
+          break;  // converged
         prev_det = est.det;
       }
       if (ok) {
@@ -171,7 +178,11 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   Estimate best;
   for (int trial = 0; trial < n_trials; ++trial) {
     const std::size_t t = static_cast<std::size_t>(trial);
-    if (attempt_ok[t] && attempts[t].det < best.det) best = attempts[t];
+    // det > 0: the scatter is PSD by construction, so a NEGATIVE determinant
+    // is numerical noise from a singular support set — and being tiny it
+    // would otherwise beat every legitimate positive determinant.
+    if (attempt_ok[t] && attempts[t].det > 0.0 && attempts[t].det < best.det)
+      best = attempts[t];
   }
 
   if (!std::isfinite(best.det)) return result;
