@@ -1,7 +1,8 @@
 // In-process harness for the slam_node ingestion layer — the seam between
 // TF/proc_points and the pose graph that only ran hand-verified until now:
 // exact-stamp TF admission, the head-pitch gate, the DR yaw spike gate's
-// NODE wiring, scan admission counters, and the odometry-only fallback.
+// NODE wiring, scan admission counters, the odometry-only fallback, and the
+// bag-rewind session reset (fresh graph + refreshed depth-1 latches).
 //
 // The node class lives inside slam_node.cpp with its own main(); include it
 // with main renamed so the class is testable without restructuring the
@@ -219,6 +220,60 @@ int main()
           "missing TF not counted (%lld -> %lld)", tf_before,
           diag_int("exact_tf_failures"));
     std::printf("[5] exact-stamp TF failure counted\n");
+
+    // [6] bag rewind: a ping stamped far behind the last processed one must
+    // reset the session — fresh graph, refreshed depth-1 latches. First grow
+    // the session to keyframe 2 with a > keyframe_translation DR step so the
+    // reset is observable as a keyframe-count drop.
+    odom_at(103.6, 4.0, 0.0);
+    odom_at(103.8, 4.1, 0.0);
+    spin_for(0.2);
+    points_pub->publish(make_cloud_msg(103.7, 120, 2.0));
+    spin_for(1.4);
+    CHECK(diag_int("keyframes") == 2,
+          "big DR step did not promote keyframe 2 (keyframes=%lld)",
+          diag_int("keyframes"));
+    const long long adm_before_rewind = diag_int("admitted_scans");
+
+    // Rewound stamps must stay inside the odom buffer's 10 s tf2 cache
+    // (newest sample 103.8 -> prune horizon 93.8). The DR yaw gate must NOT
+    // swallow this ping: on a backward stamp it drops its baseline instead
+    // of rejecting, so the rewound ping reaches the session-reset check.
+    odom_at(94.9, 0.0, 0.0);
+    odom_at(95.1, 0.05, 0.0);
+    spin_for(0.2);
+    points_pub->publish(make_cloud_msg(95.0, 120, 2.0));
+    spin_for(1.4);
+    CHECK(diag_int("keyframes") == 1,
+          "rewound ping did not reset the session (keyframes=%lld)",
+          diag_int("keyframes"));
+    CHECK(diag_int("admitted_scans") == adm_before_rewind + 1,
+          "rewound ping not admitted into the fresh session (%lld -> %lld)",
+          adm_before_rewind, diag_int("admitted_scans"));
+
+    // The depth-1 transient-local traj latch must now hold the NEW session
+    // only: a late joiner gets one retained cloud — width 1, stamped at the
+    // rewound ping — never the dead session's 2-keyframe snapshot (whose
+    // stamps a looped replay would exactly reuse for wrong associations).
+    sensor_msgs::msg::PointCloud2 latched;
+    bool got_latched = false;
+    auto traj_sub =
+      pub_node->create_subscription<sensor_msgs::msg::PointCloud2>(
+        sonar_slam::SLAM_TRAJ_TOPIC,
+        rclcpp::QoS(rclcpp::KeepLast(4)).reliable().transient_local(),
+        [&](const sensor_msgs::msg::PointCloud2& m) {
+          latched = m;
+          got_latched = true;
+        });
+    spin_for(1.0);
+    CHECK(got_latched, "no retained sample on the traj latch after rewind");
+    CHECK(latched.width == 1,
+          "traj latch still carries the dead session (width=%u)",
+          latched.width);
+    CHECK(latched.header.stamp.sec == 95,
+          "traj latch stamp %d != rewound session start",
+          latched.header.stamp.sec);
+    std::printf("[6] rewind reset: session cleared, latches refreshed\n");
 
     rc = 0;
     std::printf("PASS\n");
