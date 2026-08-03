@@ -22,6 +22,25 @@ inline bool check(cudaError_t err, const char* what)
   std::fprintf(stderr,
                "sonar_slam_cpp CUDA error in %s: %s (falling back to CPU)\n",
                what, cudaGetErrorString(err));
+  // Sticky errors poison the CUDA context: every subsequent call in the
+  // process returns them, so retrying per ping is a guaranteed stderr storm
+  // plus a wasted host<->device round trip — exactly what disable() exists
+  // to prevent. Transient errors (allocation pressure, invalid value from a
+  // degenerate input) stay retryable.
+  switch (err) {
+    case cudaErrorIllegalAddress:
+    case cudaErrorLaunchFailure:
+    case cudaErrorECCUncorrectable:
+    case cudaErrorHardwareStackError:
+    case cudaErrorIllegalInstruction:
+    case cudaErrorMisalignedAddress:
+    case cudaErrorInvalidAddressSpace:
+    case cudaErrorInvalidPc:
+      disable(what);
+      break;
+    default:
+      break;
+  }
   return false;
 }
 

@@ -76,10 +76,23 @@ public:
 
     slam_.point_resolution = get_double("point_resolution");
     slam_.point_noise = get_double("point_noise", 0.5);
+    // The global-init cost grid divides its resolution and dilation radius
+    // by point_noise; zero/negative is a config error, not a tunable.
+    if (!(slam_.point_noise > 0.0))
+      throw std::runtime_error("point_noise must be > 0");
     slam_.sonar_max_range = get_double("sonar_max_range", 30.0);
     slam_.sonar_horizontal_aperture =
       get_double("sonar_horizontal_aperture", 2.2689280275926285);
     points_topic_ = get_string("points_topic", SONAR_POINTS_TOPIC);
+    // Bag-rewind session reset, matching the convention every other stateful
+    // node follows (sonar_proc, vdb_mapping, the assembler).
+    reset_on_time_rewind_ = get_bool("reset_on_time_rewind", true);
+    time_rewind_tolerance_ = get_double("time_rewind_tolerance", 0.5);
+    // !(x >= 0) also rejects NaN. A negative tolerance makes every normal
+    // forward step read as a rewind — the node would silently reset the
+    // session on every ping.
+    if (!(time_rewind_tolerance_ >= 0.0))
+      throw std::invalid_argument("time_rewind_tolerance must be >= 0");
     odom_frame_ = get_string("odom_frame", "odom");
     base_frame_ = get_string("base_frame", "base_link");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
@@ -273,8 +286,15 @@ public:
       std::max(1, get_int("input_queue_depth", 50));
     const int output_queue_depth =
       std::max(1, get_int("output_queue_depth", 10));
-    const auto input_qos = rclcpp::SensorDataQoS(
+    // Best-effort by default: live prioritizes latency and the sonar_proc
+    // publisher is best-effort there anyway. The replay overlay raises
+    // input_queue_depth expecting a LOSSLESS stream, which best-effort cannot
+    // promise even against a reliable publisher — so it also sets
+    // input_reliable true (sonar_proc's replay overlay makes the producer
+    // reliable), which is what actually makes the deep queue deliver.
+    auto input_qos = rclcpp::SensorDataQoS(
       rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
+    if (get_bool("input_reliable", false)) input_qos.reliable();
     const auto output_qos = rclcpp::QoS(
       rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
     // Oculus is a flash-imaging sonar: a cloud is one rigid ping, not a
@@ -316,8 +336,14 @@ public:
       SLAM_POSE_TOPIC, output_qos);
     odom_pub_ =
       create_publisher<nav_msgs::msg::Odometry>(SLAM_ODOM_TOPIC, output_qos);
+    // Depth 1 deliberately, decoupled from output_queue_depth: each
+    // trajectory message carries the FULL keyframe history and fully
+    // supersedes its predecessor, so a late joiner needs exactly one. A
+    // deeper transient-local writer only retains stale snapshots — under the
+    // replay overlay's output_queue_depth 256 it dumped 256 full-trajectory
+    // clouds to every late-joining assembler.
     traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SLAM_TRAJ_TOPIC, latched_qos(output_queue_depth));
+      SLAM_TRAJ_TOPIC, latched_qos(1));
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
 
@@ -343,6 +369,21 @@ public:
         [this]() { republish_map_odom(); });
 
     slam_.configure();
+
+    // Censi is a RESEARCH option (deployed config uses "sampled"): its
+    // closed-form Hessian is built from a fixed point_noise-radius,
+    // untrimmed correspondence set, while the ICP chain minimizes with its
+    // own matcher distance and trimmed outlier filters — so the reported
+    // covariance is not the covariance of the objective actually minimized.
+    // Valid for relative comparisons; do not treat its absolute scale as
+    // calibrated without aligning the correspondence set first.
+    if (slam_.ssm_params.cov_method == SMParams::CENSI ||
+        slam_.nssm_params.cov_method == SMParams::CENSI)
+      RCLCPP_WARN(get_logger(),
+                  "cov_method 'censi' is experimental: its Hessian uses a "
+                  "point_noise-radius untrimmed correspondence set, not the "
+                  "loaded ICP chain's matcher/trim configuration — treat its "
+                  "covariance scale as uncalibrated relative to 'sampled'");
 
     // Map persistence: ~/save_map serializes the whole keyframe map;
     // map_load_path restores a previous session at startup and arms
@@ -435,10 +476,11 @@ private:
 
   // Timer body: re-broadcast the cached correction, future-dated.
   //
-  // Stamping is done in the DATA clock domain, not the node's: bag replay in
-  // this workspace defaults to use_sim_time=False (bag/play.launch.xml), so
-  // now() is wall time while frames carry bag time — stamping with now()
-  // directly would inject transforms decades away from the rest of TF.
+  // Stamping is done in the DATA clock domain, not the node's. The robot
+  // stack sets use_sim_time = is_sim or is_bag (bringup_robot.launch.xml),
+  // but a standalone/harness replay can run this node on wall time while
+  // frames carry bag time — stamping with now() directly would then inject
+  // transforms decades away from the rest of TF.
   // Advancing the last data stamp by the node-clock interval since it was
   // cached is correct in BOTH domains: under sim time the two clocks are the
   // same and this reduces to now() + tolerance (rtabmap's form), and under
@@ -488,11 +530,24 @@ private:
     geometry_msgs::msg::TransformStamped odom_base;
     try {
       const auto stamp = rclcpp::Time(msg.header.stamp);
+      // ONE deadline shared by both lookups: under single-threaded spin these
+      // block the executor, and two full budgets back to back doubled the
+      // worst-case stall per ping (0.4 s at the replay overlay's 0.20 s).
+      // The second lookup gets whatever the first left unspent — both
+      // transforms describe the same instant, so once the buffer has caught
+      // up to the stamp the second lookup is typically immediate.
+      const auto lookup_start = std::chrono::steady_clock::now();
       const auto timeout = rclcpp::Duration::from_seconds(tf_lookup_timeout_);
       base_sensor =
         tf_buffer_->lookupTransform(base_frame_, msg.header.frame_id, stamp, timeout);
+      const double spent =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      lookup_start)
+          .count();
+      const auto remaining = rclcpp::Duration::from_seconds(
+        std::max(0.0, tf_lookup_timeout_ - spent));
       odom_base =
-        tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp, timeout);
+        tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp, remaining);
     } catch (const tf2::TransformException& e) {
       ++tf_lookup_failures_;
       RCLCPP_ERROR_THROTTLE(
@@ -590,6 +645,50 @@ private:
                      bool scan_usable)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Bag rewind: a backward ping stamp means a looped/seeked replay. The
+    // graph is a single-session estimator — mixing two passes cross-
+    // contaminates keyframes and permanently breaks the assembler's evidence
+    // association (it resets and re-associates; this node previously did
+    // not). Reset like every other stateful node in the stack.
+    if (reset_on_time_rewind_ && last_ping_stamp_valid_) {
+      const double dt = (rclcpp::Time(time) - last_ping_stamp_).seconds();
+      if (dt < -time_rewind_tolerance_) {
+        RCLCPP_WARN(get_logger(),
+                    "Ping time moved backwards %.2f s — resetting the SLAM "
+                    "session (looped/seeked replay). A loaded map does not "
+                    "survive the reset.",
+                    -dt);
+        slam_.resetSession();
+        usbl_applied_.clear();
+        last_logged_key_ = -1;
+        {
+          std::lock_guard<std::mutex> tf_lock(tf_mutex_);
+          map_odom_tf_ = MapOdomTf{};
+        }
+        // Refresh the transient-local latches NOW: both publishers latch
+        // depth 1, so without this the dead session's full-history snapshot
+        // stays the retained sample until the first post-reset keyframe —
+        // and in a looped replay pass-2 stamps EQUAL pass-1 stamps, so a
+        // late-joining consumer would associate new evidence to pre-reset
+        // poses. An empty trajectory and a DELETEALL marker are the correct
+        // "no session yet" statements.
+        {
+          sensor_msgs::msg::PointCloud2 empty = make_cloud(
+            {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
+          empty.header.stamp = time;
+          empty.header.frame_id = "map";
+          traj_pub_->publish(empty);
+          visualization_msgs::msg::Marker clear;
+          clear.header.stamp = time;
+          clear.header.frame_id = "map";
+          clear.action = visualization_msgs::msg::Marker::DELETEALL;
+          constraint_pub_->publish(clear);
+        }
+      }
+    }
+    last_ping_stamp_ = rclcpp::Time(time);
+    last_ping_stamp_valid_ = true;
 
     auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
     ScanAdmission admission;
@@ -945,6 +1044,17 @@ private:
     geometry_msgs::msg::PoseWithCovarianceStamped msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // The pose is applied as a MAP-frame prior regardless of the stamp; an
+    // RViz click made with the fixed frame on odom arrives offset by the
+    // entire accumulated map->odom correction and would silently drag the
+    // graph. Warn — the click may still be intentional from a non-RViz
+    // publisher that simply left the frame blank or wrong.
+    if (!msg.header.frame_id.empty() && msg.header.frame_id != "map")
+      RCLCPP_WARN(get_logger(),
+                  "manual correction stamped in frame '%s' but applied as a "
+                  "map-frame pose — set the RViz fixed frame to 'map' before "
+                  "clicking, or expect the prior to be offset",
+                  msg.header.frame_id.c_str());
     if (slam_.keyframes.empty()) {
       RCLCPP_WARN(get_logger(),
                   "manual correction ignored: no keyframes in the graph yet");
@@ -1087,6 +1197,25 @@ private:
     if (usbl_lever_arm_valid_) { r_bt = usbl_lever_arm_; return true; }
     const std::string src = usbl_frame_id_.empty() ? frame : usbl_frame_id_;
     if (src.empty() || src == base_frame_) {
+      usbl_lever_arm_ = Eigen::Vector2d::Zero();
+      usbl_lever_arm_valid_ = true;
+      r_bt = usbl_lever_arm_;
+      return true;
+    }
+    // A fix stamped with a position-REFERENCE frame is telling us where the
+    // position is expressed, not where the transponder is mounted. Looking
+    // one of these up against the live TF tree "succeeds" — and permanently
+    // caches the vehicle's current offset from that frame's origin as a
+    // bogus static lever arm, corrupting every subsequent fix. Mount frames
+    // must come from usbl/frame_id or a genuine sensor frame.
+    if (src == "map" || src == odom_frame_ || src == "earth" || src == "utm") {
+      RCLCPP_WARN_ONCE(
+        get_logger(),
+        "USBL fixes are stamped with reference frame '%s', which cannot be a "
+        "transponder mount frame — applying a ZERO lever arm. Set "
+        "usbl/frame_id to the mount frame if the transponder is offset from "
+        "%s.",
+        src.c_str(), base_frame_.c_str());
       usbl_lever_arm_ = Eigen::Vector2d::Zero();
       usbl_lever_arm_valid_ = true;
       r_bt = usbl_lever_arm_;
@@ -1315,6 +1444,10 @@ private:
   int last_logged_key_ = -1;
   rclcpp::Time last_viz_publish_{0, 0, RCL_ROS_TIME};
   std::string points_topic_;
+  bool reset_on_time_rewind_ = true;
+  double time_rewind_tolerance_ = 0.5;
+  rclcpp::Time last_ping_stamp_{0, 0, RCL_ROS_TIME};
+  bool last_ping_stamp_valid_ = false;
   std::string odom_frame_ = "odom";
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;
