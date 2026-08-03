@@ -24,6 +24,15 @@ public:
   // sanity checks + noise model construction (slam.py configure())
   void configure();
 
+  // Fresh session on the SAME configured engine: clears every piece of
+  // graph/session state (keyframes, factors, estimator, PCM queue, counters,
+  // loaded-map bookkeeping) while keeping parameters, noise models, and the
+  // loaded ICP chain. For bag rewinds (reset_on_time_rewind): the graph is a
+  // single-session estimator, and mixing two replay passes cross-contaminates
+  // keyframes and the assembler's evidence association. A loaded map does NOT
+  // survive the reset — the restarted session begins fresh.
+  void resetSession();
+
   // ------------------------------------------------------------- parameters
   double keyframe_duration = 1.0;
   double keyframe_translation = 3.0;

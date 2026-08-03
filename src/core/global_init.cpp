@@ -76,6 +76,11 @@ struct CostGrid
 // point-noise radius
 CostGrid build_grid(const Matrix& target_points, double point_noise)
 {
+  // point_noise <= 0 is a config error: the resolution and the dilation
+  // radius divide by it, and the float->int casts below are UB on the
+  // resulting inf/NaN. The node validates point_noise > 0 at startup; this
+  // clamp keeps a direct/library caller defined as well.
+  point_noise = std::max(point_noise, 1e-3);
   CostGrid g;
   const double xmin = target_points.col(0).minCoeff() - 2.0 * point_noise;
   const double ymin = target_points.col(1).minCoeff() - 2.0 * point_noise;
@@ -194,6 +199,12 @@ std::vector<float> global_match_costs(
   const Matrix& target_points, const gtsam::Pose2& target_pose,
   double point_noise, const std::vector<Eigen::Vector3d>& deltas)
 {
+  // Empty-cloud guard: global_scan_match_init has one, but this public entry
+  // point (the parity/harness API) reached build_grid's minCoeff() on an
+  // empty matrix — an Eigen assert in debug, UB in release.
+  if (source_points.rows() == 0 || target_points.rows() == 0)
+    return std::vector<float>(deltas.size(),
+                              std::numeric_limits<float>::max());
   const CostGrid grid = build_grid(target_points, point_noise);
   std::vector<std::array<float, 6>> transforms;
   transforms.reserve(deltas.size());

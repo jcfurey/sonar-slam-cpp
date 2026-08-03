@@ -95,6 +95,20 @@ sensor_msgs::msg::PointCloud2 make_cloud(const std::vector<std::string>& fields,
 
 Matrix cloud_to_xyz(const sensor_msgs::msg::PointCloud2& msg)
 {
+  // Validate BEFORE iterating: PointCloud2ConstIterator throws on a missing
+  // field (escaping the subscription callback aborts the node) and silently
+  // reinterprets a non-FLOAT32 one. A malformed cloud degrades to "no
+  // points" — the caller treats that as an odometry-only frame.
+  for (const char* name : {"x", "y", "z"}) {
+    bool ok = false;
+    for (const auto& f : msg.fields)
+      if (f.name == name &&
+          f.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+        ok = true;
+        break;
+      }
+    if (!ok) return Matrix(0, 3);
+  }
   const long n = static_cast<long>(msg.width) * msg.height;
   Matrix out(n, 3);
   sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");

@@ -341,7 +341,15 @@ std::vector<ICP::BatchResult> ICP::compute_batch(
   std::vector<char> cap_skipped(guesses.size(), 0);
   std::exception_ptr fatal;
 
-#pragma omp parallel for schedule(dynamic)
+  // Bound the region to the engine pool: the pool was sized from
+  // omp_get_max_threads() at YAML-load time, and a later change to the OMP
+  // thread budget (or a nested region) must not index past it — one engine
+  // per thread is the concurrency contract, an ICP object is not safe for
+  // concurrent use.
+  const int batch_threads = std::max(
+    1, std::min<int>(omp_get_max_threads(),
+                     static_cast<int>(impl_->pool.size())));
+#pragma omp parallel for schedule(dynamic) num_threads(batch_threads)
   for (int i = 0; i < static_cast<int>(guesses.size()); ++i) {
     // time cap: guesses whose slot opens after the cap are skipped, the
     // parallel analog of the sequential loop's post-sample break
