@@ -52,6 +52,8 @@ public:
     slam_.keyframe_duration = get_double("keyframe_duration");
     slam_.keyframe_translation = get_double("keyframe_translation");
     slam_.keyframe_rotation = get_double("keyframe_rotation");
+    slam_.keyframe_head_rotation =
+      get_double("keyframe_head_rotation", 0.17453292519943295);
     if (has_parameter("keyframe_min_points"))
       throw std::runtime_error(
         "keyframe_min_points is obsolete: configure admission.min_points, "
@@ -76,6 +78,19 @@ public:
 
     slam_.point_resolution = get_double("point_resolution");
     slam_.point_noise = get_double("point_noise", 0.5);
+    slam_.constrained_3d = get_bool("constrained_3d/enabled", true);
+    slam_.constrained_icp_params.max_correspondence = static_cast<float>(
+      get_double("constrained_3d/max_correspondence", 0.75));
+    slam_.constrained_icp_params.trim_ratio =
+      get_double("constrained_3d/trim_ratio", 0.8);
+    slam_.constrained_icp_params.max_iterations =
+      get_int("constrained_3d/max_iterations", 40);
+    slam_.constrained_icp_params.translation_epsilon =
+      get_double("constrained_3d/translation_epsilon", 0.005);
+    slam_.constrained_icp_params.rotation_epsilon =
+      get_double("constrained_3d/rotation_epsilon", 0.001);
+    slam_.constrained_icp_params.min_correspondences =
+      get_int("constrained_3d/min_correspondences", 6);
     // The global-init cost grid divides its resolution and dilation radius
     // by point_noise; zero/negative is a config error, not a tunable.
     if (!(slam_.point_noise > 0.0))
@@ -96,7 +111,9 @@ public:
     odom_frame_ = get_string("odom_frame", "odom");
     base_frame_ = get_string("base_frame", "base_link");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
-    max_head_pitch_ = get_double("max_head_pitch", 0.52);
+    // Optional emergency gate.  Constrained-3D mode admits every head angle
+    // by default; a positive value restores an operator-selected bound.
+    max_head_pitch_ = get_double("max_head_pitch", 0.0);
     // DR yaw spike gate (rad/s over the inter-ping gap; 0 disables) — see
     // yaw_step_plausible in sonar_input.hpp
     max_dr_yaw_rate_ = get_double("dr/max_yaw_rate", 1.5);
@@ -369,6 +386,13 @@ public:
         [this]() { republish_map_odom(); });
 
     slam_.configure();
+    RCLCPP_INFO(
+      get_logger(),
+      "Sonar registration: %s (head gate %s)",
+      slam_.constrained_3d
+        ? "constrained XYZ correspondences -> x/y/yaw factors"
+        : "legacy planar ICP",
+      max_head_pitch_ <= 0.0 ? "disabled" : "enabled");
 
     // Censi is a RESEARCH option (deployed config uses "sampled"): its
     // closed-form Hessian is built from a fixed point_noise-radius,
@@ -612,8 +636,9 @@ private:
       ++pitch_rejections_;
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 10000,
-        "Planar SLAM is skipping head-swept ping (boresight %.1f deg, limit "
-        "%.1f deg); sonar_proc mapping streams remain unaffected",
+        "SLAM safety gate is skipping head-swept ping (boresight %.1f deg, "
+        "limit %.1f deg); set max_head_pitch <= 0 for constrained-3D "
+        "registration; sonar_proc mapping streams remain unaffected",
         head_pitch * 180.0 / M_PI, max_head_pitch_ * 180.0 / M_PI);
     }
 
@@ -632,17 +657,17 @@ private:
           .matrix().cast<float>();
       points = finite_points(
         project_flash_ping(xyz_sensor, R_bs, t_bs, R_h));
-      slam_callback(msg.header.stamp, dr_pose3, points, true);
+      slam_callback(msg.header.stamp, dr_pose3, points, true, head_pitch);
       return;
     }
 
     points.resize(0, 3);
-    slam_callback(msg.header.stamp, dr_pose3, points, false);
+    slam_callback(msg.header.stamp, dr_pose3, points, false, head_pitch);
   }
 
   void slam_callback(const builtin_interfaces::msg::Time& time,
                      const gtsam::Pose3& dr_pose3, const Matrix& points,
-                     bool scan_usable)
+                     bool scan_usable, double head_pitch)
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -690,7 +715,8 @@ private:
     last_ping_stamp_ = rclcpp::Time(time);
     last_ping_stamp_valid_ = true;
 
-    auto frame = std::make_shared<Keyframe>(false, time, dr_pose3);
+    auto frame = std::make_shared<Keyframe>(
+      false, time, dr_pose3, Matrix::Zero(0, 3), head_pitch);
     ScanAdmission admission;
     bool scan_informative = false;
     if (scan_usable) {
@@ -722,7 +748,7 @@ private:
       }
     } else {
       last_input_mode_ = "odometry_only_head_sweep";
-      last_admission_summary_ = "head pitch outside planar SLAM gate";
+      last_admission_summary_ = "head pitch outside optional safety gate";
     }
 
     // A loaded map intercepts the pipeline until relocalization lands: the
@@ -881,8 +907,9 @@ private:
     pose_msg.header.frame_id = "map";
     pose_msg.pose.pose = g2r(frame->pose3);
 
-    // 6x6 covariance in (x, y, z, roll, pitch, yaw). The planar back-end only
-    // estimates x, y and yaw; z/roll/pitch are dead-reckoning pass-through, so
+    // 6x6 covariance in (x, y, z, roll, pitch, yaw). The constrained-3D
+    // front end estimates x, y and yaw from XYZ correspondences;
+    // z/roll/pitch are dead-reckoning/pressure/IMU pass-through, so
     // they carry a large "unobserved" variance instead of a confident value a
     // downstream EKF would mistake for a SLAM measurement of those states.
     constexpr double kUnobserved = 1e6;
@@ -1397,7 +1424,7 @@ private:
       st.message = "odometry-only: uninformative sonar";
     } else if (input_mode == "odometry_only_head_sweep") {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-      st.message = "odometry-only: sonar head outside planar gate";
+      st.message = "odometry-only: sonar head outside optional safety gate";
     } else {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       st.message = "running";
@@ -1451,7 +1478,7 @@ private:
   std::string odom_frame_ = "odom";
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;
-  double max_head_pitch_ = 0.52;
+  double max_head_pitch_ = 0.0;
   // DR yaw spike gate (see yaw_step_plausible). last_* only touched from
   // the points callback (default mutually-exclusive group).
   double max_dr_yaw_rate_ = 1.5;

@@ -109,6 +109,55 @@ int main()
     std::printf("[4] knn match OK\n");
   }
 
+  // ---- constrained XYZ ICP: elevation participates in correspondence
+  // selection, while the recovered motion remains exactly x/y/yaw.
+  {
+    Matrix target(160, 3);
+    for (int i = 0; i < 80; ++i) {
+      const float z = 0.025f * static_cast<float>(i);
+      target.row(i) << 0.0f, 0.03f * static_cast<float>(i), z;
+      target.row(80 + i) << 0.03f * static_cast<float>(i), 0.0f, z;
+    }
+    const double yaw = 0.08;
+    const float c = static_cast<float>(std::cos(yaw));
+    const float s = static_cast<float>(std::sin(yaw));
+    Matrix source = target;
+    source.col(0) = c * target.col(0) - s * target.col(1);
+    source.col(1) = s * target.col(0) + c * target.col(1);
+    source.col(0).array() += 0.25f;
+    source.col(1).array() -= 0.12f;
+
+    sonar_slam::ConstrainedIcpParams p;
+    p.max_correspondence = 0.6f;
+    p.translation_epsilon = 1e-5;
+    p.rotation_epsilon = 1e-5;
+    const auto fit = sonar_slam::constrained_icp_xyz(
+      source, target, Eigen::Matrix3f::Identity(), p);
+    CHECK(fit.success, "constrained XYZ ICP failed: %s", fit.message.c_str());
+    // source = A*target+t, so target ~= A^-1*(source-t)
+    const double expect_yaw = -yaw;
+    const double expect_x = -(std::cos(expect_yaw) * 0.25 -
+                              std::sin(expect_yaw) * -0.12);
+    const double expect_y = -(std::sin(expect_yaw) * 0.25 +
+                              std::cos(expect_yaw) * -0.12);
+    const double got_yaw = std::atan2(fit.T(1, 0), fit.T(0, 0));
+    CHECK(std::fabs(fit.T(0, 2) - expect_x) < 0.04 &&
+            std::fabs(fit.T(1, 2) - expect_y) < 0.04 &&
+            std::fabs(got_yaw - expect_yaw) < 0.04,
+          "constrained fit (%.3f, %.3f, %.3f), expected (%.3f, %.3f, %.3f)",
+          fit.T(0, 2), fit.T(1, 2), got_yaw,
+          expect_x, expect_y, expect_yaw);
+
+    Matrix wrong_height = source;
+    wrong_height.col(2).array() += 2.0f;
+    p.max_correspondence = 0.4f;
+    const auto rejected = sonar_slam::constrained_icp_xyz(
+      wrong_height, target, Eigen::Matrix3f::Identity(), p);
+    CHECK(!rejected.success,
+          "height-separated scans falsely registered through XY projection");
+    std::printf("[5] constrained XYZ registration and height rejection OK\n");
+  }
+
   std::printf("PASS\n");
   return 0;
 }

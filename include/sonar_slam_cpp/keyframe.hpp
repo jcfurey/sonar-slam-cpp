@@ -66,10 +66,10 @@ struct Keyframe
 {
   Keyframe(bool status_, const builtin_interfaces::msg::Time& time_,
            const gtsam::Pose3& dr_pose3_,
-           Matrix points_ = Matrix::Zero(0, 3))
+           Matrix points_ = Matrix::Zero(0, 3), double head_pitch_ = 0.0)
     : status(status_), time(time_), dr_pose3(dr_pose3_),
       dr_pose(pose322(dr_pose3_)), pose3(dr_pose3_), pose(pose322(dr_pose3_)),
-      points(std::move(points_))
+      points(std::move(points_)), head_pitch(head_pitch_)
   {
   }
 
@@ -81,7 +81,7 @@ struct Keyframe
       gtsam::Rot3::Ypr(new_pose.theta(), dr_pose3.rotation().pitch(),
                        dr_pose3.rotation().roll()),
       gtsam::Point3(new_pose.x(), new_pose.y(), dr_pose3.z()));
-    transf_points = transform_points(points, pose);
+    transf_points = transform_points(points, horizon_pose3());
     update_transf_cov();
   }
 
@@ -103,7 +103,7 @@ struct Keyframe
       gtsam::Rot3::Ypr(pose.theta(), dr_pose3.rotation().pitch(),
                        dr_pose3.rotation().roll()),
       gtsam::Point3(est_h.x(), est_h.y(), est_h.z()));
-    transf_points = transform_points(points, pose);
+    transf_points = transform_points(points, horizon_pose3());
     update_transf_cov();
   }
 
@@ -141,15 +141,27 @@ struct Keyframe
 
   static Matrix transform_points(const Matrix& pts, const gtsam::Pose2& pose)
   {
-    if (pts.rows() == 0) return Matrix::Zero(0, 2);
+    if (pts.rows() == 0) return Matrix::Zero(0, pts.cols());
     const float c = static_cast<float>(std::cos(pose.theta()));
     const float s = static_cast<float>(std::sin(pose.theta()));
     Eigen::Matrix2f R;
     R << c, -s, s, c;
-    Matrix out(pts.rows(), 2);
-    out = pts.leftCols(2) * R.transpose();
+    Matrix out = pts;
+    out.leftCols(2) = pts.leftCols(2) * R.transpose();
     out.col(0).array() += static_cast<float>(pose.x());
     out.col(1).array() += static_cast<float>(pose.y());
+    return out;
+  }
+
+  // Horizon-frame transform used by constrained 3-D registration.  The graph
+  // pose contains yaw + xyz; roll/pitch have already been removed once at
+  // ping ingestion.  Applying only horizon yaw here avoids double attitude
+  // rotation while preserving pressure-depth separation between scans.
+  static Matrix transform_points(const Matrix& pts, const gtsam::Pose3& pose)
+  {
+    Matrix out = transform_points(pts, pose322(pose));
+    if (out.cols() >= 3)
+      out.col(2).array() += static_cast<float>(pose.z());
     return out;
   }
 
@@ -166,7 +178,12 @@ struct Keyframe
   Eigen::Matrix3d transf_cov = Eigen::Matrix3d::Zero(); // global frame
 
   Matrix points;         // local horizon-referenced frame, Nx3 (x, y, elev)
-  Matrix transf_points;  // global frame, Nx2 (registration cache; x/y only)
+  Matrix transf_points;  // global horizon frame, Nx3 (x/y + pressure depth)
+
+  // Sonar optical-boresight elevation at the ping stamp.  It participates in
+  // keyframe selection so a stationary mechanical head sweep still builds a
+  // multi-angle local submap instead of being discarded as "no motion".
+  double head_pitch = 0.0;
 
   // non-sequential constraints aka loop closures: (target key, transform)
   std::vector<std::pair<int, gtsam::Pose2>> constraints;

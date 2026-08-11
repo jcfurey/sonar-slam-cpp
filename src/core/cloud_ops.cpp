@@ -10,6 +10,7 @@
 #include <omp.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <fstream>
@@ -175,6 +176,167 @@ std::pair<Eigen::MatrixXi, Matrix> match(const Matrix& mat_ref,
   matcher->init(*cloud_ref);
   PM::Matches matches = matcher->findClosests(*cloud_in);
   return std::make_pair(matches.ids, matches.dists);
+}
+
+// ------------------------------------------------------- constrained XYZ ICP
+namespace {
+
+Eigen::Matrix3f pose_matrix(double x, double y, double yaw)
+{
+  const float c = static_cast<float>(std::cos(yaw));
+  const float s = static_cast<float>(std::sin(yaw));
+  Eigen::Matrix3f T = Eigen::Matrix3f::Identity();
+  T(0, 0) = c;
+  T(0, 1) = -s;
+  T(1, 0) = s;
+  T(1, 1) = c;
+  T(0, 2) = static_cast<float>(x);
+  T(1, 2) = static_cast<float>(y);
+  return T;
+}
+
+Matrix transform_xyz_planar(const Matrix& source, double x, double y,
+                            double yaw)
+{
+  const float c = static_cast<float>(std::cos(yaw));
+  const float s = static_cast<float>(std::sin(yaw));
+  Matrix out = source;
+  out.col(0) = c * source.col(0) - s * source.col(1);
+  out.col(1) = s * source.col(0) + c * source.col(1);
+  out.col(0).array() += static_cast<float>(x);
+  out.col(1).array() += static_cast<float>(y);
+  // source z is already expressed in the target pressure-depth chart.
+  return out;
+}
+
+}  // namespace
+
+ConstrainedIcpResult constrained_icp_xyz(
+  const Matrix& source, const Matrix& target, const Eigen::Matrix3f& guess,
+  const ConstrainedIcpParams& params)
+{
+  ConstrainedIcpResult result;
+  result.T = guess;
+  if (source.cols() != 3 || target.cols() != 3 || source.rows() == 0 ||
+      target.rows() == 0) {
+    result.message = "constrained XYZ ICP requires non-empty Nx3 clouds";
+    return result;
+  }
+  if (!(params.max_correspondence > 0.0f) ||
+      !(params.trim_ratio > 0.0 && params.trim_ratio <= 1.0) ||
+      params.max_iterations < 1 || params.min_correspondences < 3) {
+    result.message = "invalid constrained XYZ ICP parameters";
+    return result;
+  }
+
+  double x = guess(0, 2);
+  double y = guess(1, 2);
+  double yaw = std::atan2(static_cast<double>(guess(1, 0)),
+                          static_cast<double>(guess(0, 0)));
+
+  for (int iteration = 0; iteration < params.max_iterations; ++iteration) {
+    const Matrix transformed = transform_xyz_planar(source, x, y, yaw);
+    const auto [ids, dists] = match(
+      target, transformed, 1, params.max_correspondence);
+
+    std::vector<std::pair<float, int>> valid;
+    valid.reserve(static_cast<std::size_t>(source.rows()));
+    for (int i = 0; i < ids.cols(); ++i) {
+      if (ids(0, i) >= 0 && std::isfinite(dists(0, i)))
+        valid.emplace_back(dists(0, i), i);
+    }
+    const int keep = std::min<int>(
+      static_cast<int>(valid.size()),
+      std::max(params.min_correspondences,
+               static_cast<int>(std::floor(
+                 params.trim_ratio * static_cast<double>(valid.size())))));
+    if (keep < params.min_correspondences) {
+      result.message = "too few 3D correspondences (" +
+        std::to_string(valid.size()) + ")";
+      result.correspondences = static_cast<int>(valid.size());
+      return result;
+    }
+    std::nth_element(valid.begin(), valid.begin() + keep - 1, valid.end(),
+                     [](const auto& a, const auto& b) {
+                       return a.first < b.first;
+                     });
+
+    Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d b = Eigen::Vector3d::Zero();
+    const double c = std::cos(yaw), s = std::sin(yaw);
+    for (int n = 0; n < keep; ++n) {
+      const int i = valid[static_cast<std::size_t>(n)].second;
+      const int j = ids(0, i);
+      const double px = source(i, 0), py = source(i, 1);
+      const double dxdtheta = -s * px - c * py;
+      const double dydtheta = c * px - s * py;
+      Eigen::Matrix<double, 2, 3> J;
+      J << 1.0, 0.0, dxdtheta,
+           0.0, 1.0, dydtheta;
+      const Eigen::Vector2d residual(
+        static_cast<double>(target(j, 0) - transformed(i, 0)),
+        static_cast<double>(target(j, 1) - transformed(i, 1)));
+      H.noalias() += J.transpose() * J;
+      b.noalias() += J.transpose() * residual;
+    }
+
+    const Eigen::LDLT<Eigen::Matrix3d> ldlt(H);
+    if (ldlt.info() != Eigen::Success) {
+      result.message = "singular constrained XYZ ICP normal matrix";
+      return result;
+    }
+    const Eigen::Vector3d delta = ldlt.solve(b);
+    if (ldlt.info() != Eigen::Success || !delta.allFinite()) {
+      result.message = "non-finite constrained XYZ ICP update";
+      return result;
+    }
+    x += delta[0];
+    y += delta[1];
+    yaw = std::remainder(yaw + delta[2], 2.0 * M_PI);
+    result.correspondences = keep;
+    result.iterations = iteration + 1;
+    if (delta.head<2>().norm() <= params.translation_epsilon &&
+        std::abs(delta[2]) <= params.rotation_epsilon) {
+      result.success = true;
+      result.message = "success";
+      result.T = pose_matrix(x, y, yaw);
+      return result;
+    }
+  }
+
+  // A bounded, finite solution at the iteration cap is still a valid ICP
+  // result; the downstream overlap/covariance/maximum-correction gates decide
+  // whether it is safe to become a graph factor.
+  result.success = true;
+  result.message = "success";
+  result.T = pose_matrix(x, y, yaw);
+  return result;
+}
+
+std::vector<ConstrainedIcpResult> constrained_icp_xyz_batch(
+  const Matrix& source, const Matrix& target,
+  const std::vector<Eigen::Matrix3f>& guesses,
+  const ConstrainedIcpParams& params, int max_ms)
+{
+  std::vector<ConstrainedIcpResult> results(guesses.size());
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<char> expired(guesses.size(), 0);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < static_cast<int>(guesses.size()); ++i) {
+    if (i > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start).count() >= max_ms) {
+      expired[static_cast<std::size_t>(i)] = 1;
+      continue;
+    }
+    results[static_cast<std::size_t>(i)] = constrained_icp_xyz(
+      source, target, guesses[static_cast<std::size_t>(i)], params);
+  }
+  // Keep prefix semantics like ICP::compute_batch: a later dynamic worker may
+  // have finished after an earlier slot observed the cap.
+  auto first = std::find(expired.begin(), expired.end(), 1);
+  if (first != expired.end())
+    results.resize(static_cast<std::size_t>(first - expired.begin()));
+  return results;
 }
 
 // ------------------------------------------------------------------------ ICP

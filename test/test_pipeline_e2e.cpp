@@ -136,6 +136,27 @@ bool feed(Slam& slam, int k, const gtsam::Pose2& truth, const gtsam::Pose2& dr,
 
 int main()
 {
+  // Both sampled-covariance execution modes must honor constrained XYZ ICP.
+  // A past regression sent the sequential toggle through legacy planar ICP.
+  {
+    Slam sequential;
+    sequential.parallel_cov_samples = false;
+    sequential.constrained_3d = true;
+    Matrix target(40, 3);
+    for (int i = 0; i < target.rows(); ++i)
+      target.row(i) << 0.1f * static_cast<float>(i % 8),
+                       0.12f * static_cast<float>(i / 8),
+                       0.08f * static_cast<float>((i * 7) % 11);
+    Matrix source = target;
+    source.col(2).array() += 2.0f;
+    std::vector<gtsam::Pose2> guesses(8, gtsam::Pose2());
+    const auto covariance = sequential.compute_icp_with_cov(
+      source, target, guesses);
+    CHECK(covariance.message == "Too few samples for covariance computation",
+          "sequential covariance ignored height separation: %s",
+          covariance.message.c_str());
+  }
+
   // The Censi covariance Hessian is point-to-POINT, so it must be paired
   // with a point-to-point ICP chain and refused against a point-to-plane
   // one. Which of those is loaded is a CONFIG question, not a constant: the
@@ -170,6 +191,9 @@ int main()
     };
     const auto censi_rejected = [](const std::string& icp_path) {
       Slam s;
+      // Censi is intentionally unavailable in constrained-3D mode; this
+      // fixture isolates the legacy planar minimizer/covariance contract.
+      s.constrained_3d = false;
       s.icp.load_from_yaml(icp_path);
       s.nssm_params.cov_method = sonar_slam::SMParams::CENSI;
       // isolate the censi/minimizer contract from the SSM covariance

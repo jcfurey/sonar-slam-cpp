@@ -1,6 +1,7 @@
 # sonar_slam_cpp
 
-Sonar scan matching and pose-graph optimization for ROS 2.
+Tilt-aware constrained-3D sonar scan matching and pose-graph optimization for
+ROS 2.
 
 This package intentionally owns only:
 
@@ -30,16 +31,30 @@ For each ping, `slam_node` requests both:
 - `odom <- base_link` at the same stamp.
 
 If either exact transform is unavailable, the ping is dropped and reported on
-`/diagnostics`. The input cloud is projected once through the sensor transform,
-then leveled with fused roll/pitch for planar registration. Large head sweeps
-are rejected by boresight elevation while sonar_proc's mapping streams continue
-unaffected.
+`/diagnostics`. The input cloud is projected once through the live head
+transform, then leveled with fused roll/pitch. XYZ is retained through
+keyframe accumulation, correspondence search, trimming, overlap checks and
+ICP. Source elevation is shifted into the target keyframe's pressure-depth
+chart before matching.
+
+The registration motion model is deliberately constrained to `x/y/yaw`:
+elevation decides *which* returns correspond, but sonar factors cannot modify
+depth, roll or pitch. Those states remain owned by pressure and the IMU. This
+avoids both failures of the previous flattened matcher—different elevations
+aliasing in XY and floor/head-sweep geometry being discarded—without allowing
+the wide Oculus elevation aperture to invent a free SE(3) solution. A positive
+`max_head_pitch` remains available as an emergency/operator gate; its default
+is disabled.
+
+The Sobol global initializer still searches only `x/y/yaw` on an XY occupancy
+seed. Every seed is subsequently refined and validated with constrained XYZ
+ICP, XYZ overlap, sampled covariance and the existing graph-defense gates.
 
 ## Open-water behavior
 
 Sparse sonar is treated as absence of a measurement. Before keyframe selection,
 including the first frame, a ping must have enough finite returns distributed
-across distinct horizontal cells and azimuth bins. Rejected pings never enter
+across distinct XYZ voxels and horizontal azimuth bins. Rejected pings never enter
 the graph or loop-closure history; the node continues publishing the fused
 odometry pose through the last `map -> odom` correction.
 

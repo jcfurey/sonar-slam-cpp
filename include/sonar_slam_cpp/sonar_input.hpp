@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <set>
+#include <tuple>
 #include <utility>
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
@@ -111,26 +112,31 @@ inline Matrix finite_points(const Matrix& points)
 }
 
 // Admission is deliberately independent of raw detector density. A scan needs
-// enough finite returns, enough distinct horizontal cells, and returns across
-// multiple azimuth bins. Thus a dense blob or one water-column ray cannot
-// become graph evidence merely by carrying many neighboring points.
+// enough finite returns, enough distinct XYZ voxels, and returns across
+// multiple horizontal azimuth bins. Thus a dense blob or one water-column ray
+// cannot become graph evidence merely by carrying many neighboring points,
+// while a tilted head sweep can demonstrate real 3-D support.
 inline ScanAdmission assess_scan(
   const Matrix& points, const ScanAdmissionParams& params)
 {
   ScanAdmission out;
-  std::set<std::pair<std::int64_t, std::int64_t>> cells;
+  std::set<std::tuple<std::int64_t, std::int64_t, std::int64_t>> cells;
   std::set<std::int64_t> azimuth_bins;
 
   for (int i = 0; i < points.rows(); ++i) {
     if (points.cols() < 2 || !std::isfinite(points(i, 0)) ||
-        !std::isfinite(points(i, 1)))
+        !std::isfinite(points(i, 1)) ||
+        (points.cols() >= 3 && !std::isfinite(points(i, 2))))
       continue;
     ++out.finite_points;
     const double x = static_cast<double>(points(i, 0));
     const double y = static_cast<double>(points(i, 1));
+    const double z = points.cols() >= 3
+      ? static_cast<double>(points(i, 2)) : 0.0;
     cells.emplace(
       static_cast<std::int64_t>(std::floor(x / params.cell_size)),
-      static_cast<std::int64_t>(std::floor(y / params.cell_size)));
+      static_cast<std::int64_t>(std::floor(y / params.cell_size)),
+      static_cast<std::int64_t>(std::floor(z / params.cell_size)));
     azimuth_bins.insert(static_cast<std::int64_t>(
       std::floor(std::atan2(y, x) / params.azimuth_bin_size)));
   }

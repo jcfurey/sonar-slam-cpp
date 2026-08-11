@@ -7,8 +7,11 @@
     keyframe_duration: 1.0
     keyframe_translation: 3.0
     keyframe_rotation: 0.5235987755982988   # deg(30)
+    # A mechanical head sweep changes observable 3-D geometry even when the
+    # vehicle is stationary. <= 0 disables angle-triggered keyframes.
+    keyframe_head_rotation: 0.17453292519943295  # deg(10)
     # Open-water admission. Every graph candidate, including the first, must
-    # carry enough finite returns distributed across distinct horizontal cells
+    # carry enough finite returns distributed across distinct XYZ voxels
     # and azimuth bins. Rejected pings publish odometry-extrapolated pose only
     # and never enter keyframe/NSSM history.
     admission:
@@ -33,8 +36,9 @@
     odom_sigmas: [0.2, 0.2, 0.02]
     icp_odom_sigmas: [0.1, 0.1, 0.01]
 
-    # ICP config. Resolved to an absolute path by the launch file; if left empty
-    # the node falls back to the installed package share copy of icp.yaml.
+    # Legacy planar compatibility-mode ICP config. constrained_3d.enabled=true
+    # uses the explicit matcher parameters below instead. Resolved to an
+    # absolute path by the launch file; empty uses the package copy.
     icp_config: ""
 
     # sonar_proc candidate cloud + exact-stamp TF contract
@@ -42,7 +46,9 @@
     odom_frame: odom
     base_frame: base_link
     tf_lookup_timeout: 0.05
-    max_head_pitch: 0.52
+    # Optional emergency/operator gate. <= 0 admits every angle into the
+    # constrained-3D front end (the default).
+    max_head_pitch: 0.0
     # DR yaw spike gate (rad/s over the inter-ping gap; 0 disables): drop a
     # ping whose odom yaw stepped faster than the vehicle can physically
     # turn — a compass/EKF glitch would otherwise become a hard yaw
@@ -57,9 +63,19 @@
     point_resolution: 0.5
     # noise radius (m) used by the overlap tests and the global-init occupancy grid
     point_noise: 0.5
-    # Sensor noise used by the point-to-point Censi closed-form helper. Only
-    # read when cov_method: censi, which Slam::configure() gates on the LOADED
-    # ICP chain (see the cov_method notes below) — not on a fixed assumption.
+    # XYZ correspondences with a hard x/y/yaw motion model. Source elevation
+    # is shifted into the target pressure-depth chart before registration;
+    # sonar therefore cannot modify z, roll or pitch.
+    constrained_3d:
+      enabled: true
+      max_correspondence: 0.75
+      trim_ratio: 0.8
+      max_iterations: 40
+      translation_epsilon: 0.005
+      rotation_epsilon: 0.001
+      min_correspondences: 6
+    # Sensor noise for the legacy planar point-to-point Censi helper. Censi is
+    # rejected while constrained_3d is enabled; use sampled covariance there.
     censi_sensor_noise: 0.1
     # run the "sampled" method's cov_samples registrations across an OpenMP
     # per-thread ICP engine pool instead of one core sequentially
@@ -91,7 +107,8 @@
       # the graph under require_covariance). 30 matches nssm and the e2e test.
       cov_samples: 30
       # sampled = many ICPs + FAST-MCD (default, and the recommended path).
-      # `censi` is the point-to-point closed form; Slam::configure() gates it
+      # `censi` is the legacy planar point-to-point closed form. It is rejected
+      # in constrained-3D mode; in planar mode configure() also gates it
       # on the LOADED ICP chain via ICP::error_minimizer_name(), so it is
       # accepted against a PointToPoint minimizer and rejected against
       # PointToPlane. This package's config/icp.yaml ships point-to-plane, so
@@ -124,7 +141,8 @@
       initialization_params: [100.0, 5.0, 0.01]  # [sobol n per iter, iters, refine ftol]
       cov_samples: 30
       # sampled = many ICPs + FAST-MCD (default, and the recommended path).
-      # `censi` is the point-to-point closed form; Slam::configure() gates it
+      # `censi` is the legacy planar point-to-point closed form. It is rejected
+      # in constrained-3D mode; in planar mode configure() also gates it
       # on the LOADED ICP chain via ICP::error_minimizer_name(), so it is
       # accepted against a PointToPoint minimizer and rejected against
       # PointToPlane. This package's config/icp.yaml ships point-to-plane, so
