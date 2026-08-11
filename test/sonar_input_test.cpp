@@ -120,6 +120,27 @@ int main()
   CHECK(admission.informative, "structured scan was rejected: %s",
         sonar_slam::scan_admission_reason(admission.reason));
 
+  // XYZ occupancy must retain real vertical support. These points occupy
+  // only three horizontal cells, but six 3-D voxels; flattening admission
+  // back to XY would reject the tilted structure.
+  gate.min_occupied_cells = 6;
+  Matrix vertical_structure(6, 3);
+  vertical_structure << 1.0f, 0.0f, 0.0f,
+                        1.0f, 0.0f, 0.6f,
+                        1.0f, 0.6f, 0.0f,
+                        1.0f, 0.6f, 0.6f,
+                        1.0f, -0.6f, 0.0f,
+                        1.0f, -0.6f, 0.6f;
+  admission = sonar_slam::assess_scan(vertical_structure, gate);
+  CHECK(admission.informative && admission.occupied_cells == 6,
+        "XYZ admission flattened vertical support (%d cells)",
+        admission.occupied_cells);
+
+  vertical_structure(0, 2) = std::numeric_limits<float>::quiet_NaN();
+  admission = sonar_slam::assess_scan(vertical_structure, gate);
+  CHECK(admission.finite_points == 5,
+        "non-finite elevation counted toward XYZ admission");
+
   // ---- yaw_step_plausible: the DR yaw spike gate
   CHECK(sonar_slam::yaw_step_plausible(0.0, 3.0, 0.01, 0.0),
         "disabled gate rejected");

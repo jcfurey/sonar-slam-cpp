@@ -125,8 +125,15 @@ void Slam::configure()
   // rejection claimed "the runtime ICP is point-to-plane", which was false
   // for the deployed configuration and foreclosed a valid option on a wrong
   // premise. (icp.load_from_yaml runs before configure(), so this is known.)
-  if (ssm_params.cov_method == SMParams::CENSI ||
-      nssm_params.cov_method == SMParams::CENSI) {
+  if (constrained_3d &&
+      (ssm_params.cov_method == SMParams::CENSI ||
+       nssm_params.cov_method == SMParams::CENSI))
+    throw std::invalid_argument(
+      "cov_method 'censi' is planar-only; constrained_3d uses XYZ "
+      "correspondences and requires cov_method 'sampled'");
+  if (!constrained_3d &&
+      (ssm_params.cov_method == SMParams::CENSI ||
+       nssm_params.cov_method == SMParams::CENSI)) {
     const std::string em = icp.error_minimizer_name();
     if (em.find("PointToPoint") == std::string::npos)
       throw std::invalid_argument(
@@ -137,6 +144,15 @@ void Slam::configure()
         "'. Use cov_method 'sampled', or configure "
         "PointToPointErrorMinimizer in icp_config.");
   }
+  if (constrained_3d &&
+      (!(constrained_icp_params.max_correspondence > 0.0f) ||
+       !(constrained_icp_params.trim_ratio > 0.0 &&
+         constrained_icp_params.trim_ratio <= 1.0) ||
+       constrained_icp_params.max_iterations < 1 ||
+       constrained_icp_params.min_correspondences < 3 ||
+       !(constrained_icp_params.translation_epsilon >= 0.0) ||
+       !(constrained_icp_params.rotation_epsilon >= 0.0)))
+    throw std::invalid_argument("invalid constrained_3d ICP parameters");
   if (nssm_params.cov_samples > 0 &&
       nssm_params.cov_samples >= nssm_params.init_n * nssm_params.init_iters)
     throw std::invalid_argument(
@@ -230,22 +246,33 @@ Matrix Slam::get_points(const std::vector<int>& frames, int ref_key) const
 {
   const bool use_ref = ref_key >= 0;
   gtsam::Pose2 ref_pose;
-  if (use_ref) ref_pose = keyframes[ref_key]->pose;
+  gtsam::Pose3 ref_pose3;
+  if (use_ref) {
+    ref_pose = keyframes[ref_key]->pose;
+    ref_pose3 = keyframes[ref_key]->horizon_pose3();
+  }
 
   long total = 0;
   for (int key : frames) total += keyframes[key]->points.rows();
-  Matrix all_points(total, 2);
+  const int dimensions = constrained_3d ? 3 : 2;
+  Matrix all_points(total, dimensions);
 
   long at = 0;
   for (int key : frames) {
     if (use_ref) {
-      const gtsam::Pose2 transf_pose = ref_pose.between(keyframes[key]->pose);
-      const Matrix transf = Keyframe::transform_points(keyframes[key]->points, transf_pose);
+      const Matrix transf = constrained_3d
+        ? Keyframe::transform_points(
+            keyframes[key]->points,
+            ref_pose3.between(keyframes[key]->horizon_pose3()))
+        : Keyframe::transform_points(
+            keyframes[key]->points.leftCols(2),
+            ref_pose.between(keyframes[key]->pose));
       all_points.middleRows(at, transf.rows()) = transf;
       at += transf.rows();
     } else {
       const Matrix& transf = keyframes[key]->transf_points;  // reference, no copy
-      all_points.middleRows(at, transf.rows()) = transf;
+      all_points.middleRows(at, transf.rows()) =
+        constrained_3d ? transf : transf.leftCols(2);
       at += transf.rows();
     }
   }
@@ -258,13 +285,15 @@ std::pair<Matrix, std::vector<int>> Slam::get_points_with_keys(
 {
   long total = 0;
   for (int key : frames) total += keyframes[key]->points.rows();
-  Matrix all_points(total, 2);
+  const int dimensions = constrained_3d ? 3 : 2;
+  Matrix all_points(total, dimensions);
   Matrix all_keys(total, 1);
 
   long at = 0;
   for (int key : frames) {
     const Matrix& transf = keyframes[key]->transf_points;
-    all_points.middleRows(at, transf.rows()) = transf;
+    all_points.middleRows(at, transf.rows()) =
+      constrained_3d ? transf : transf.leftCols(2);
     all_keys.middleRows(at, transf.rows()).setConstant(static_cast<float>(key));
     at += transf.rows();
   }
@@ -285,6 +314,13 @@ std::pair<std::string, gtsam::Pose2> Slam::compute_icp(
   const gtsam::Pose2& guess)
 {
   Eigen::Matrix3f g = guess.matrix().cast<float>();
+  if (constrained_3d) {
+    const ConstrainedIcpResult result = constrained_icp_xyz(
+      source_points, target_points, g, constrained_icp_params);
+    const double x = result.T(0, 2), y = result.T(1, 2);
+    const double theta = std::atan2(result.T(1, 0), result.T(0, 0));
+    return {result.message, gtsam::Pose2(x, y, theta)};
+  }
   auto [message, T] = icp.compute(source_points, target_points, g);
   const double x = T(0, 2), y = T(1, 2);
   const double theta = std::atan2(T(1, 0), T(0, 0));
@@ -307,20 +343,29 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
     std::vector<Eigen::Matrix3f> gm(guesses.size());
     for (std::size_t i = 0; i < guesses.size(); ++i)
       gm[i] = guesses[i].matrix().cast<float>();
-    const auto batch = icp.compute_batch(source_points, target_points, gm, 2000);
-    for (const auto& r : batch) {
-      if (!r.success) continue;
-      sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
-                                     std::atan2(r.T(1, 0), r.T(0, 0)));
+    if (constrained_3d) {
+      const auto batch = constrained_icp_xyz_batch(
+        source_points, target_points, gm, constrained_icp_params, 2000);
+      for (const auto& r : batch) {
+        if (!r.success) continue;
+        sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
+                                       std::atan2(r.T(1, 0), r.T(0, 0)));
+      }
+    } else {
+      const auto batch = icp.compute_batch(source_points, target_points, gm, 2000);
+      for (const auto& r : batch) {
+        if (!r.success) continue;
+        sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
+                                       std::atan2(r.T(1, 0), r.T(0, 0)));
+      }
     }
   } else {
     const auto start = std::chrono::steady_clock::now();
     for (const auto& g : guesses) {
-      Eigen::Matrix3f gm = g.matrix().cast<float>();
-      auto [message, T] = icp.compute(source_points, target_points, gm);
+      const auto [message, odom] =
+        compute_icp(source_points, target_points, g);
       if (message == "success") {
-        sample_transforms.emplace_back(T(0, 2), T(1, 2),
-                                       std::atan2(T(1, 0), T(0, 0)));
+        sample_transforms.emplace_back(odom.x(), odom.y(), odom.theta());
       }
       // enforce a max run time for this loop (slam.py: 2 s)
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -404,7 +449,11 @@ int Slam::get_overlap(const Matrix& source_points, const Matrix& target_points,
   }
   const Matrix& src = *src_ptr;
 
-  auto [ids, dists] = match(target_points.leftCols(2), src.leftCols(2), 1,
+  const Matrix target_match = constrained_3d
+    ? target_points : Matrix(target_points.leftCols(2));
+  const Matrix source_match = constrained_3d
+    ? src : Matrix(src.leftCols(2));
+  auto [ids, dists] = match(target_match, source_match, 1,
                             static_cast<float>(point_noise));
   int count = 0;
   if (indices_out) indices_out->resize(ids.cols());
@@ -430,10 +479,19 @@ bool Slam::is_keyframe(const Keyframe& frame) const
   if (duration < keyframe_duration) return false;
 
   const gtsam::Pose2 dr_odom = keyframes.back()->dr_pose.between(frame.dr_pose);
-  const double translation =
-    std::hypot(dr_odom.translation().x(), dr_odom.translation().y());
+  const gtsam::Pose3 dr_odom3 =
+    keyframes.back()->horizon_dr_pose3().between(frame.horizon_dr_pose3());
+  const double translation = constrained_3d
+    ? std::sqrt(dr_odom3.x() * dr_odom3.x() +
+                dr_odom3.y() * dr_odom3.y() +
+                dr_odom3.z() * dr_odom3.z())
+    : std::hypot(dr_odom.translation().x(), dr_odom.translation().y());
   const double rotation = std::abs(dr_odom.theta());
-  return translation > keyframe_translation || rotation > keyframe_rotation;
+  const double head_rotation =
+    std::abs(frame.head_pitch - keyframes.back()->head_pitch);
+  return translation > keyframe_translation || rotation > keyframe_rotation ||
+         (constrained_3d && keyframe_head_rotation > 0.0 &&
+          head_rotation > keyframe_head_rotation);
 }
 
 void Slam::add_prior(const KeyframePtr& keyframe)
@@ -486,8 +544,14 @@ InitializationResult Slam::initialize_sequential_scan_matching(
   ret.source_pose = keyframe->pose;
   ret.target_pose = current_keyframe()->pose;
 
-  // registration is planar: keep the x/y projection, drop the elevation col
-  ret.source_points = keyframe->points.leftCols(2);
+  ret.source_points = constrained_3d
+    ? keyframe->points : Matrix(keyframe->points.leftCols(2));
+  if (constrained_3d && ret.source_points.cols() >= 3) {
+    // Express the source elevations in the target keyframe's pressure-depth
+    // chart.  ICP then solves x/y/yaw only; z is already known.
+    ret.source_points.col(2).array() += static_cast<float>(
+      keyframe->pose3.z() - current_keyframe()->pose3.z());
+  }
   std::vector<int> target_frames;
   for (int k = std::max(0, current_key() - ssm_params.target_frames);
        k < current_key(); ++k)
@@ -812,8 +876,11 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
     const double bearing_bound =
       rotation_std * 5.0 + sonar_horizontal_aperture * 0.5;
 
-    const Matrix local_points =
-      Keyframe::transform_points(target_points_all, pose.inverse());
+    const Matrix local_points = constrained_3d
+      ? Keyframe::transform_points(
+          target_points_all,
+          keyframes[source_frame]->horizon_pose3().inverse())
+      : Keyframe::transform_points(target_points_all, pose.inverse());
     // This runs over the WHOLE accumulated map cloud once per source frame,
     // so the two transcendentals per point dominate the gate. Both are
     // skipped for points a previous source frame already selected, and atan2
@@ -831,7 +898,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
     }
   }
 
-  Matrix target_points(n_sel, 2);
+  Matrix target_points(n_sel, constrained_3d ? 3 : 2);
   std::vector<int> target_keys(n_sel);
   long at = 0;
   for (int i = 0; i < target_points_all.rows(); ++i) {
@@ -947,7 +1014,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   {
     long n_keep = 0;
     for (int k : target_keys) n_keep += revisit_set.count(k);
-    Matrix kept_points(n_keep, 2);
+    Matrix kept_points(n_keep, constrained_3d ? 3 : 2);
     std::vector<int> kept_keys(n_keep);
     long at = 0;
     for (int i = 0; i < target_points.rows(); ++i) {
@@ -976,11 +1043,19 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
   ret.target_key = best_frame;
   ret.target_pose = keyframes[ret.target_key]->pose;
-  ret.target_points =
-    Keyframe::transform_points(target_points, ret.target_pose.inverse());
+  ret.target_points = constrained_3d
+    ? Keyframe::transform_points(
+        target_points, keyframes[ret.target_key]->horizon_pose3().inverse())
+    : Keyframe::transform_points(target_points, ret.target_pose.inverse());
   ret.cov = keyframes[ret.source_key]->cov;
 
-  if (!nssm_params.initialization) return ret;
+  if (!nssm_params.initialization) {
+    if (constrained_3d)
+      ret.source_points.col(2).array() += static_cast<float>(
+        keyframes[ret.source_key]->pose3.z() -
+        keyframes[ret.target_key]->pose3.z());
+    return ret;
+  }
 
   // Bounds from the source-pose uncertainty. slam.py reused `cov` leaked from
   // the fan-selection loop above — the OLDEST source frame's covariance, a
@@ -1033,8 +1108,16 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
   // refine the target key: the frame with maximum overlap against the
   // initialized source points
-  const Matrix estimated_source_points =
-    Keyframe::transform_points(ret.source_points, ret.estimated_source_pose);
+  const Matrix estimated_source_points = constrained_3d
+    ? Keyframe::transform_points(
+        ret.source_points,
+        gtsam::Pose3(
+          gtsam::Rot3::Yaw(ret.estimated_source_pose.theta()),
+          gtsam::Point3(ret.estimated_source_pose.x(),
+                        ret.estimated_source_pose.y(),
+                        keyframes[ret.source_key]->pose3.z())))
+    : Keyframe::transform_points(ret.source_points,
+                                 ret.estimated_source_pose);
   std::vector<int> indices;
   get_overlap(estimated_source_points, target_points, nullptr, &indices);
 
@@ -1056,6 +1139,10 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // aggregate only the fan-selected candidate submap (not the whole map) into
   // the refined target frame — see candidate_frames above.
   ret.target_points = get_points(candidate_frames, ret.target_key);
+  if (constrained_3d)
+    ret.source_points.col(2).array() += static_cast<float>(
+      keyframes[ret.source_key]->pose3.z() -
+      keyframes[ret.target_key]->pose3.z());
 
   return ret;
 }
@@ -1633,8 +1720,29 @@ bool Slam::relocalize(const KeyframePtr& frame)
                   std::to_string(static_cast<int>(need)) + " needed)";
     return false;
   }
-  const gtsam::Pose2 matched = center.compose(
+  gtsam::Pose2 matched = center.compose(
     gtsam::Pose2(init.delta.x(), init.delta.y(), init.delta.theta()));
+
+  if (constrained_3d) {
+    Matrix source_global_depth = frame->points;
+    source_global_depth.col(2).array() +=
+      static_cast<float>(frame->dr_pose3.z());
+    const auto [message, refined] = compute_icp(
+      source_global_depth, target, matched);
+    if (message != "success") {
+      last_error_ = "3-D relocalization refinement failed: " + message;
+      return false;
+    }
+    matched = refined;
+    const int overlap = get_overlap(
+      source_global_depth, target, &matched);
+    if (overlap < need) {
+      last_error_ = "3-D relocalization overlap too low (" +
+                    std::to_string(overlap) + " hits < " +
+                    std::to_string(static_cast<int>(need)) + " needed)";
+      return false;
+    }
+  }
 
   // enter the map at the matched pose: moderate prior (the global init is
   // grid-coarse; SSM/NSSM tighten from here), plus the usual state unary

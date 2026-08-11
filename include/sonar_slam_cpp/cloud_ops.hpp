@@ -29,6 +29,43 @@ std::pair<Eigen::MatrixXi, Matrix> match(const Matrix& mat_ref,
                                          const Matrix& mat_in, int knn,
                                          float max_dist);
 
+// XYZ correspondence / constrained-motion ICP.  Returns still carry a 2-D
+// homogeneous transform because the optimizer is deliberately limited to
+// x/y/yaw: source and target elevations must already share the pressure-depth
+// chart.  Z participates in nearest-neighbour selection and trimming, so
+// returns from different elevations cannot alias merely because their XY
+// projections overlap, but sonar is never allowed to override pressure or
+// the IMU by inventing z/roll/pitch motion.
+struct ConstrainedIcpParams
+{
+  float max_correspondence = 0.75f;
+  double trim_ratio = 0.8;
+  int max_iterations = 40;
+  double translation_epsilon = 0.005;
+  double rotation_epsilon = 0.001;
+  int min_correspondences = 6;
+};
+
+struct ConstrainedIcpResult
+{
+  bool success = false;
+  std::string message;
+  Eigen::Matrix3f T = Eigen::Matrix3f::Identity();
+  int correspondences = 0;
+  int iterations = 0;
+};
+
+ConstrainedIcpResult constrained_icp_xyz(
+  const Matrix& source, const Matrix& target, const Eigen::Matrix3f& guess,
+  const ConstrainedIcpParams& params);
+
+// Deterministic per-guess batch used by sampled covariance.  Results retain
+// input order; guesses which begin after max_ms are returned unsuccessful.
+std::vector<ConstrainedIcpResult> constrained_icp_xyz_batch(
+  const Matrix& source, const Matrix& target,
+  const std::vector<Eigen::Matrix3f>& guesses,
+  const ConstrainedIcpParams& params, int max_ms);
+
 // libpointmatcher ICP wrapper with the same YAML config as the Python stack.
 class ICP
 {

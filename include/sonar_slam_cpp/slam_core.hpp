@@ -37,6 +37,9 @@ public:
   double keyframe_duration = 1.0;
   double keyframe_translation = 3.0;
   double keyframe_rotation = 0.5;
+  // Mechanical head motion creates new 3-D viewing geometry even while the
+  // vehicle is stationary.  <= 0 disables head-angle keyframing.
+  double keyframe_head_rotation = 0.17453292519943295;  // 10 deg
 
   Eigen::Vector3d prior_sigmas = Eigen::Vector3d(0.1, 0.1, 0.01);
   Eigen::Vector3d odom_sigmas = Eigen::Vector3d(0.2, 0.2, 0.02);
@@ -52,6 +55,12 @@ public:
   // only divergence is that the 2 s cap rarely fires, so MCD sees the full
   // sample set.
   bool parallel_cov_samples = true;
+
+  // Tilt-aware front end.  Clouds stay XYZ and are registered with pressure
+  // depth pre-aligned; the optimizer solves only x/y/yaw.  This is constrained
+  // 3-D, not free SE(3): sonar cannot override pressure z or IMU roll/pitch.
+  bool constrained_3d = true;
+  ConstrainedIcpParams constrained_icp_params;
 
   SMParams ssm_params;
   SMParams nssm_params;

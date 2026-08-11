@@ -182,8 +182,9 @@ int main()
           diag["input_mode"].c_str());
     std::printf("[2] sparse ping rejected as evidence\n");
 
-    // [3] head-swept ping: boresight pitched past max_head_pitch -> planar
-    // SLAM skips the scan (head_pitch_rejections), odometry continues
+    // [3] Explicit safety-gate compatibility: this fixture launches with a
+    // positive max_head_pitch, so a larger sweep is skipped while odometry
+    // continues. Production defaults the gate off for constrained 3-D.
     static_tf.sendTransform(make_tf(0.0, "base_link", "sonar0/optical_frame",
                                     0.0, 0.0, M_PI / 2 + 0.6));
     odom_at(102.0, 0.20, 0.0);
