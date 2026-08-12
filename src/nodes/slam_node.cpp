@@ -169,6 +169,7 @@ public:
     slam_.ssm_max_anisotropy = get_double("ssm/max_anisotropy", 8.0);
     slam_.ssm_degeneracy_prefloor =
       get_bool("ssm/degeneracy_prefloor", true);
+    slam_.ssm_max_yaw_vs_dr = get_double("ssm/max_yaw_vs_dr", 0.15);
 
     // Open-water admission happens before keyframe selection, including the
     // first frame. Keep the count at least as strict as SSM so a cloud too
