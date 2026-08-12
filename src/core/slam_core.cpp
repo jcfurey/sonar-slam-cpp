@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -699,18 +700,46 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
   run_scan_match_icp(ret2, ssm_params);
 
   // the transformation compared to dead reckoning can't be too large
+  double delta_translation = std::numeric_limits<double>::quiet_NaN();
+  double delta_rotation = std::numeric_limits<double>::quiet_NaN();
   if (ret2.status) {
     const gtsam::Pose2 delta =
       ret2.initial_transform.between(ret2.estimated_transform);
-    const double delta_translation =
+    delta_translation =
       std::hypot(delta.translation().x(), delta.translation().y());
-    const double delta_rotation = std::abs(delta.theta());
+    delta_rotation = std::abs(delta.theta());
     // inverted comparisons so a NaN delta (degenerate transform) fails closed
     if (!(delta_translation <= ssm_params.max_translation) ||
         !(delta_rotation <= ssm_params.max_rotation)) {
       ret2.status = Status(Status::LARGE_TRANSFORMATION);
       ret2.status.description = "trans " + std::to_string(delta_translation) +
                                 " rot " + std::to_string(delta_rotation);
+    }
+  }
+
+  // Per-link max_rotation alone does not bound the whole sequential chain:
+  // several same-sign corrections just below that threshold can ratchet the
+  // map tens of degrees away from compass-anchored DR. Evaluate the proposed
+  // source pose before inserting its factor. If the target is already outside
+  // the bound (manual/absolute correction), allow a link that holds or heals
+  // the discrepancy but never one that worsens it.
+  if (ret2.status && ssm_max_yaw_vs_dr > 0.0) {
+    const gtsam::Pose2 proposed =
+      ret2.target_pose.compose(ret2.estimated_transform);
+    const double target_yaw_error = std::abs(std::remainder(
+      ret2.target_pose.theta() - keyframes[ret2.target_key]->dr_pose.theta(),
+      2.0 * M_PI));
+    const double source_yaw_error = std::abs(std::remainder(
+      proposed.theta() - keyframe->dr_pose.theta(), 2.0 * M_PI));
+    if (!ssm_yaw_consistent(
+          ret2.target_pose.theta(),
+          keyframes[ret2.target_key]->dr_pose.theta(), proposed.theta(),
+          keyframe->dr_pose.theta(), ssm_max_yaw_vs_dr)) {
+      ret2.status = Status(Status::LARGE_TRANSFORMATION);
+      ret2.status.description =
+        "compass-inconsistent cumulative yaw " +
+        std::to_string(source_yaw_error) + " rad (target was " +
+        std::to_string(target_yaw_error) + ")";
     }
   }
 
@@ -757,6 +786,10 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
   }
 
   if (ret2.status) {
+    if (!ret2.status.description.empty()) ret2.status.description += ", ";
+    ret2.status.description +=
+      "corr trans " + std::to_string(delta_translation) +
+      " rot " + std::to_string(delta_rotation);
     const gtsam::SharedNoiseModel model =
       ret2.has_cov
         ? gtsam::noiseModel::Gaussian::Covariance(embed_planar_cov(ret2.cov))

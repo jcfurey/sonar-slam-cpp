@@ -7,6 +7,7 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 
+#include <cmath>
 #include <deque>
 #include <map>
 #include <optional>
@@ -15,6 +16,21 @@
 #include "sonar_slam_cpp/keyframe.hpp"
 
 namespace sonar_slam {
+
+// A per-link ICP yaw limit cannot stop several same-sign corrections from
+// accumulating into a large map-to-compass error. Keep this rule independent
+// of ICP so its boundary and recovery behavior remain directly testable.
+inline bool ssm_yaw_consistent(double target_yaw, double target_dr_yaw,
+                               double proposed_source_yaw,
+                               double source_dr_yaw, double max_yaw_vs_dr)
+{
+  if (!(max_yaw_vs_dr > 0.0)) return true;
+  const double target_error = std::abs(std::remainder(
+    target_yaw - target_dr_yaw, 2.0 * M_PI));
+  const double source_error = std::abs(std::remainder(
+    proposed_source_yaw - source_dr_yaw, 2.0 * M_PI));
+  return source_error <= max_yaw_vs_dr || source_error <= target_error;
+}
 
 class Slam
 {
@@ -72,6 +88,12 @@ public:
   double ssm_max_sigma = 0.5;
   double ssm_max_anisotropy = 8.0;
   bool ssm_degeneracy_prefloor = true;
+  // Absolute compass guard for the sequential chain. max_rotation limits one
+  // ICP link relative to DR, but repeated same-sign sub-threshold yaw changes
+  // can still ratchet map->odom far from the compass. Reject the first link
+  // that would cross this bound or worsen an already-over-bound map (for
+  // example after an operator correction). 0 disables.
+  double ssm_max_yaw_vs_dr = 0.15;
 
   int pcm_queue_size = 5;
   int min_pcm = 3;

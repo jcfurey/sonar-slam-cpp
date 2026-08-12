@@ -186,7 +186,11 @@ if(BUILD_TESTING)
     ament_index_cpp)
   ament_add_test(test_slam_node
     COMMAND $<TARGET_FILE:test_slam_node>
+    # Keep the synthetic node off the deployed/default DDS domain. Otherwise
+    # a live bag replay feeds thousands of real pings into this process and
+    # turns its admission-count assertions into nondeterministic failures.
     ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
+        ROS_DOMAIN_ID=152
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_icp_wrapper test/icp_wrapper_test.cpp)

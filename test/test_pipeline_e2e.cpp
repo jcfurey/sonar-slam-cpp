@@ -136,6 +136,21 @@ bool feed(Slam& slam, int k, const gtsam::Pose2& truth, const gtsam::Pose2& dr,
 
 int main()
 {
+  // A sequence of individually small ICP rotations must not ratchet the map
+  // away from compass-anchored DR. Once already outside the bound (for
+  // example after an operator correction), holding/healing remains possible
+  // while further divergence fails closed.
+  CHECK(sonar_slam::ssm_yaw_consistent(0.10, 0.0, 0.14, 0.0, 0.15),
+        "yaw guard rejected a proposal inside the absolute bound");
+  CHECK(!sonar_slam::ssm_yaw_consistent(0.10, 0.0, 0.16, 0.0, 0.15),
+        "yaw guard admitted cumulative drift across the absolute bound");
+  CHECK(sonar_slam::ssm_yaw_consistent(0.20, 0.0, 0.19, 0.0, 0.15),
+        "yaw guard prevented recovery from an already-overbound pose");
+  CHECK(!sonar_slam::ssm_yaw_consistent(0.20, 0.0, 0.21, 0.0, 0.15),
+        "yaw guard admitted worsening of an already-overbound pose");
+  CHECK(sonar_slam::ssm_yaw_consistent(0.0, 0.0, M_PI, 0.0, 0.0),
+        "zero should disable the cumulative yaw guard");
+
   // Both sampled-covariance execution modes must honor constrained XYZ ICP.
   // A past regression sent the sequential toggle through legacy planar ICP.
   {

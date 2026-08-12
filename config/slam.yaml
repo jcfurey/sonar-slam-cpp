@@ -87,6 +87,9 @@
       min_points: 50          # the min number of points to try SSM
       max_translation: 3.0    # the max translation allowed
       max_rotation: 0.5235987755982988   # deg(30)
+      # Absolute cumulative map-vs-DR yaw guard. Per-link max_rotation alone
+      # permits same-sign scan-match corrections to ratchet the map.
+      max_yaw_vs_dr: 0.15
       target_frames: 3        # the number of frames we compare the current frame to
       # Sequential neighbors should share a meaningful fraction of the scan.
       # This complements the absolute count and rejects accidental overlap in
