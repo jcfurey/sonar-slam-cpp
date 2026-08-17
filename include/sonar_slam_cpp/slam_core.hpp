@@ -32,6 +32,12 @@ inline bool ssm_yaw_consistent(double target_yaw, double target_dr_yaw,
   return source_error <= max_yaw_vs_dr || source_error <= target_error;
 }
 
+inline bool post_loop_yaw_consistent(double yaw_rms,
+                                     double max_yaw_rms)
+{
+  return !(max_yaw_rms > 0.0) || yaw_rms <= max_yaw_rms;
+}
+
 class Slam
 {
 public:
@@ -88,12 +94,10 @@ public:
   double ssm_max_sigma = 0.5;
   double ssm_max_anisotropy = 8.0;
   bool ssm_degeneracy_prefloor = true;
-  // Absolute compass guard for the sequential chain. max_rotation limits one
-  // ICP link relative to DR, but repeated same-sign sub-threshold yaw changes
-  // can still ratchet map->odom far from the compass. Reject the first link
-  // that would cross this bound or worsen an already-over-bound map (for
-  // example after an operator correction). 0 disables.
-  double ssm_max_yaw_vs_dr = 0.15;
+  // Optional DR-yaw guard for the sequential chain. max_rotation limits one
+  // ICP link relative to DR, while this limits cumulative divergence. It is
+  // disabled where magnetic disturbance makes DR yaw unsuitable as truth.
+  double ssm_max_yaw_vs_dr = 0.0;
 
   int pcm_queue_size = 5;
   int min_pcm = 3;
@@ -101,8 +105,8 @@ public:
   // NSSM degeneracy gate (wall-aliasing closures are self-consistent, so PCM
   // alone cannot reject them): reject a closure whose sampled/Censi
   // translation covariance is too large or too elongated (sliding along a
-  // featureless wall). Pair with a tight nssm/max_rotation — yaw corrections
-  // beyond compass noise are bogus by construction in this anchored frame.
+  // featureless wall). Pair with a bounded nssm/max_rotation to keep ICP from
+  // walking from its sampled seed into a remote rotational alias.
   double nssm_max_sigma = 0.5;       // max sqrt(largest translation eigenvalue), m
   double nssm_max_anisotropy = 8.0;  // max sigma_max / sigma_min
   // Evaluate the degeneracy gate on the PRE-floor covariance (opt-in). The
@@ -124,20 +128,17 @@ public:
   // verification: one Gauss-Newton pass under-converges a large correction,
   // and judging that transient state reverts (and quarantines) genuine loops
   int loop_extra_iterations = 3;
-  // Operator hand-correction trust (x m, y m, yaw rad). Yaw is deliberately
-  // SOFT by default: DR yaw is compass-anchored and the whole post-loop
-  // verification stack assumes it — a hard manual yaw contradicting the
-  // compass would make every later loop round's yaw-RMS check trip
-  // spuriously. Position is where the operator's knowledge is; tighten yaw
-  // only if the compass itself is what is being corrected.
+  // Operator hand-correction trust (x m, y m, yaw rad). Yaw remains soft by
+  // default because a hard manual rotation can fight the sequential graph.
   Eigen::Vector3d manual_correction_sigmas = Eigen::Vector3d(0.2, 0.2, 0.5);
-  // ABSOLUTE yaw gate against the compass (kills discrete rotational
+  // Optional DR-relative yaw gate (kills discrete rotational
   // aliasing — e.g. a near-square pool aliases at 90°, which ICP matches
   // confidently and symmetric pairs pass PCM): the closure's relative yaw
-  // must agree with the compass-anchored DR relative yaw within this bound.
+  // must agree with DR relative yaw within this bound. Disable it when DR yaw
+  // is magnetically disturbed.
   // Neither max_rotation (ICP-vs-Sobol refinement only) nor the covariance
   // gate (catches sliding, not confident-but-wrong locks) covers this mode.
-  double nssm_max_yaw_vs_compass = 0.15;  // rad (~8.6°, > compass noise)
+  double nssm_max_yaw_vs_compass = 0.0;
   // OPTIONAL absolute TRANSLATION gate — the x/y analog of the yaw gate
   // above, for parallel-wall translational aliasing on symmetric venues. When
   // >0, it clamps the Sobol init search and rejects a final ICP relative pose
@@ -145,10 +146,10 @@ public:
   // otherwise walk from a bounded seed into a distant alias basin. Set just
   // above the real revisit-drift scale. 0 disables both checks.
   double nssm_max_translation_vs_dr = 0.0;  // m; 0 disables
-  // optimize-then-verify (rtabmap RGBD/OptimizeMaxError analog): after a
-  // loop-closure insert, the whole graph's optimized-vs-DR yaw RMS must stay
-  // under this bound or the loops are rolled back (see update_factor_graph)
-  double post_loop_max_yaw_rms = 0.15;  // rad
+  // Optional optimize-then-verify yaw check: after a loop-closure insert, the
+  // graph's optimized-vs-DR yaw RMS must stay under this bound or loops are
+  // rolled back. Zero disables it where DR yaw is not ground truth.
+  double post_loop_max_yaw_rms = 0.0;
   // Post-loop CHAIN-TEAR check, in SIGMA of the link's own noise model
   // (rtabmap RGBD/OptimizeMaxError, Graph.cpp computeMaxGraphErrors; its
   // default is 3.0). Parallel-wall translational aliases pass every

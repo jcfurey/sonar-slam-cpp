@@ -169,7 +169,7 @@ public:
     slam_.ssm_max_anisotropy = get_double("ssm/max_anisotropy", 8.0);
     slam_.ssm_degeneracy_prefloor =
       get_bool("ssm/degeneracy_prefloor", true);
-    slam_.ssm_max_yaw_vs_dr = get_double("ssm/max_yaw_vs_dr", 0.15);
+    slam_.ssm_max_yaw_vs_dr = get_double("ssm/max_yaw_vs_dr", 0.0);
 
     // Open-water admission happens before keyframe selection, including the
     // first frame. Keep the count at least as strict as SSM so a cloud too
@@ -241,10 +241,10 @@ public:
     slam_.nssm_max_sigma = get_double("nssm/max_sigma", 0.5);
     slam_.nssm_max_anisotropy = get_double("nssm/max_anisotropy", 8.0);
     slam_.nssm_degeneracy_prefloor = get_bool("nssm/degeneracy_prefloor", false);
-    slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.15);
+    slam_.nssm_max_yaw_vs_compass = get_double("nssm/max_yaw_vs_compass", 0.0);
     slam_.nssm_max_translation_vs_dr =
       get_double("nssm/max_translation_vs_dr", 0.0);
-    slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.15);
+    slam_.post_loop_max_yaw_rms = get_double("post_loop_max_yaw_rms", 0.0);
     slam_.post_loop_max_link_error_sigma =
       get_double("post_loop_max_link_error_sigma", 3.0);
     // The chain-tear bound changed UNITS on 2026-07-25 (metres -> sigma of

@@ -719,7 +719,7 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
 
   // Per-link max_rotation alone does not bound the whole sequential chain:
   // several same-sign corrections just below that threshold can ratchet the
-  // map tens of degrees away from compass-anchored DR. Evaluate the proposed
+  // map tens of degrees away from DR. Evaluate the proposed
   // source pose before inserting its factor. If the target is already outside
   // the bound (manual/absolute correction), allow a link that holds or heals
   // the discrepancy but never one that worsens it.
@@ -1284,21 +1284,17 @@ bool Slam::add_nonsequential_scan_matching()
     }
   }
 
-  // Compass-consistency gate (ABSOLUTE, added 2026-07-15 night after two
-  // accepted closures rotated the map 90°+): discrete rotational aliasing —
-  // a near-square pool aliases at ~90° — produces CONFIDENT wrong locks
-  // (tight isotropic covariance, tiny ICP refinement) and symmetric pairs
-  // that agree with each other, so every relative gate below passes. The
-  // compass cannot be aliased: both keyframes' DR yaws are compass-anchored
-  // and drift-free, so the closure's measured relative yaw must match the
-  // DR relative yaw within compass noise.
+  // Optional DR-yaw consistency gate. This was added after discrete rotational
+  // aliasing in a near-square pool produced confident wrong locks. Field work
+  // around steel subsequently showed that the compass-backed DR yaw can jump,
+  // so zero now explicitly disables this gate. Geometric covariance, overlap,
+  // PCM, and chain-tear checks remain active when it is disabled.
   //
   // Deliberately reads dr_pose directly rather than going through
-  // predicted_relative_pose: compass-anchored yaw is ABSOLUTE, so it is the
-  // one DR quantity that survives a map-load epoch change intact, and the
-  // graph yaw this gate is meant to police must never become its own
-  // reference. Only translation needs the cross-session treatment above.
-  if (ret2.status) {
+  // predicted_relative_pose because this optional check compares against the
+  // DR yaw source itself, not the graph. It is disabled in the deployed
+  // steel-structure configuration.
+  if (ret2.status && nssm_max_yaw_vs_compass > 0.0) {
     const double dr_rel_yaw = keyframes[ret2.target_key]
                                 ->dr_pose.between(keyframes[ret2.source_key]->dr_pose)
                                 .theta();
@@ -1318,8 +1314,8 @@ bool Slam::add_nonsequential_scan_matching()
   // RMS yaw correction — why NSSM was turned off). Sliding along featureless
   // structure shows up as an elongated translation covariance in the
   // sampled/Censi estimate, so reject closures whose covariance is too large
-  // or too anisotropic. The yaw half of the gate is nssm/max_rotation,
-  // tightened in slam.yaml to the compass-anchored bound.
+  // or too anisotropic. nssm/max_rotation separately bounds how far ICP may
+  // refine away from its initialization.
   if (ret2.status && ret2.has_cov) {
     // Gate on the pre-floor covariance when enabled: the per-eigenvalue floor in
     // compute_icp_with_cov otherwise caps the observable anisotropy and lets
@@ -1721,8 +1717,9 @@ bool Slam::relocalize(const KeyframePtr& frame)
     return false;
   }
 
-  // search the whole map footprint; yaw stays near the compass-anchored DR
-  // yaw (both sessions share the compass, so the map yaw offset is small)
+  // Search the whole map footprint. Yaw stays near DR as a finite search
+  // prior; the deployed EKF now propagates that yaw primarily from A50 gyro
+  // deltas and gives magnetic heading only weak, innovation-gated authority.
   float min_x = 1e30f, max_x = -1e30f, min_y = 1e30f, max_y = -1e30f;
   for (long r = 0; r < target.rows(); ++r) {
     min_x = std::min(min_x, target(r, 0));
@@ -1734,7 +1731,7 @@ bool Slam::relocalize(const KeyframePtr& frame)
   // body frame, so a heading-carrying center would rotate the translation
   // search box with the vehicle and miss parts of an elongated map. With
   // theta = 0 the delta x/y live in world axes and the delta yaw IS the
-  // absolute yaw, bounded around the compass-anchored DR heading.
+  // absolute yaw, bounded around the DR heading prior.
   const gtsam::Pose2 center(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.0);
   const double dr_yaw = frame->dr_pose.theta();
   Eigen::Matrix<double, 3, 2> bounds;
@@ -1938,14 +1935,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   gtsam::Pose3 pose;
   if (!new_poses.empty()) pose = new_poses.back();
 
-  // rtabmap-style optimize-then-verify (RGBD/OptimizeMaxError analog, using
-  // the reference rtabmap doesn't have — an absolute compass): when this
-  // round inserted loop closures, check the WHOLE graph's optimized yaws
-  // against the compass-anchored DR yaws. A closure that fooled every
-  // per-closure gate (confident rotational alias) still has to bend the
-  // trajectory away from the compass to win — the historical "21 deg RMS
-  // yaw correction" diagnostic, automated. On failure the loops are rolled
-  // back and the estimator rebuilt without them.
+  // Optional rtabmap-style optimize-then-verify yaw check. It is retained for
+  // deployments with an independently trustworthy DR yaw reference, but zero
+  // disables it around steel. The geometric chain-tear check below remains
+  // active independently.
   if (!pending_loops_.empty()) {
     // WINDOWED max-RMS: a fold bends a LOCAL run of keyframes, and a global
     // RMS dilutes as ~1/sqrt(N) with mission length until any localized fold
@@ -2035,10 +2028,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
         }
       }
     }
-    const bool yaw_bad = rms > post_loop_max_yaw_rms;
+    const bool yaw_bad = !post_loop_yaw_consistent(rms, post_loop_max_yaw_rms);
     if (yaw_bad || tear_bad) {
       last_error_ = yaw_bad
-        ? ("post-loop compass check failed: optimized-vs-DR windowed yaw RMS " +
+        ? ("post-loop DR-yaw check failed: optimized-vs-DR windowed yaw RMS " +
            std::to_string(rms) + " rad > " +
            std::to_string(post_loop_max_yaw_rms))
         : ("post-loop chain-tear check failed: this round pulled a consecutive "
