@@ -87,9 +87,8 @@
       min_points: 50          # the min number of points to try SSM
       max_translation: 3.0    # the max translation allowed
       max_rotation: 0.5235987755982988   # deg(30)
-      # Absolute cumulative map-vs-DR yaw guard. Per-link max_rotation alone
-      # permits same-sign scan-match corrections to ratchet the map.
-      max_yaw_vs_dr: 0.15
+      # Disabled by default: DR yaw may be magnetically disturbed.
+      max_yaw_vs_dr: 0.0
       target_frames: 3        # the number of frames we compare the current frame to
       # Sequential neighbors should share a meaningful fraction of the scan.
       # This complements the absolute count and rejects accidental overlap in
@@ -188,9 +187,8 @@
       # it is legal, just means tuning min_st_sep for doubling will do nothing.
       # Raise min_st_sep above this value to make it bind again.
       min_revisit_sep: 10
-      # absolute compass gate AND (fix 3a) the clamp on the global-init yaw
-      # search window — candidates beyond this band can only be rejected
-      max_yaw_vs_compass: 0.15   # rad (~8.6 deg, above compass noise)
+      # Disabled by default: magnetic heading is not geometric ground truth.
+      max_yaw_vs_compass: 0.0
       # translational analog of the compass gate, for parallel-wall aliasing
       # on symmetric venues: bounds the global-init x/y window AND rejects a
       # final ICP result further than this from the predicted relative pose
@@ -216,10 +214,8 @@
     pcm_queue_size: 5         # the sliding window size for PCM
     min_pcm: 2                # the min number of pairwise consistent loop closures
 
-    # optimize-then-verify: revert the round when the optimized graph bends
-    # away from the compass-anchored DR (worst sliding-window yaw RMS) or
-    # tears a consecutive keyframe link vs its DR link (0 disables)
-    post_loop_max_yaw_rms: 0.15        # rad
+    # Magnetic-yaw verification is disabled; chain-tear remains active.
+    post_loop_max_yaw_rms: 0.0
     post_loop_max_link_error_sigma: 3.0 # sigma of the link's own noise model (rtabmap RGBD/OptimizeMaxError)
     # extra ISAM2 iterations after inserting loop factors, BEFORE the checks
     # above judge the graph (one Gauss-Newton pass under-converges a large
@@ -234,9 +230,8 @@
     # undo service /bruce/slam/slam/undo_manual_correction, which pops the most recent
     # manual prior and relaxes the trajectory back).
     manual_correction_topic: /initialpose
-    # operator trust [x m, y m, yaw rad]. Yaw is deliberately SOFT: DR yaw is
-    # compass-anchored and the post-loop verification assumes it — tighten
-    # yaw only if the compass itself is what is being corrected.
+    # operator trust [x m, y m, yaw rad]. Yaw is deliberately soft so a manual
+    # rotation does not over-constrain the sequential graph.
     manual_correction_sigmas: [0.2, 0.2, 0.5]
 
     # ---- map persistence (multi-session) ----

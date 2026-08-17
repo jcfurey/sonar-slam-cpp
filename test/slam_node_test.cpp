@@ -44,7 +44,7 @@ sensor_msgs::msg::PointCloud2 make_cloud_msg(double stamp_s, int n_points,
   msg.header.stamp.sec = static_cast<int32_t>(stamp_s);
   msg.header.stamp.nanosec =
     static_cast<uint32_t>((stamp_s - static_cast<int32_t>(stamp_s)) * 1e9);
-  msg.header.frame_id = "sonar0/optical_frame";
+  msg.header.frame_id = "sonar0/projection_frame";
   msg.height = 1;
   msg.width = n_points;
   msg.is_bigendian = false;
@@ -138,7 +138,7 @@ int main()
 
     // optical mount: +90 deg about y (level boresight)
     static_tf.sendTransform(
-      make_tf(0.0, "base_link", "sonar0/optical_frame", 0.0, 0.0, M_PI / 2));
+      make_tf(0.0, "base_link", "sonar0/projection_frame", 0.0, 0.0, M_PI / 2));
 
     auto spin_for = [&](double seconds) {
       const auto deadline = std::chrono::steady_clock::now() +
@@ -185,7 +185,7 @@ int main()
     // [3] Explicit safety-gate compatibility: this fixture launches with a
     // positive max_head_pitch, so a larger sweep is skipped while odometry
     // continues. Production defaults the gate off for constrained 3-D.
-    static_tf.sendTransform(make_tf(0.0, "base_link", "sonar0/optical_frame",
+    static_tf.sendTransform(make_tf(0.0, "base_link", "sonar0/projection_frame",
                                     0.0, 0.0, M_PI / 2 + 0.6));
     odom_at(102.0, 0.20, 0.0);
     odom_at(102.2, 0.22, 0.0);
@@ -196,7 +196,7 @@ int main()
           "swept head not rejected (pitch=%lld)",
           diag_int("head_pitch_rejections"));
     static_tf.sendTransform(
-      make_tf(0.0, "base_link", "sonar0/optical_frame", 0.0, 0.0, M_PI / 2));
+      make_tf(0.0, "base_link", "sonar0/projection_frame", 0.0, 0.0, M_PI / 2));
     std::printf("[3] head-swept scan skipped\n");
 
     // [4] DR yaw spike: 40 deg step in 100 ms -> ping dropped by the yaw

@@ -150,6 +150,10 @@ int main()
         "yaw guard admitted worsening of an already-overbound pose");
   CHECK(sonar_slam::ssm_yaw_consistent(0.0, 0.0, M_PI, 0.0, 0.0),
         "zero should disable the cumulative yaw guard");
+  CHECK(sonar_slam::post_loop_yaw_consistent(0.5, 0.0),
+        "zero should disable the post-loop yaw guard");
+  CHECK(!sonar_slam::post_loop_yaw_consistent(0.16, 0.15),
+        "enabled post-loop yaw guard admitted an over-bound RMS");
 
   // Both sampled-covariance execution modes must honor constrained XYZ ICP.
   // A past regression sent the sequential toggle through legacy planar ICP.
