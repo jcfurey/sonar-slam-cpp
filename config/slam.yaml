@@ -46,6 +46,7 @@
     odom_frame: odom
     base_frame: base_link
     tf_lookup_timeout: 0.05
+    tf_buffer_duration: 10.0
     # Optional emergency/operator gate. <= 0 admits every angle into the
     # constrained-3D front end (the default).
     max_head_pitch: 0.0
