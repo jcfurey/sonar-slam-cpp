@@ -319,7 +319,11 @@ public:
     // spinning scan, so per-point "deskew" is fictitious. Resolve both the
     // sensor extrinsic and odom pose at the cloud's acquisition stamp instead
     // of pairing it to a nearest odometry message with a 0.5 s slop.
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    const double tf_buffer_duration = get_double("tf_buffer_duration", 10.0);
+    if (!std::isfinite(tf_buffer_duration) || tf_buffer_duration <= 0.0)
+      throw std::invalid_argument("tf_buffer_duration must be finite and positive");
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(
+      get_clock(), tf2::durationFromSec(tf_buffer_duration));
     tf_listener_ =
       std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this, true);
     points_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(

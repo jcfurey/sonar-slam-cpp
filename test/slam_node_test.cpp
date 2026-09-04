@@ -114,7 +114,8 @@ int main()
                     "-p", "nssm.enable:=false",
                     "-p", "dr.max_yaw_rate:=1.5",
                     "-p", "max_head_pitch:=0.52",
-                    "-p", "tf_lookup_timeout:=0.05"});
+                    "-p", "tf_lookup_timeout:=0.05",
+                    "-p", "tf_buffer_duration:=120.0"});
     auto node = std::make_shared<sonar_slam::SlamNode>(opts);
     auto pub_node = rclcpp::Node::make_shared("slam_harness");
     auto points_pub = pub_node->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -236,8 +237,8 @@ int main()
           diag_int("keyframes"));
     const long long adm_before_rewind = diag_int("admitted_scans");
 
-    // Rewound stamps must stay inside the odom buffer's 10 s tf2 cache
-    // (newest sample 103.8 -> prune horizon 93.8). The DR yaw gate must NOT
+    // Rewound stamps stay inside even the live 10 s tf2 cache (this test
+    // uses the longer replay cache). The DR yaw gate must NOT
     // swallow this ping: on a backward stamp it drops its baseline instead
     // of rejecting, so the rewound ping reaches the session-reset check.
     odom_at(94.9, 0.0, 0.0);
@@ -275,6 +276,22 @@ int main()
           "traj latch stamp %d != rewound session start",
           latched.header.stamp.sec);
     std::printf("[6] rewind reset: session cleared, latches refreshed\n");
+
+    // [7] accelerated replay can put /tf twenty seconds ahead of a queued
+    // cloud. The replay cache must preserve its exact odometry sample.
+    const auto tf_before_backlog = diag_int("exact_tf_failures");
+    const auto admitted_before_backlog = diag_int("admitted_scans");
+    odom_at(104.9, 0.1, 0.0);
+    odom_at(105.1, 0.1, 0.0);
+    odom_at(125.0, 0.1, 0.0);
+    spin_for(0.2);
+    points_pub->publish(make_cloud_msg(105.0, 120, 2.0));
+    spin_for(1.4);
+    CHECK(diag_int("exact_tf_failures") == tf_before_backlog,
+          "replay backlog lost the historical odometry transform");
+    CHECK(diag_int("admitted_scans") == admitted_before_backlog + 1,
+          "backlogged sonar ping was not admitted");
+    std::printf("[7] replay backlog retains exact-stamp TF\n");
 
     rc = 0;
     std::printf("PASS\n");
