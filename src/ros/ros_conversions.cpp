@@ -1,9 +1,9 @@
 #include "sonar_slam_cpp/ros_conversions.hpp"
 
-#include <sensor_msgs/point_cloud2_iterator.hpp>
-
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <limits>
 
 namespace sonar_slam {
 
@@ -95,29 +95,48 @@ sensor_msgs::msg::PointCloud2 make_cloud(const std::vector<std::string>& fields,
 
 Matrix cloud_to_xyz(const sensor_msgs::msg::PointCloud2& msg)
 {
-  // Validate BEFORE iterating: PointCloud2ConstIterator throws on a missing
-  // field (escaping the subscription callback aborts the node) and silently
-  // reinterprets a non-FLOAT32 one. A malformed cloud degrades to "no
-  // points" — the caller treats that as an odometry-only frame.
-  for (const char* name : {"x", "y", "z"}) {
-    bool ok = false;
+  // Reject inconsistent metadata before allocating or touching the payload.
+  // A malformed cloud is an odometry-only frame, like an empty detection.
+  if (msg.width == 0 || msg.height == 0 || msg.point_step < sizeof(float))
+    return Matrix(0, 3);
+  const std::uint64_t row_bytes = std::uint64_t(msg.width) * msg.point_step;
+  const std::uint64_t payload_bytes = std::uint64_t(msg.height) * msg.row_step;
+  const std::uint64_t n = std::uint64_t(msg.width) * msg.height;
+  if (row_bytes > msg.row_step || payload_bytes > msg.data.size() ||
+      n > std::uint64_t(std::numeric_limits<Eigen::Index>::max()) / 3)
+    return Matrix(0, 3);
+
+  std::array<std::uint32_t, 3> offsets{};
+  const std::array<const char*, 3> names{{"x", "y", "z"}};
+  for (std::size_t c = 0; c < names.size(); ++c) {
+    bool found = false;
     for (const auto& f : msg.fields)
-      if (f.name == name &&
-          f.datatype == sensor_msgs::msg::PointField::FLOAT32) {
-        ok = true;
-        break;
+      if (f.name == names[c]) {
+        if (found || f.datatype != sensor_msgs::msg::PointField::FLOAT32 ||
+            f.count != 1 || f.offset > msg.point_step - sizeof(float))
+          return Matrix(0, 3);
+        offsets[c] = f.offset;
+        found = true;
       }
-    if (!ok) return Matrix(0, 3);
+    if (!found) return Matrix(0, 3);
   }
-  const long n = static_cast<long>(msg.width) * msg.height;
-  Matrix out(n, 3);
-  sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
-  sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
-  sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
-  for (long i = 0; i < n; ++i, ++it_x, ++it_y, ++it_z) {
-    out(i, 0) = *it_x;
-    out(i, 1) = *it_y;
-    out(i, 2) = *it_z;
+
+  Matrix out(static_cast<Eigen::Index>(n), 3);
+  for (std::uint32_t r = 0; r < msg.height; ++r) {
+    for (std::uint32_t p = 0; p < msg.width; ++p) {
+      const auto* point = msg.data.data() + std::size_t(r) * msg.row_step +
+                          std::size_t(p) * msg.point_step;
+      for (std::size_t c = 0; c < offsets.size(); ++c) {
+        const auto* bytes = point + offsets[c];
+        std::uint32_t bits = 0;
+        for (int b = 0; b < 4; ++b)
+          bits |= std::uint32_t(bytes[b]) <<
+                  (8 * (msg.is_bigendian ? 3 - b : b));
+        float value;
+        std::memcpy(&value, &bits, sizeof value);
+        out(Eigen::Index(r) * msg.width + p, c) = value;
+      }
+    }
   }
   return out;
 }

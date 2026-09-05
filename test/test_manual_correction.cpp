@@ -12,6 +12,7 @@
 //  6. ordinary keyframe rounds keep succeeding after each step.
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 #include "sonar_slam_cpp/slam_core.hpp"
 
@@ -72,6 +73,19 @@ int main()
     CHECK(add_keyframe(slam, k, k), "keyframe %d update failed: %s", k,
           slam.last_error().c_str());
   const gtsam::Pose2 before = slam.current_keyframe()->pose;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  CHECK(!slam.add_manual_correction(gtsam::Pose2(nan, 0.0, 0.0)),
+        "non-finite operator correction was accepted");
+  CHECK(!slam.add_position_prior(9, nan, 0.0, 0.2),
+        "non-finite position fix was accepted");
+  for (double sigma : {0.0, -0.1, nan, inf})
+    CHECK(!slam.add_position_prior(9, 9.0, 0.0, sigma),
+          "invalid position sigma was accepted");
+  CHECK(slam.position_priors_applied == 0 &&
+          slam.manual_corrections_pending() == 0 &&
+          slam.current_keyframe()->pose.equals(before, 1e-12),
+        "invalid priors changed graph state");
   std::printf("[1] chain built: kf9 at (%.3f, %.3f, %.3f)\n", before.x(),
               before.y(), before.theta());
 

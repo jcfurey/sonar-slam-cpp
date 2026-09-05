@@ -29,6 +29,13 @@ inline IcpObservability assess_icp_observability(
   const Eigen::Matrix3d& cov, double max_sigma, double max_anisotropy)
 {
   IcpObservability out;
+  // Translation-only thresholds still require a valid FULL covariance:
+  // bad yaw/cross terms otherwise reach GTSAM despite passing the XY gate.
+  if (!cov.allFinite() || !cov.isApprox(cov.transpose(), 1e-9)) return out;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> full(cov);
+  if (full.info() != Eigen::Success ||
+      full.eigenvalues().minCoeff() < -1e-12 * std::max(1.0, cov.norm()))
+    return out;
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(
     cov.topLeftCorner<2, 2>());
   // A failed eigensolve leaves the eigenvalues unspecified — they can be

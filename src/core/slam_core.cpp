@@ -115,6 +115,26 @@ Slam::Slam() : isam_(make_isam2_params())
 
 void Slam::configure()
 {
+  const auto valid_sigmas = [](const Eigen::Vector3d& sigmas) {
+    return sigmas.allFinite() && (sigmas.array() > 0.0).all();
+  };
+  if (!valid_sigmas(prior_sigmas) || !valid_sigmas(odom_sigmas) ||
+      !valid_sigmas(icp_odom_sigmas) || !valid_sigmas(manual_correction_sigmas))
+    throw std::invalid_argument("pose noise sigmas must be finite and positive");
+  if (!std::isfinite(point_noise) || point_noise <= 0.0 ||
+      !std::isfinite(point_resolution) || point_resolution <= 0.0)
+    throw std::invalid_argument("point_noise and point_resolution must be finite and positive");
+  const auto validate_sampling = [](const SMParams& p, const char* name) {
+    if (p.cov_samples < 0 || p.init_n < 1 || p.init_iters < 1 ||
+        p.init_n > std::numeric_limits<int>::max() / p.init_iters ||
+        !std::isfinite(p.init_ftol) || p.init_ftol < 0.0)
+      throw std::invalid_argument(std::string(name) + " has invalid initialization parameters");
+    if (p.enable && p.initialization && p.cov_method == SMParams::SAMPLED &&
+        p.cov_samples > 0 && p.cov_samples < 5)
+      throw std::invalid_argument(std::string(name) + " sampled covariance needs cov_samples >= 5");
+  };
+  validate_sampling(ssm_params, "ssm");
+  validate_sampling(nssm_params, "nssm");
   // config sanity (slam.py used asserts; these must also fire in NDEBUG
   // builds — the default build type disables assert())
   // The Censi helper builds a point-to-point J'J Hessian and does not consume
@@ -172,13 +192,12 @@ void Slam::configure()
   // covariance unavailable" — an all-odometry graph that still burns the full
   // global-init + ICP compute per keyframe, distinguishable from a healthy
   // run only by reading the reject counters. Refuse to start instead.
-  if (ssm_params.enable && ssm_require_covariance && ssm_params.cov_samples <= 0)
+  if (ssm_params.enable && ssm_require_covariance &&
+      (!ssm_params.initialization || ssm_params.cov_samples <= 0))
     throw std::invalid_argument(
-      "ssm/require_covariance needs ssm/cov_samples > 0: no covariance is "
-      "estimated at cov_samples 0, so every sequential scan match would be "
-      "rejected as 'covariance unavailable' and the graph would silently "
-      "degrade to odometry-only. Set ssm/cov_samples (e.g. 30, matching "
-      "nssm), or set ssm/require_covariance: false.");
+      "ssm/require_covariance needs ssm/initialization enabled and "
+      "ssm/cov_samples > 0; otherwise every sequential scan match is "
+      "rejected as 'covariance unavailable'");
   // 6D lifts of the configured planar sigmas (see the chart note above):
   // prior/odometry constrain chart roll/pitch (0) and depth (absolute for the
   // prior, DR delta for odometry); ICP factors are wide in everything the
@@ -381,8 +400,14 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   }
 
   Eigen::MatrixXd samples(sample_transforms.size(), 3);
-  for (std::size_t i = 0; i < sample_transforms.size(); ++i)
+  const double yaw_reference = sample_transforms.front()[2];
+  for (std::size_t i = 0; i < sample_transforms.size(); ++i) {
     samples.row(i) = sample_transforms[i];
+    // MCD uses Euclidean differences. Put all yaw samples in one local
+    // chart so +pi/-pi neighbors cannot average to a spurious zero heading.
+    samples(i, 2) = yaw_reference +
+      std::remainder(sample_transforms[i][2] - yaw_reference, 2.0 * M_PI);
+  }
 
   // robust covariance — outliers are frequent (slam.py uses MinCovDet)
   const McdResult mcd = min_cov_det(samples, 0.8);
@@ -1437,6 +1462,11 @@ std::string Slam::nssm_reject_summary() const
 bool Slam::add_manual_correction(const gtsam::Pose2& map_pose)
 {
   if (keyframes.empty()) return false;
+  if (!std::isfinite(map_pose.x()) || !std::isfinite(map_pose.y()) ||
+      !std::isfinite(map_pose.theta())) {
+    last_error_ = "manual correction must be a finite planar pose";
+    return false;
+  }
   const int key = current_key() - 1;
   // planar prior lifted into the horizon chart: roll/pitch/z stay wide (the
   // per-keyframe unary owns them; z target = current z so the wide prior is
@@ -1512,12 +1542,19 @@ void put_pose3(std::ofstream& f, const gtsam::Pose3& p)
   f.write(reinterpret_cast<const char*>(d), sizeof d);
 }
 
-gtsam::Pose3 get_pose3(std::ifstream& f)
+bool get_pose3(std::ifstream& f, gtsam::Pose3& pose)
 {
-  double d[7];
-  f.read(reinterpret_cast<char*>(d), sizeof d);
-  return gtsam::Pose3(gtsam::Rot3::Quaternion(d[0], d[1], d[2], d[3]),
+  double d[7]{};
+  if (!f.read(reinterpret_cast<char*>(d), sizeof d)) return false;
+  for (double value : d)
+    if (!std::isfinite(value)) return false;
+  Eigen::Quaterniond q(d[0], d[1], d[2], d[3]);
+  const double norm = q.norm();
+  if (!std::isfinite(norm) || std::abs(norm - 1.0) > 1e-3) return false;
+  q.normalize();
+  pose = gtsam::Pose3(gtsam::Rot3::Quaternion(q.w(), q.x(), q.y(), q.z()),
                       gtsam::Point3(d[4], d[5], d[6]));
+  return true;
 }
 
 }  // namespace
@@ -1605,30 +1642,56 @@ bool Slam::load_map(const std::string& path)
     return false;
   }
   constexpr std::uint32_t kMaxKeyframes = 1000000;
-  if (n > kMaxKeyframes) {
+  if (n == 0 || n > kMaxKeyframes) {
     last_error_ = "map header claims an implausible keyframe count";
     return false;
   }
 
+  // Bound counts by the actual file before allocating clouds. The fixed
+  // portion of each record is stamp + two Pose3s + Pose2 + point count.
+  f.seekg(0, std::ios::end);
+  const auto file_end = f.tellg();
+  constexpr std::streamoff kRecordBytes = 8 + 2 * 7 * 8 + 3 * 8 + 8;
+  if (file_end < std::streampos(16) ||
+      (file_end - std::streampos(16)) / kRecordBytes < n) {
+    last_error_ = "truncated map keyframe records";
+    return false;
+  }
+  f.seekg(16);
+
   gtsam::NonlinearFactorGraph g;
   gtsam::Values v;
+  std::vector<KeyframePtr> loaded;
+  loaded.reserve(n);
   for (std::uint32_t k = 0; k < n; ++k) {
     std::int64_t stamp_ns = 0, rows = 0;
     f.read(reinterpret_cast<char*>(&stamp_ns), 8);
-    const gtsam::Pose3 dr = get_pose3(f);
-    const gtsam::Pose3 p3 = get_pose3(f);
-    double p2[3];
+    gtsam::Pose3 dr, p3;
+    if (!get_pose3(f, dr) || !get_pose3(f, p3)) {
+      last_error_ = "truncated/invalid pose at keyframe " + std::to_string(k);
+      return false;
+    }
+    double p2[3]{};
     f.read(reinterpret_cast<char*>(p2), sizeof p2);
     f.read(reinterpret_cast<char*>(&rows), 8);
-    if (!f || rows < 0 || rows > 50000000) {
+    if (!f || rows < 0 || rows > 50000000 ||
+        !std::isfinite(p2[0]) || !std::isfinite(p2[1]) || !std::isfinite(p2[2]) ||
+        rows > (file_end - f.tellg()) / std::streamoff(3 * sizeof(float))) {
       last_error_ = "truncated/corrupt map file at keyframe " +
                     std::to_string(k);
-      keyframes.clear();
+      return false;
+    }
+    std::int64_t seconds = stamp_ns / 1000000000ll;
+    std::int64_t nanos = stamp_ns % 1000000000ll;
+    if (nanos < 0) { --seconds; nanos += 1000000000ll; }
+    if (seconds < std::numeric_limits<std::int32_t>::min() ||
+        seconds > std::numeric_limits<std::int32_t>::max()) {
+      last_error_ = "invalid timestamp at keyframe " + std::to_string(k);
       return false;
     }
     builtin_interfaces::msg::Time t;
-    t.sec = static_cast<std::int32_t>(stamp_ns / 1000000000ll);
-    t.nanosec = static_cast<std::uint32_t>(stamp_ns % 1000000000ll);
+    t.sec = static_cast<std::int32_t>(seconds);
+    t.nanosec = static_cast<std::uint32_t>(nanos);
     auto kf = std::make_shared<Keyframe>(true, t, dr);
     kf->points = Matrix(rows, 3);
     if (rows > 0) {
@@ -1639,18 +1702,21 @@ bool Slam::load_map(const std::string& path)
       // "successfully" with the missing tail as (0,0,0) phantom points
       if (!f) {
         last_error_ = "truncated point payload at keyframe " + std::to_string(k);
-        keyframes.clear();
         return false;
       }
       for (long r = 0; r < rows; ++r)
         for (int c = 0; c < 3; ++c)
           kf->points(r, c) = buf[static_cast<std::size_t>(r) * 3 + c];
     }
+    if (!kf->points.allFinite()) {
+      last_error_ = "non-finite point payload at keyframe " + std::to_string(k);
+      return false;
+    }
     // restore the optimized estimate through the horizon chart (yaw-only
     // rotation, saved z); roll/pitch ride from the saved DR pose
     kf->update(gtsam::Pose3(gtsam::Rot3::Yaw(p2[2]),
                             gtsam::Point3(p2[0], p2[1], p3.z())));
-    keyframes.push_back(kf);
+    loaded.push_back(kf);
 
     // Rebuild an equivalent-strength graph instead of serializing factors:
     // the saved poses are a solved optimum, so an anchored chain of tight
@@ -1663,7 +1729,7 @@ bool Slam::load_map(const std::string& path)
                                              prior_model_));
     } else {
       const gtsam::Pose3 rel =
-        keyframes[k - 1]->horizon_pose3().between(kf->horizon_pose3());
+        loaded[k - 1]->horizon_pose3().between(kf->horizon_pose3());
       g.add(gtsam::BetweenFactor<gtsam::Pose3>(
         X(key - 1), X(key), rel,
         lift_sigmas(icp_odom_sigmas, kSigmaTightRP, kSigmaDepthDelta)));
@@ -1675,7 +1741,6 @@ bool Slam::load_map(const std::string& path)
 
   if (f.peek() != std::ifstream::traits_type::eof()) {
     last_error_ = "trailing data after the last keyframe — corrupt map file";
-    keyframes.clear();
     return false;
   }
 
@@ -1683,10 +1748,10 @@ bool Slam::load_map(const std::string& path)
     isam_.update(g, v);
   } catch (const std::exception& e) {
     last_error_ = std::string("loaded map failed to solve: ") + e.what();
-    keyframes.clear();
     isam_ = gtsam::ISAM2(make_isam2_params());
     return false;
   }
+  keyframes = std::move(loaded);
   committed_graph_ = g;
   loaded_key_count_ = static_cast<int>(n);
   // A restored map carries poses and clouds but not the per-link factor
@@ -1695,6 +1760,7 @@ bool Slam::load_map(const std::string& path)
   // `keyframes` so links added this session land at the right index.
   consecutive_links_.assign(keyframes.size(), ConsecutiveLink{});
   awaiting_relocalization_ = true;
+  last_error_.clear();
   return true;
 }
 
@@ -1797,6 +1863,11 @@ bool Slam::add_position_prior(int key, double x, double y, double sigma_xy)
 {
   if (key < 0 || key >= current_key()) {
     last_error_ = "position prior key out of range";
+    return false;
+  }
+  if (!std::isfinite(x) || !std::isfinite(y) ||
+      !std::isfinite(sigma_xy) || sigma_xy <= 0.0) {
+    last_error_ = "position prior must have finite coordinates and a finite positive sigma";
     return false;
   }
   // position-only fix: yaw/attitude stay wide (USBL measures position, not

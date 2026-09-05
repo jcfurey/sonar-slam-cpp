@@ -53,6 +53,28 @@ int main()
     return 1;
   }
 
+  for (double yaw_variance : {std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity(), -0.01}) {
+    invalid = compact;
+    invalid(2, 2) = yaw_variance;
+    if (sonar_slam::assess_icp_observability(invalid, 0.5, 8.0).observable) {
+      std::printf("invalid yaw variance was admitted\n");
+      return 1;
+    }
+  }
+  invalid = compact;
+  invalid(0, 2) = invalid(2, 0) = 1.0;
+  if (sonar_slam::assess_icp_observability(invalid, 0.5, 8.0).observable) {
+    std::printf("indefinite covariance was admitted\n");
+    return 1;
+  }
+  invalid = compact;
+  invalid(0, 1) = 0.01;
+  if (sonar_slam::assess_icp_observability(invalid, 0.5, 8.0).observable) {
+    std::printf("asymmetric covariance was admitted\n");
+    return 1;
+  }
+
   std::mt19937 rng(12345);
   std::uniform_real_distribution<double> U(0.0, 8.0);
   const int N = 250;
