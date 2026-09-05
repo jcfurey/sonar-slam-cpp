@@ -116,6 +116,21 @@ int main()
                     "-p", "max_head_pitch:=0.52",
                     "-p", "tf_lookup_timeout:=0.05",
                     "-p", "tf_buffer_duration:=120.0"});
+    for (const auto& setting : {
+           "prior_sigmas:=[0.1, 0.2]", "odom_sigmas:=[0.1, 0.2, -0.01]",
+           "icp_odom_sigmas:=[0.1, 0.2, 0.01, 0.1]",
+           "manual_correction_sigmas:=[0.1, 0.2]",
+           "ssm.initialization_params:=[1e20, 1.0, 0.01]"}) {
+      auto bad_opts = opts;
+      auto args = opts.arguments();
+      args.insert(args.end(), {"-p", setting});
+      bad_opts.arguments(args);
+      bool rejected = false;
+      try { auto invalid = std::make_shared<sonar_slam::SlamNode>(bad_opts); }
+      catch (const std::runtime_error&) { rejected = true; }
+      catch (const std::invalid_argument&) { rejected = true; }
+      CHECK(rejected, "invalid setting accepted: %s", setting);
+    }
     auto node = std::make_shared<sonar_slam::SlamNode>(opts);
     auto pub_node = rclcpp::Node::make_shared("slam_harness");
     auto points_pub = pub_node->create_publisher<sensor_msgs::msg::PointCloud2>(

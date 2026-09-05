@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -69,12 +70,18 @@ public:
     // <= 0 -> every keyframe
     viz_min_period_ = get_double("viz_min_period", 2.0);
 
-    const auto prior = get_double_array("prior_sigmas");
-    const auto odom = get_double_array("odom_sigmas");
-    const auto icp_odom = get_double_array("icp_odom_sigmas");
-    slam_.prior_sigmas = Eigen::Vector3d(prior[0], prior[1], prior[2]);
-    slam_.odom_sigmas = Eigen::Vector3d(odom[0], odom[1], odom[2]);
-    slam_.icp_odom_sigmas = Eigen::Vector3d(icp_odom[0], icp_odom[1], icp_odom[2]);
+    const auto sigmas = [](const char* name, const std::vector<double>& v) {
+      if (v.size() != 3 ||
+          !std::all_of(v.begin(), v.end(), [](double x) {
+            return std::isfinite(x) && x > 0.0;
+          }))
+        throw std::invalid_argument(std::string(name) +
+          " must contain three finite positive sigmas [x, y, yaw]");
+      return Eigen::Vector3d(v[0], v[1], v[2]);
+    };
+    slam_.prior_sigmas = sigmas("prior_sigmas", get_double_array("prior_sigmas"));
+    slam_.odom_sigmas = sigmas("odom_sigmas", get_double_array("odom_sigmas"));
+    slam_.icp_odom_sigmas = sigmas("icp_odom_sigmas", get_double_array("icp_odom_sigmas"));
 
     slam_.point_resolution = get_double("point_resolution");
     slam_.point_noise = get_double("point_noise", 0.5);
@@ -122,9 +129,13 @@ public:
     const auto init_params = [this](const char* name,
                                     const std::vector<double>& def) {
       const auto v = get_double_array(name, def);
-      if (v.size() != 3)
+      if (v.size() != 3 ||
+          !std::all_of(v.begin(), v.begin() + 2, [](double n) {
+            return std::isfinite(n) && n >= 1.0 &&
+                   n <= std::numeric_limits<int>::max() && n == std::floor(n);
+          }) || !std::isfinite(v[2]) || v[2] < 0.0)
         throw std::runtime_error(std::string(name) +
-                                 " must be [n, iters, ftol]");
+          " must be [positive integer n, positive integer iters, finite nonnegative ftol]");
       return v;
     };
 
@@ -187,8 +198,11 @@ public:
     if (admission_params_.min_points < slam_.ssm_params.min_points)
       throw std::runtime_error(
         "admission.min_points must be >= ssm.min_points");
-    if (!(admission_params_.cell_size > 0.0) ||
+    if (!std::isfinite(admission_params_.cell_size) ||
+        !(admission_params_.cell_size > 0.0) ||
+        admission_params_.min_points < 1 ||
         admission_params_.min_occupied_cells < 1 ||
+        !std::isfinite(admission_params_.azimuth_bin_size) ||
         !(admission_params_.azimuth_bin_size > 0.0) ||
         admission_params_.min_azimuth_bins < 1)
       throw std::runtime_error(
@@ -270,13 +284,7 @@ public:
     // default (see slam_core.hpp: the verify stack assumes compass yaw)
     const auto mc_sigmas =
       get_double_array("manual_correction_sigmas", {0.2, 0.2, 0.5});
-    if (mc_sigmas.size() == 3)
-      slam_.manual_correction_sigmas =
-        Eigen::Vector3d(mc_sigmas[0], mc_sigmas[1], mc_sigmas[2]);
-    else
-      RCLCPP_ERROR(get_logger(),
-                   "manual_correction_sigmas must be [x, y, yaw]; keeping "
-                   "defaults [0.2, 0.2, 0.5]");
+    slam_.manual_correction_sigmas = sigmas("manual_correction_sigmas", mc_sigmas);
 
     // ICP config; falls back to the installed package share copy when unset
     std::string icp_config = get_string("icp_config", "");
@@ -692,6 +700,10 @@ private:
         slam_.resetSession();
         usbl_applied_.clear();
         last_logged_key_ = -1;
+        // Finish the old snapshot before clearing its latch. Otherwise a
+        // late worker publish can resurrect the discarded session's markers.
+        if (viz_thread_.joinable()) viz_thread_.join();
+        last_viz_publish_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         {
           std::lock_guard<std::mutex> tf_lock(tf_mutex_);
           map_odom_tf_ = MapOdomTf{};

@@ -193,6 +193,24 @@ if(BUILD_TESTING)
         ROS_DOMAIN_ID=152
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_ros_conversions test/ros_conversions_test.cpp)
+  target_link_libraries(test_ros_conversions sonar_slam_ros)
+  ament_add_test(test_ros_conversions
+    COMMAND $<TARGET_FILE:test_ros_conversions>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_slam_covariance test/slam_covariance_test.cpp)
+  target_link_libraries(test_slam_covariance sonar_slam_core)
+  ament_add_test(test_slam_covariance
+    COMMAND $<TARGET_FILE:test_slam_covariance>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_map_persistence test/map_persistence_test.cpp)
+  target_link_libraries(test_map_persistence sonar_slam_core)
+  ament_add_test(test_map_persistence
+    COMMAND $<TARGET_FILE:test_map_persistence>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_icp_wrapper test/icp_wrapper_test.cpp)
   target_link_libraries(test_icp_wrapper sonar_slam_core)
   ament_add_test(test_icp_wrapper
