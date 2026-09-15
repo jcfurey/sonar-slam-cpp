@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "sonar_slam_cpp/gpu.hpp"
+#include "sonar_slam_cpp/mapping_trajectory.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/node_base.hpp"
 #include "sonar_slam_cpp/ros_conversions.hpp"
@@ -69,6 +70,9 @@ public:
     // min seconds between rebuilds of the O(history) constraint markers;
     // <= 0 -> every keyframe
     viz_min_period_ = get_double("viz_min_period", 2.0);
+    const double mapping_interval = get_double("mapping_anchor_interval", 2.0);
+    mapping_trajectory_ = MappingTrajectory(mapping_interval);
+    mapping_anchor_interval_ = mapping_interval;
 
     const auto sigmas = [](const char* name, const std::vector<double>& v) {
       if (v.size() != 3 ||
@@ -374,6 +378,17 @@ public:
     // clouds to every late-joining assembler.
     traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       SLAM_TRAJ_TOPIC, latched_qos(1));
+    mapping_traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "~/mapping_traj", latched_qos(1));
+    mapping_timer_ = create_wall_timer(
+      std::chrono::duration<double>(std::min(mapping_interval / 4.0, 0.25)),
+      [this]() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!slam_.keyframes.empty() && !slam_.awaiting_relocalization() &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+              last_mapping_observation_wall_).count() >= mapping_anchor_interval_ &&
+            mapping_trajectory_.flush()) publish_mapping_trajectory();
+      });
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
 
@@ -555,6 +570,13 @@ private:
 
   void points_callback(const sensor_msgs::msg::PointCloud2& msg)
   {
+    if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000U ||
+        (msg.header.stamp.sec == 0 && msg.header.stamp.nanosec == 0)) {
+      ++tf_lookup_failures_;
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 10000,
+        "Dropping sonar points without a positive normalized acquisition stamp");
+      return;
+    }
     if (msg.header.frame_id.empty()) {
       ++tf_lookup_failures_;
       RCLCPP_ERROR_THROTTLE(
@@ -698,6 +720,7 @@ private:
                     "survive the reset.",
                     -dt);
         slam_.resetSession();
+        mapping_trajectory_.clear();
         usbl_applied_.clear();
         last_logged_key_ = -1;
         // Finish the old snapshot before clearing its latch. Otherwise a
@@ -721,6 +744,7 @@ private:
           empty.header.stamp = time;
           empty.header.frame_id = "map";
           traj_pub_->publish(empty);
+          mapping_traj_pub_->publish(empty);
           visualization_msgs::msg::Marker clear;
           clear.header.stamp = time;
           clear.header.frame_id = "map";
@@ -759,8 +783,8 @@ private:
         last_input_mode_ = "odometry_only_sparse";
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 10000,
-          "Sonar ping rejected as graph evidence: %s; publishing fused-odometry "
-          "extrapolation only",
+          "Sonar ping rejected as registration evidence: %s; retaining "
+          "fused-odometry mapping anchors",
           last_admission_summary_.c_str());
       }
     } else {
@@ -803,19 +827,11 @@ private:
       return;
     }
 
-    frame->status = scan_informative && slam_.is_keyframe(*frame);
-
-    // Open water or a head sweep can precede the first informative keyframe.
-    // Keep map->odom connected and publish the fused-odometry pose, but do not
-    // insert a graph state or retain the cloud as future NSSM evidence.
-    if (!frame->status && slam_.keyframes.empty() && publish_tf_) {
-      set_map_odom(Eigen::Vector3d::Zero(), Eigen::Quaterniond::Identity(),
-                   frame->time);
-      RCLCPP_INFO_ONCE(
-        get_logger(),
-        "Publishing identity map->odom while waiting for the first usable "
-        "SLAM candidate frame.");
-    }
+    // Mapping needs trajectory anchors even when acoustic geometry cannot
+    // constrain registration. Exact-time TF, pose/yaw and loaded-map gates
+    // have already passed. Preserve the usual motion/time/head keyframe
+    // policy, but retain NO registration cloud from an ineligible ping.
+    frame->status = slam_.is_keyframe(*frame);
 
     if (!slam_.keyframes.empty()) {
       const gtsam::Pose2 dr_odom =
@@ -824,7 +840,7 @@ private:
     }
 
     if (frame->status) {
-      frame->points = points;
+      if (scan_informative) frame->points = points;
 
       // The back-end runs GTSAM/ISAM2 (and libpointmatcher ICP), which can
       // throw on a degenerate/indeterminate system. Under single-threaded
@@ -833,10 +849,10 @@ private:
       try {
         if (slam_.keyframes.empty())
           slam_.add_prior(frame);
-        else if (enable_slam_)
+        else if (enable_slam_ && scan_informative)
           slam_.add_sequential_scan_matching(frame);
         else
-          // SLAM back-end disabled: chain plain dead-reckoning odometry factors
+          // Disabled or acoustically ineligible: plain odometry factor only.
           slam_.add_odometry(frame);
 
         if (!slam_.update_factor_graph(frame)) {
@@ -846,7 +862,7 @@ private:
                        "SLAM back-end update failed (%s); keyframe dropped, "
                        "estimator rebuilt from last good state",
                        slam_.last_error().c_str());
-        } else if (enable_slam_ && slam_.nssm_params.enable &&
+        } else if (enable_slam_ && scan_informative && slam_.nssm_params.enable &&
                    slam_.add_nonsequential_scan_matching()) {
           // per-closure geometry, logged before the update so it precedes any
           // post-loop revert message (diagnoses legit-fix vs parallel-wall alias)
@@ -873,6 +889,11 @@ private:
     if (!slam_.current_frame) return;
     publish_pose();
     if (slam_.keyframes.empty()) return;
+    const auto mapping_update = mapping_trajectory_.observe(
+      slam_.current_frame->time, slam_.current_frame->dr_pose3,
+      slam_.keyframes.size() - 1);
+    if (mapping_update.accepted) last_mapping_observation_wall_ = std::chrono::steady_clock::now();
+    if (mapping_update.published || slam_.current_frame->status) publish_mapping_trajectory();
     if (slam_.current_frame->status) {
       publish_trajectory();
       // Constraint markers re-walk the graph history, so rate-limit and build
@@ -1076,6 +1097,24 @@ private:
     msg.header.stamp = msg_stamp;
     msg.header.frame_id = "map";
     traj_pub_->publish(msg);
+  }
+
+  void publish_mapping_trajectory()
+  {
+    const auto& anchors = mapping_trajectory_.anchors();
+    if (anchors.empty()) return;
+    const auto& stamp = anchors.back().time;
+    Matrix rows(anchors.size(), 8);
+    for (std::size_t i = 0; i < anchors.size(); ++i) {
+      const auto pose = mapping_trajectory_.pose(i, slam_.keyframes);
+      rows.row(i) << pose.x(), pose.y(), pose.z(), pose.rotation().roll(),
+        pose.rotation().pitch(), pose.rotation().yaw(), static_cast<float>(i),
+        static_cast<float>(to_sec(anchors[i].time) - to_sec(stamp));
+    }
+    auto msg = make_cloud({"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, rows);
+    msg.header.stamp = stamp;
+    msg.header.frame_id = "map";
+    mapping_traj_pub_->publish(msg);
   }
 
   // Operator hand-correction: a map-frame planar pose fix (typically RViz's
@@ -1389,6 +1428,18 @@ private:
       reverted = slam_.nssm_reverted;
       input_mode = last_input_mode_;
       add("keyframes", std::to_string(slam_.current_key()));
+      add("mapping_anchors", std::to_string(mapping_trajectory_.anchors().size()));
+      add("mapping_pending_anchors", std::to_string(mapping_trajectory_.pending()));
+      std::size_t registration_keyframes = 0;
+      std::size_t registration_points = 0;
+      for (const auto& frame : slam_.keyframes) {
+        registration_keyframes += frame->points.rows() > 0;
+        registration_points += frame->points.rows();
+      }
+      add("registration_keyframes", std::to_string(registration_keyframes));
+      add("odometry_only_keyframes",
+          std::to_string(slam_.keyframes.size() - registration_keyframes));
+      add("registration_points", std::to_string(registration_points));
       add("ssm_factors", std::to_string(slam_.ssm_accepted));
       add("ssm_degenerate_rejected",
           std::to_string(slam_.ssm_degenerate_rejected));
@@ -1474,10 +1525,16 @@ private:
       publish_pose();
     }
     publish_trajectory();
+    publish_mapping_trajectory();
     if (schedule_viz_rebuild()) last_viz_publish_ = now();
   }
 
   Slam slam_;
+  MappingTrajectory mapping_trajectory_;
+  double mapping_anchor_interval_ = 2.0;
+  std::chrono::steady_clock::time_point last_mapping_observation_wall_;
+  rclcpp::TimerBase::SharedPtr mapping_timer_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_traj_pub_;
   std::mutex mutex_;
   // Background graph-marker rebuild (see schedule_viz_rebuild).
   std::thread viz_thread_;

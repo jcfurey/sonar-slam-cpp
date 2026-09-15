@@ -533,10 +533,8 @@ void Slam::add_odometry(const KeyframePtr& keyframe)
   const gtsam::Pose3 dr_odom =
     keyframes.back()->horizon_pose3().between(keyframe->horizon_pose3());
   // Noise scaled to what this link actually spans, not to the nominal
-  // keyframe step. Input admission and the head-pitch gate can force
-  // status=false for a whole +/-54 deg sweep, during which NO keyframe is
-  // created — so the link that closes the sweep can span many metres and
-  // must not carry the same 0.2 m sigma as a 0.75 m step.
+  // keyframe step. Missing exact-time TF or invalid poses can leave a gap
+  // of many metres, which must not carry a nominal 0.75 m step's sigma.
   const gtsam::Pose2 dr_planar =
     keyframes.back()->dr_pose.between(keyframe->dr_pose);
   double ts = 0.0, rs = 0.0;
