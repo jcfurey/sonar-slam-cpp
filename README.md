@@ -52,16 +52,41 @@ ICP, XYZ overlap, sampled covariance and the existing graph-defense gates.
 
 ## Open-water behavior
 
-Sparse sonar is treated as absence of a measurement. Before keyframe selection,
-including the first frame, a ping must have enough finite returns distributed
-across distinct XYZ voxels and horizontal azimuth bins. Rejected pings never enter
-the graph or loop-closure history; the node continues publishing the fused
-odometry pose through the last `map -> odom` correction.
+Sparse sonar is treated as absence of an acoustic pose measurement. A scan must
+have enough finite returns distributed across distinct XYZ voxels and horizontal
+azimuth bins before its cloud can enter registration history. With valid
+timestamped transforms and odometry, the normal keyframe motion/time/head gates
+still create odometry-only trajectory anchors, including the first frame. The
+mapping assembler can attach occupancy and survey evidence to those anchors;
+their empty registration clouds cannot supply sequential or loop-closure evidence.
+The loaded-map relocalization gate still requires an informative acoustic match
+before any new state enters the saved map's coordinate frame.
+
+`~/mapping_traj` supplies additional pose-only anchors at
+`mapping_anchor_interval` acquisition seconds (default 2 s), even during a
+stationary interval. Each anchor retains its exact valid DR pose/stamp and its
+parent graph keyframe. Its published pose is recomputed as
+`parent.pose3 * parent.dr_pose3.inverse() * anchor.dr_pose3`, so loop, manual and
+other graph corrections propagate through the mapping history. This creates no
+extra graph states, acoustic evidence, or registration factors; `~/traj` remains
+the graph-keyframe trajectory.
+
+Selected mapping anchors wait one acquisition interval before publication so
+same-ping map/survey clouds arrive before the assembler advances its association
+cutoff. After valid input stops for one wall-time interval, a wall timer flushes
+pending anchors and the final cached observation using their original stamps.
+It never creates a pose at the current time from stale input. Rewind clears both
+histories and their retained messages. Zero/negative or unnormalized acquisition
+timestamps are rejected before TF lookup.
 
 Sequential scan matching then requires both a meaningful overlap fraction and a
 finite, observable ICP covariance. Failure adds only a span-scaled odometry link.
 Admission counts, rejection reasons, input mode and degenerate SSM rejections are
-published on `/diagnostics`.
+published on `/diagnostics`, alongside separate `odometry_only_keyframes`,
+`registration_keyframes`, and retained `registration_points` counts. An assembled
+map supported only by odometry remains subject to odometry drift; map production
+does not imply successful acoustic registration.
+`mapping_anchors` and `mapping_pending_anchors` expose the separate mapping history.
 
 ## Public interfaces
 
@@ -76,6 +101,7 @@ Outputs:
 - `/bruce/slam/slam/pose`;
 - `/bruce/slam/slam/odom`;
 - `/bruce/slam/slam/traj`;
+- `/bruce/slam/slam/mapping_traj`;
 - `/bruce/slam/slam/constraint`;
 - `map -> odom` TF when `publish_tf` is enabled.
 

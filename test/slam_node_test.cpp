@@ -240,15 +240,16 @@ int main()
 
     // [6] bag rewind: a ping stamped far behind the last processed one must
     // reset the session — fresh graph, refreshed depth-1 latches. First grow
-    // the session to keyframe 2 with a > keyframe_translation DR step so the
+    // the session by one keyframe with a > keyframe_translation DR step so the
     // reset is observable as a keyframe-count drop.
+    const long long before_big_step = diag_int("keyframes");
     odom_at(103.6, 4.0, 0.0);
     odom_at(103.8, 4.1, 0.0);
     spin_for(0.2);
     points_pub->publish(make_cloud_msg(103.7, 120, 2.0));
     spin_for(1.4);
-    CHECK(diag_int("keyframes") == 2,
-          "big DR step did not promote keyframe 2 (keyframes=%lld)",
+    CHECK(diag_int("keyframes") == before_big_step + 1,
+          "big DR step did not grow the trajectory (keyframes=%lld)",
           diag_int("keyframes"));
     const long long adm_before_rewind = diag_int("admitted_scans");
 

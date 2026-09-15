@@ -193,6 +193,25 @@ if(BUILD_TESTING)
         ROS_DOMAIN_ID=152
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_mapping_keyframes test/mapping_keyframes_test.cpp)
+  target_link_libraries(test_mapping_keyframes sonar_slam_ros)
+  auto_target_dependencies(
+    test_mapping_keyframes
+    rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
+    nav_msgs visualization_msgs builtin_interfaces tf2 tf2_ros ament_index_cpp)
+  ament_add_test(test_mapping_keyframes
+    COMMAND $<TARGET_FILE:test_mapping_keyframes>
+    ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
+        ROS_DOMAIN_ID=153 ROS_LOG_DIR=/tmp/sonar_slam_mapping_test_logs
+        ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
+  add_executable(test_mapping_trajectory test/mapping_trajectory_test.cpp)
+  target_link_libraries(test_mapping_trajectory sonar_slam_core)
+  ament_add_test(test_mapping_trajectory
+    COMMAND $<TARGET_FILE:test_mapping_trajectory>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_ros_conversions test/ros_conversions_test.cpp)
   target_link_libraries(test_ros_conversions sonar_slam_ros)
   ament_add_test(test_ros_conversions
