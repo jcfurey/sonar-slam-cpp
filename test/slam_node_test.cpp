@@ -162,6 +162,28 @@ int main()
       while (std::chrono::steady_clock::now() < deadline)
         exec.spin_some(std::chrono::milliseconds(10));
     };
+
+    // [0] A fresh session latches an empty trajectory, so consumers still
+    // holding a previous session's keyframes reset instead of re-posing them
+    // onto this session's indices.
+    {
+      sensor_msgs::msg::PointCloud2 startup;
+      bool got_startup = false;
+      auto startup_sub =
+        pub_node->create_subscription<sensor_msgs::msg::PointCloud2>(
+          sonar_slam::SLAM_TRAJ_TOPIC,
+          rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+          [&](const sensor_msgs::msg::PointCloud2& m) {
+            startup = m;
+            got_startup = true;
+          });
+      spin_for(1.0);
+      CHECK(got_startup, "no retained startup sample on the traj latch");
+      CHECK(startup.width == 0, "startup traj latch is not empty (width=%u)",
+            startup.width);
+      std::printf("[0] startup: empty trajectory latched\n");
+    }
+
     auto odom_at = [&](double stamp, double x, double yaw) {
       dyn_tf.sendTransform(make_tf(stamp, "odom", "base_link", x, yaw));
     };

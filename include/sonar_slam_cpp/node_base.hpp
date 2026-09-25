@@ -29,7 +29,15 @@ int run_node(int argc, char** argv)
   rclcpp::init(argc, argv);
   int rc = 0;
   try {
-    rclcpp::spin(std::make_shared<NodeT>());
+    // Two threads: callbacks in the default (mutually exclusive) group stay
+    // serialized exactly as under rclcpp::spin, and a node may place
+    // latency-critical work, such as the map->odom republish timer, in its own
+    // group so a long keyframe callback cannot starve it.
+    rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 2);
+    auto node = std::make_shared<NodeT>();
+    executor.add_node(node);
+    executor.spin();
   } catch (const rclcpp::exceptions::InvalidParameterValueException& e) {
     RCLCPP_FATAL(
       rclcpp::get_logger("sonar_slam"),

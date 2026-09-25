@@ -392,6 +392,21 @@ public:
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
       SLAM_CONSTRAINT_TOPIC, latched_qos());
 
+    // A new session has no keyframes; say so on the latched trajectories, as
+    // the rewind path does. After a respawn or manual restart the assembler
+    // and atlas still hold the old session's keyframes, and this session's
+    // indices 0..n would otherwise read as "the graph moved these",
+    // re-posing the old evidence onto unrelated poses. Both reset on an
+    // empty trajectory.
+    {
+      sensor_msgs::msg::PointCloud2 empty = make_cloud(
+        {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
+      empty.header.stamp = now();
+      empty.header.frame_id = "map";
+      traj_pub_->publish(empty);
+      mapping_traj_pub_->publish(empty);
+    }
+
     // Mirror the graph funnel and exact-stamp input health on /diagnostics so
     // TF starvation and the NSSM accept/reject balance are visible in rqt.
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
@@ -408,10 +423,18 @@ public:
     // publish-inline-from-the-callback behaviour.
     tf_publish_period_ = get_double("tf_publish_period", 0.05);  // 20 Hz
     tf_tolerance_ = get_double("tf_tolerance", 0.1);
-    if (publish_tf_ && tf_publish_period_ > 0.0)
+    // Its own callback group, served by the multi-threaded executor in
+    // run_node: in the default group a keyframe callback (global init,
+    // covariance ICPs, iSAM2 and marginals) blocked the republish for its
+    // whole duration, starving every map-frame consumer. The body touches
+    // only the mutex-guarded cache and the broadcaster.
+    if (publish_tf_ && tf_publish_period_ > 0.0) {
+      tf_callback_group_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
       tf_timer_ = create_timer(
         std::chrono::duration<double>(tf_publish_period_),
-        [this]() { republish_map_odom(); });
+        [this]() { republish_map_odom(); }, tf_callback_group_);
+    }
 
     slam_.configure();
     RCLCPP_INFO(
@@ -533,10 +556,16 @@ private:
   // but a standalone/harness replay can run this node on wall time while
   // frames carry bag time — stamping with now() directly would then inject
   // transforms decades away from the rest of TF.
-  // Advancing the last data stamp by the node-clock interval since it was
-  // cached is correct in BOTH domains: under sim time the two clocks are the
-  // same and this reduces to now() + tolerance (rtabmap's form), and under
-  // wall time a bag playing at ~1x advances data time at ~1x real time.
+  // When the node clock and the data share a domain (live, or sim time on
+  // replay) the stamp is now() + tolerance, rtabmap's form. Advancing the
+  // cached data stamp by the elapsed node time does NOT reduce to that: the
+  // data stamp was already older than the caching time by the whole
+  // sonar_proc -> SLAM latency, so every republish landed that far behind
+  // now() and the 0.1 s future-dating that matches the odom EKF's
+  // transform_time_offset shrank to nothing or went negative. The data-domain
+  // extrapolation remains for a harness running this node on wall time while
+  // frames carry bag time, where a bag playing at ~1x advances data time at
+  // ~1x real time.
   //
   // map->odom is a slowly-varying correction, not motion, so holding it
   // constant and extrapolating the STAMP forward is safe between updates —
@@ -549,13 +578,22 @@ private:
       if (!map_odom_tf_.valid) return;
       c = map_odom_tf_;
     }
-    const double elapsed = (now() - c.cached_at).seconds();
-    // negative = node clock jumped backwards (bag loop): fall back to the
-    // cached stamp rather than emitting a transform in the past
-    const rclcpp::Time stamp =
-      c.data_stamp +
-      rclcpp::Duration::from_seconds((elapsed > 0.0 ? elapsed : 0.0) +
-                                     tf_tolerance_);
+    const rclcpp::Time node_now = now();
+    const rclcpp::Duration tolerance =
+      rclcpp::Duration::from_seconds(tf_tolerance_);
+    constexpr double kSameDomainSeconds = 60.0;
+    rclcpp::Time stamp;
+    if (node_now.get_clock_type() == c.data_stamp.get_clock_type() &&
+        std::fabs((node_now - c.data_stamp).seconds()) < kSameDomainSeconds) {
+      stamp = node_now + tolerance;
+    } else {
+      const double elapsed = (node_now - c.cached_at).seconds();
+      // negative = node clock jumped backwards (bag loop): fall back to the
+      // cached stamp rather than emitting a transform in the past
+      stamp = c.data_stamp +
+              rclcpp::Duration::from_seconds(elapsed > 0.0 ? elapsed : 0.0) +
+              tolerance;
+    }
     tf_->sendTransform(make_transform(c.t, c.q, stamp, "map", odom_frame_));
   }
 
@@ -1594,6 +1632,7 @@ private:
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   double tf_publish_period_ = 0.05;  // s; <= 0 -> publish inline (old behavior)
   double tf_tolerance_ = 0.1;        // s of future-dating
+  rclcpp::CallbackGroup::SharedPtr tf_callback_group_;
   rclcpp::TimerBase::SharedPtr tf_timer_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub_;
