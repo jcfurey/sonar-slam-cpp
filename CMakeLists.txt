@@ -265,6 +265,33 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_pipeline_e2e>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 300)
+
+  # Loop-closure harness: the scan-match acceptance checks against synthetic
+  # ground truth under the DEPLOYED profile, read from the settings package
+  # when this workspace has it (the package config otherwise).
+  find_package(ament_cmake_gtest REQUIRED)
+  set(SLAM_HARNESS_CONFIG
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../settings/params/localization/sonar_slam/slam.yaml")
+  if(NOT EXISTS "${SLAM_HARNESS_CONFIG}")
+    set(SLAM_HARNESS_CONFIG "")
+  endif()
+  ament_add_gtest(test_loop_closure_harness test/loop_closure_harness_test.cpp
+    TIMEOUT 900
+    # Sampled covariance runs its ICPs on an OpenMP pool; keep this suite from
+    # taking every core of a shared workstation.
+    ENV SLAM_HARNESS_CONFIG=${SLAM_HARNESS_CONFIG} OMP_NUM_THREADS=4)
+  if(TARGET yaml-cpp::yaml-cpp)
+    set(SLAM_HARNESS_YAML yaml-cpp::yaml-cpp)
+  else()
+    set(SLAM_HARNESS_YAML yaml-cpp)
+  endif()
+  target_link_libraries(
+    test_loop_closure_harness sonar_slam_core ${SLAM_HARNESS_YAML})
+  auto_target_dependencies(
+    test_loop_closure_harness builtin_interfaces geometry_msgs)
+  target_compile_definitions(
+    test_loop_closure_harness
+    PRIVATE TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 install(TARGETS sonar_slam_core sonar_slam_ros
