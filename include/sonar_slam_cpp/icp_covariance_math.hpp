@@ -9,6 +9,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
@@ -25,8 +26,16 @@ struct IcpObservability
 // Assess the translation block used by both SSM and NSSM. A covariance with
 // non-finite/negative eigenvalues, excessive uncertainty, or a long weak axis
 // is not trustworthy sonar evidence.
+//
+// sigma_floor is the smallest spread the covariance estimate can resolve. The
+// sampled covariance is the scatter of ICP runs that each stop within their
+// convergence tolerance of the optimum, so on a well-constrained match the
+// short axis is that stopping noise, and a ratio against it swings with the
+// noise rather than with the geometry. Anisotropy is measured against
+// max(sigma_min, sigma_floor).
 inline IcpObservability assess_icp_observability(
-  const Eigen::Matrix3d& cov, double max_sigma, double max_anisotropy)
+  const Eigen::Matrix3d& cov, double max_sigma, double max_anisotropy,
+  double sigma_floor = 0.0)
 {
   IcpObservability out;
   // Translation-only thresholds still require a valid FULL covariance:
@@ -49,7 +58,9 @@ inline IcpObservability assess_icp_observability(
     return out;
 
   out.sigma_max = std::sqrt(ev_hi);
-  const double sigma_min = std::sqrt(std::max(1e-12, ev_lo));
+  const double floor_var =
+    std::isfinite(sigma_floor) ? sigma_floor * sigma_floor : 0.0;
+  const double sigma_min = std::sqrt(std::max({1e-12, floor_var, ev_lo}));
   out.anisotropy = out.sigma_max / sigma_min;
   out.observable =
     (max_sigma <= 0.0 || out.sigma_max <= max_sigma) &&

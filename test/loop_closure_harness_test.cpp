@@ -3,20 +3,19 @@
 // Each case states the behaviour a correct check must have; the printed
 // measurements show how close the current implementation comes.
 //
-// KNOWN DEFECTS -- these cases are DISABLED_ until their fix lands; run them
-// with --gtest_also_run_disabled_tests to see the current measurements.
-//  * DegeneracyGate.CornerViewsPassTheGate: anisotropy divides by a sampled
-//    sigma_min floored only at 1e-6 m, so registrations good to 1-2.5 cm are
-//    rejected on convergence noise (65% pass). The corridor it must reject
-//    has sigma_max 8.6-13 cm.
-//  * SequentialMatch.CorrectsSmallDeadReckoningError: the same noise, plus
-//    ssm/max_translation measured from the global-init seed rather than dead
-//    reckoning, rejects 9 of 12 corner registrations with a 0.1 m DR error.
-//  * PcmConsistency.{Translation,Yaw}AliasIsExcluded: PCM adds each source
-//    keyframe's ABSOLUTE marginal to the consistency covariance. Under the
-//    deployed odometry sigmas those reach ~1.3 m / 0.13 rad within 40
-//    keyframes, so a 3 m or 0.35 rad alias scores md 1-3 against 11.34 and is
-//    never excluded, even on a short chain.
+// What each group guards (the fix that made it pass, in brackets):
+//  * DegeneracyGate: registrations good to 1-2.5 cm pass, a featureless
+//    corridor (sigma_max 8.6-13 cm) does not. [anisotropy is measured against
+//    the ICP convergence tolerance, not a sampled sigma_min of stopping noise;
+//    before that 35% of the good corner registrations were rejected]
+//  * SequentialMatch: a 0.1 m DR error is corrected, a 0.9 m one is refused.
+//    [ssm/max_translation is measured from dead reckoning, not from the
+//    global-init seed, which rejected good matches whose seed was 0.5 m out]
+//  * PcmConsistency: honest closures form a clique; a 3 m or 0.35 rad alias
+//    among them does not join it. [the graph legs of the cycle use relative
+//    covariance; absolute marginals reached ~1.3 m / 0.13 rad within 40
+//    keyframes and left aliases at md 1-3 against 11.34]
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -108,7 +107,8 @@ GateOutcome run_gate(const char* label, const SyntheticWorld& world,
       if (result.n_samples == 0) continue;  // registration failed outright
       const IcpObservability obs = assess_icp_observability(
         slam.ssm_degeneracy_prefloor ? result.cov_raw : result.cov,
-        slam.ssm_max_sigma, slam.ssm_max_anisotropy);
+        slam.ssm_max_sigma, slam.ssm_max_anisotropy,
+        slam.degeneracy_sigma_floor());
       out.sigma_max.push_back(obs.sigma_max);
       out.anisotropy.push_back(obs.anisotropy);
       if (obs.observable) ++out.passed;
@@ -140,7 +140,7 @@ std::vector<gtsam::Pose2> corner_views()
           {4.0, 7.0, std::atan2(3.0, -4.0)}};
 }
 
-TEST(DegeneracyGate, DISABLED_CornerViewsPassTheGate)
+TEST(DegeneracyGate, CornerViewsPassTheGate)
 {
   const SyntheticWorld world = SyntheticWorld::pool(20.0, 10.0);
   const GateOutcome out = run_gate(
@@ -222,7 +222,7 @@ SequentialOutcome run_sequential(const gtsam::Pose2& truth0,
   return out;
 }
 
-TEST(SequentialMatch, DISABLED_CorrectsSmallDeadReckoningError)
+TEST(SequentialMatch, CorrectsSmallDeadReckoningError)
 {
   int trials = 0, accepted = 0, accurate = 0;
   for (const gtsam::Pose2& view : corner_views()) {
@@ -417,7 +417,7 @@ TEST_P(PcmConsistency, HonestClosuresFormOneClique)
   EXPECT_GE(out.honest_accepted, out.trials - 1);
 }
 
-TEST_P(PcmConsistency, DISABLED_TranslationAliasIsExcluded)
+TEST_P(PcmConsistency, TranslationAliasIsExcluded)
 {
   const PcmCase c = GetParam();
   const gtsam::Pose2 alias(3.0, 0.0, 0.0);  // one structure spacing along-track
@@ -428,7 +428,7 @@ TEST_P(PcmConsistency, DISABLED_TranslationAliasIsExcluded)
   EXPECT_GE(out.alias_excluded, out.trials - 1);
 }
 
-TEST_P(PcmConsistency, DISABLED_YawAliasIsExcluded)
+TEST_P(PcmConsistency, YawAliasIsExcluded)
 {
   const PcmCase c = GetParam();
   const gtsam::Pose2 alias(0.0, 0.0, 0.35);

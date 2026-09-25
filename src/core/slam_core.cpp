@@ -259,6 +259,53 @@ gtsam::Pose2 Slam::predicted_relative_pose(int target_key, int source_key,
             : keyframes[target_key]->pose.between(keyframes[source_key]->pose);
 }
 
+double Slam::degeneracy_sigma_floor() const
+{
+  return constrained_3d ? constrained_icp_params.translation_epsilon : 0.0;
+}
+
+Eigen::Matrix3d Slam::relative_covariance(int from, int to) const
+{
+  const int n = static_cast<int>(keyframes.size());
+  if (from < 0 || to < 0 || from >= n || to >= n || from == to)
+    return Eigen::Matrix3d::Zero();
+
+  const int lo = std::min(from, to), hi = std::max(from, to);
+  bool chained = same_dr_epoch(lo, hi) &&
+                 hi < static_cast<int>(consecutive_links_.size());
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for (int m = lo + 1; chained && m <= hi; ++m) {
+    const ConsecutiveLink& link = consecutive_links_[m];
+    if (!link.valid) {
+      chained = false;
+      break;
+    }
+    // carry the span so far through this link into keyframe m's frame, then
+    // add the link's own noise
+    const gtsam::Pose2 step =
+      keyframes[m - 1]->pose.between(keyframes[m]->pose);
+    const Eigen::Matrix3d ad = step.inverse().AdjointMap();
+    const Eigen::Vector3d var(link.trans_sigma * link.trans_sigma,
+                              link.trans_sigma * link.trans_sigma,
+                              link.rot_sigma * link.rot_sigma);
+    cov = ad * cov * ad.transpose();
+    cov.diagonal() += var;
+  }
+  if (chained) {
+    if (from < to) return cov;
+    // cov is T_to^-1 T_from in from's frame; inverting a relative pose P
+    // moves a right perturbation xi to -Ad(P) xi
+    const Eigen::Matrix3d ad =
+      keyframes[to]->pose.between(keyframes[from]->pose).AdjointMap();
+    return ad * cov * ad.transpose();
+  }
+
+  // T_from^-1 T_to perturbs as xi_to - Ad(P^-1) xi_from, P = T_from^-1 T_to
+  const Eigen::Matrix3d ad =
+    keyframes[from]->pose.between(keyframes[to]->pose).inverse().AdjointMap();
+  return keyframes[to]->cov + ad * keyframes[from]->cov * ad.transpose();
+}
+
 // ---------------------------------------------------------------------------
 // point accumulation
 // ---------------------------------------------------------------------------
@@ -722,12 +769,17 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
                         ssm_params.cov_method == SMParams::SAMPLED);
   run_scan_match_icp(ret2, ssm_params);
 
-  // the transformation compared to dead reckoning can't be too large
+  // the transformation compared to dead reckoning can't be too large. The
+  // source's predicted pose is the target's graph pose advanced by the DR
+  // increment, so measure from that -- not from initial_transform, the
+  // global-init seed, which can sit anywhere in the +-5 sigma search window
+  // and so neither bounds the correction nor tolerates ICP walking from a
+  // poor seed to the right answer.
   double delta_translation = std::numeric_limits<double>::quiet_NaN();
   double delta_rotation = std::numeric_limits<double>::quiet_NaN();
   if (ret2.status) {
-    const gtsam::Pose2 delta =
-      ret2.initial_transform.between(ret2.estimated_transform);
+    const gtsam::Pose2 delta = ret2.target_pose.between(ret2.source_pose)
+                                 .between(ret2.estimated_transform);
     delta_translation =
       std::hypot(delta.translation().x(), delta.translation().y());
     delta_rotation = std::abs(delta.theta());
@@ -797,7 +849,7 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
       const Eigen::Matrix3d& gate_cov =
         ssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
       const IcpObservability obs = assess_icp_observability(
-        gate_cov, ssm_max_sigma, ssm_max_anisotropy);
+        gate_cov, ssm_max_sigma, ssm_max_anisotropy, degeneracy_sigma_floor());
       if (!obs.observable) {
         ret2.status = Status(Status::NOT_CONVERGED);
         ret2.status.description =
@@ -1346,7 +1398,7 @@ bool Slam::add_nonsequential_scan_matching()
     const Eigen::Matrix3d& gate_cov =
       nssm_degeneracy_prefloor ? ret2.cov_raw : ret2.cov;
     const IcpObservability obs = assess_icp_observability(
-      gate_cov, nssm_max_sigma, nssm_max_anisotropy);
+      gate_cov, nssm_max_sigma, nssm_max_anisotropy, degeneracy_sigma_floor());
     if (!obs.observable) {
       ret2.status = Status(Status::NOT_CONVERGED);
       ret2.status.description =
@@ -2185,11 +2237,12 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     keyframes.back()->update(pose);
   }
 
-  // PCM marginal refresh (fixes the DIVERGENCES.md known limitation: only
-  // the newest keyframe's marginal was ever refreshed, so PCM tested
-  // consistency against stale covariances and honest cliques never formed):
-  // refresh the marginals of every keyframe involved in a queued closure —
-  // a handful of O(1) calls per update, not the O(n^2) full-history sweep.
+  // PCM marginal refresh: refresh the marginals of every keyframe involved
+  // in a queued closure — a handful of O(1) calls per update, not the O(n^2)
+  // full-history sweep. PCM's relative_covariance composes link noise where
+  // the chain is intact and falls back to these marginals across a map-load
+  // boundary, where stale ones would test consistency against the wrong
+  // uncertainty.
   for (const ICPResult& q : nssm_queue_) {
     for (const int k : {q.source_key, q.target_key}) {
       if (k < 0 || k >= static_cast<int>(keyframes.size())) continue;
@@ -2404,35 +2457,36 @@ std::vector<int> Slam::verify_pcm(const std::deque<ICPResult>& queue,
       const gtsam::Pose2& pjk1 = ret_jk.estimated_transform;
       const gtsam::Pose2 pjk2 = pj.between(pi.compose(pil).compose(plk));
 
+      // error is a right perturbation of pjk1, i.e. in source k's frame
       const Eigen::Vector3d error = gtsam::Pose2::Logmap(pjk1.between(pjk2));
-      Eigen::Matrix3d cov = ret_jk.cov;
-      if (!ret_jk.has_cov)
-        cov = icp_odom_sigmas.array().square().matrix().asDiagonal();
-      // The consistency error routes through the GRAPH's relative pose
-      // between the two closures' source keyframes (plk) — its uncertainty
-      // (the drift PCM exists to tolerate) must appear in the chi2
-      // denominator or honest pairs on a drifted segment always fail.
-      // GTSAM marginals are BODY-frame tangent covariances (the tangent chart
-      // sits at the pose, Exp on the right), so rotate each keyframe's
-      // marginal into the world frame FIRST, sum there, then take the sum
-      // into pj's frame — the earlier code treated the body marginals as
-      // world and applied a spurious unrotation. Ignoring the (helpful)
-      // cross-correlation still makes this an over-estimate: permissive, so
-      // PCM keeps relying on the per-closure gates for outright junk.
-      const auto body_to_world = [](Eigen::Matrix3d c, const gtsam::Pose2& p) {
-        const Eigen::Matrix2d Rb = p.rotation().matrix();
-        c.topRows<2>() = Rb * c.topRows<2>();
-        c.leftCols<2>() = c.leftCols<2>() * Rb.transpose();
-        return c;
+      // Every link of the cycle j -> i -> l -> k contributes its uncertainty,
+      // carried into k's frame: a right perturbation of a factor followed by
+      // B in the product reappears as Ad(B^-1) at the end. The graph legs
+      // take the RELATIVE covariance between their keyframes -- absolute
+      // marginals carry the whole drift history both keyframes share, which
+      // under the deployed odometry sigmas grows to metres and makes any
+      // alias look consistent.
+      const auto carried = [](const Eigen::Matrix3d& c, const gtsam::Pose2& b) {
+        const Eigen::Matrix3d ad = b.inverse().AdjointMap();
+        return Eigen::Matrix3d(ad * c * ad.transpose());
       };
-      Eigen::Matrix3d rel =
-        body_to_world(keyframes[ret_il.source_key]->cov, ret_il.source_pose) +
-        body_to_world(keyframes[ret_jk.source_key]->cov, ret_jk.source_pose);
-      const Eigen::Matrix2d R = pj.rotation().matrix();
-      rel.topRows<2>() = R.transpose() * rel.topRows<2>();
-      rel.leftCols<2>() = rel.leftCols<2>() * R;
-      cov += rel;
-      const double md = error.dot(cov.inverse() * error);
+      const auto closure_cov = [this](const ICPResult& r) -> Eigen::Matrix3d {
+        if (r.has_cov) return r.cov;
+        return icp_odom_sigmas.array().square().matrix().asDiagonal();
+      };
+      const Eigen::Matrix3d cov =
+        closure_cov(ret_jk) +
+        relative_covariance(ret_il.source_key, ret_jk.source_key) +
+        carried(closure_cov(ret_il), plk) +
+        carried(relative_covariance(ret_jk.target_key, ret_il.target_key),
+                pil.compose(plk));
+      const Eigen::LDLT<Eigen::Matrix3d> ldlt(cov);
+      double md = ldlt.info() == Eigen::Success
+        ? error.dot(ldlt.solve(error))
+        : std::numeric_limits<double>::infinity();
+      // a singular or non-finite covariance must not vote for consistency
+      if (!std::isfinite(md) || md < 0.0)
+        md = std::numeric_limits<double>::infinity();
       if (last_pcm_min_md < 0.0 || md < last_pcm_min_md) last_pcm_min_md = md;
       // chi2.ppf(0.99, 3) = 11.34
       if (md < 11.34) {

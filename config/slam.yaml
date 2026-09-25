@@ -75,6 +75,10 @@
       max_correspondence: 0.75
       trim_ratio: 0.8
       max_iterations: 40
+      # ICP stops once a step moves less than this, so it is also the
+      # smallest spread the sampled covariance resolves: the ssm/nssm
+      # max_anisotropy gates measure sigma_max against it (a smaller
+      # epsilon makes those gates stricter).
       translation_epsilon: 0.005
       rotation_epsilon: 0.001
       min_correspondences: 6

@@ -309,6 +309,12 @@ public:
   std::vector<int> verify_pcm(const std::deque<ICPResult>& queue,
                               int min_pcm_value);
 
+  // Smallest translation spread the sampled covariance resolves, for the
+  // degeneracy gates' anisotropy (see assess_icp_observability): the
+  // constrained ICP's convergence tolerance. The legacy planar chain keeps
+  // no floor.
+  double degeneracy_sigma_floor() const;
+
 private:
   InitializationResult initialize_sequential_scan_matching(
     const KeyframePtr& keyframe);
@@ -352,6 +358,14 @@ private:
   // dr_backed reports which was used, for the gate's diagnostic text.
   gtsam::Pose2 predicted_relative_pose(int target_key, int source_key,
                                        bool* dr_backed = nullptr) const;
+
+  // Covariance of the graph's relative pose T_from^-1 * T_to as a right
+  // perturbation in `to`'s frame (Pose2 tangent: x, y, yaw), for PCM.
+  // Composed along the consecutive link factors between the two keyframes,
+  // which bound it from above: loop closures and unaries only add
+  // information. Where a link is missing (map-load boundary) it falls back
+  // to the two keyframes' marginals without their cross-correlation.
+  Eigen::Matrix3d relative_covariance(int from, int to) const;
 
   // failure recovery for update_factor_graph: undo loop-closure bookkeeping
   // written before a failed solve, and reconstruct ISAM2 from the committed
