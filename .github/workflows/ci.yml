@@ -2,13 +2,17 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, cam-dev, cam_dev]
   pull_request:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    container: ros:jazzy
+    strategy:
+      fail-fast: false
+      matrix:
+        ros: [jazzy, lyrical]
+    container: ros:${{ matrix.ros }}-ros-base
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,22 +22,36 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          rosdep update || true
-          rosdep install --from-paths src --ignore-src -y
+          apt-get install -y python3-colcon-common-extensions python3-rosdep
+          if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+            rosdep init
+          fi
+          rosdep update
+          if [ '${{ matrix.ros }}' = lyrical ]; then
+            bash src/sonar_slam_cpp/.github/install_libpointmatcher.sh
+          else
+            apt-get install -y ros-${{ matrix.ros }}-libpointmatcher
+          fi
+          rosdep install --from-paths src --ignore-src -y --skip-keys libpointmatcher
 
       - name: Build (CPU-only)
         shell: bash
         run: |
-          source /opt/ros/jazzy/setup.bash
+          source /opt/ros/${{ matrix.ros }}/setup.bash
           colcon build --packages-select sonar_slam_cpp \
             --event-handlers console_cohesion+ \
-            --cmake-args -DSONAR_SLAM_ENABLE_CUDA=OFF
+            --cmake-args -DSONAR_SLAM_ENABLE_CUDA=OFF -DBUILD_TESTING=ON
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 2
 
       - name: Test
         shell: bash
         run: |
-          source /opt/ros/jazzy/setup.bash
+          source /opt/ros/${{ matrix.ros }}/setup.bash
           source install/setup.bash
           colcon test --packages-select sonar_slam_cpp \
             --event-handlers console_cohesion+
           colcon test-result --verbose
+        env:
+          OMP_NUM_THREADS: 4
+          ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST

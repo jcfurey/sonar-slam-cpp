@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
+#include "sonar_slam_cpp/pose_covariance.hpp"
+#include "sonar_slam_cpp/registration.hpp"
 
 namespace sonar_slam {
 
@@ -76,6 +78,12 @@ struct Keyframe
   // update following a SLAM optimization step (slam_objects.py Keyframe.update)
   void update(const gtsam::Pose2& new_pose)
   {
+    if (chart == CloudChart::Body) {
+      update(gtsam::Pose3(gtsam::Rot3::Ypr(new_pose.theta(), pose3.rotation().pitch(),
+        pose3.rotation().roll()), gtsam::Point3(new_pose.x(), new_pose.y(), pose3.z())));
+      return;
+    }
+    update_extent();
     pose = new_pose;
     pose3 = gtsam::Pose3(
       gtsam::Rot3::Ypr(new_pose.theta(), dr_pose3.rotation().pitch(),
@@ -87,8 +95,7 @@ struct Keyframe
 
   void update(const gtsam::Pose2& new_pose, const Eigen::Matrix3d& new_cov)
   {
-    cov = new_cov;
-    has_cov = true;
+    set_cov(new_cov);
     update(new_pose);
   }
 
@@ -98,6 +105,13 @@ struct Keyframe
   // double-apply them). z comes from the estimate; roll/pitch ride from DR.
   void update(const gtsam::Pose3& est_h)
   {
+    update_extent();
+    if (chart == CloudChart::Body) {
+      pose3 = est_h;
+      pose = pose322(est_h);
+      transf_points = transform_body_points(points, pose3);
+      return;
+    }
     pose = gtsam::Pose2(est_h.x(), est_h.y(), est_h.rotation().yaw());
     pose3 = gtsam::Pose3(
       gtsam::Rot3::Ypr(pose.theta(), dr_pose3.rotation().pitch(),
@@ -109,8 +123,7 @@ struct Keyframe
 
   void update(const gtsam::Pose3& est_h, const Eigen::Matrix3d& new_cov)
   {
-    cov = new_cov;
-    has_cov = true;
+    set_cov(new_cov);
     update(est_h);
   }
 
@@ -120,9 +133,28 @@ struct Keyframe
   // redundant O(cloud) transform (used on the loop-closure marginal refresh).
   void set_cov(const Eigen::Matrix3d& new_cov)
   {
+    if (!valid_pose_covariance(new_cov)) {
+      invalidate_covariance();
+      return;
+    }
     cov = new_cov;
     has_cov = true;
     update_transf_cov();
+  }
+
+  void invalidate_covariance()
+  {
+    has_cov = false;
+    cov.setZero();
+    transf_cov.setZero();
+    has_covariance6 = false;
+    covariance6.setZero();
+  }
+
+  void set_covariance6(const Covariance6& value)
+  {
+    has_covariance6 = valid_covariance6(value);
+    covariance6 = has_covariance6 ? value : Covariance6::Zero();
   }
 
   // the keyframe's current estimate as a horizon pose (graph state chart)
@@ -166,6 +198,9 @@ struct Keyframe
   }
 
   bool status = false;
+  CloudChart chart = CloudChart::GravityHorizontal;
+  Covariance6 covariance6 = Covariance6::Zero();
+  bool has_covariance6 = false;
   builtin_interfaces::msg::Time time;
 
   gtsam::Pose3 dr_pose3;   // dead reckoning 3d pose
@@ -179,6 +214,7 @@ struct Keyframe
 
   Matrix points;         // local horizon-referenced frame, Nx3 (x, y, elev)
   Matrix transf_points;  // global horizon frame, Nx3 (x/y + pressure depth)
+  double horizontal_extent = 0.0;
 
   // Sonar optical-boresight elevation at the ping stamp.  It participates in
   // keyframe selection so a stationary mechanical head sweep still builds a
@@ -191,6 +227,17 @@ struct Keyframe
   geometry_msgs::msg::Twist twist;
 
 private:
+  Eigen::Index extent_rows_ = -1;
+  void update_extent()
+  {
+    // Registration clouds are immutable after graph admission. A new cloud
+    // gets one extent calculation; moving its pose does not change its radius.
+    if (extent_rows_ == points.rows()) return;
+    extent_rows_ = points.rows();
+    horizontal_extent = points.rows() ?
+      std::sqrt(points.leftCols(2).rowwise().squaredNorm().maxCoeff()) : 0.0;
+  }
+
   void update_transf_cov()
   {
     if (!has_cov) return;

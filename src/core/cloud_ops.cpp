@@ -209,16 +209,42 @@ Matrix transform_xyz_planar(const Matrix& source, double x, double y,
   return out;
 }
 
+// A matcher owns its reference cloud and search tree for the entire fit.
+// Each batch worker has its own matcher: libpointmatcher does not promise
+// concurrent findClosests calls on one matcher are safe.
+class PreparedMatcher
+{
+public:
+  PreparedMatcher(const Matrix& target, float max_distance)
+    : reference_(from_eigen(target))
+  {
+    PointMatcherSupport::Parametrizable::Parameters parameters;
+    parameters["knn"] = "1";
+    parameters["maxDist"] = std::to_string(max_distance);
+    matcher_ = PM::get().MatcherRegistrar.create("KDTreeMatcher", parameters);
+    matcher_->init(*reference_);
+  }
+  PM::Matches find(const Matrix& query)
+  {
+    const auto cloud = from_eigen(query);
+    return matcher_->findClosests(*cloud);
+  }
+private:
+  DPPtr reference_;
+  std::shared_ptr<PM::Matcher> matcher_;
+};
+
 }  // namespace
 
-ConstrainedIcpResult constrained_icp_xyz(
+static ConstrainedIcpResult constrained_icp_xyz_impl(
   const Matrix& source, const Matrix& target, const Eigen::Matrix3f& guess,
-  const ConstrainedIcpParams& params)
+  const ConstrainedIcpParams& params, PreparedMatcher& matcher,
+  std::chrono::steady_clock::time_point deadline)
 {
   ConstrainedIcpResult result;
   result.T = guess;
   if (source.cols() != 3 || target.cols() != 3 || source.rows() == 0 ||
-      target.rows() == 0) {
+      target.rows() == 0 || !source.allFinite() || !target.allFinite() || !guess.allFinite()) {
     result.message = "constrained XYZ ICP requires non-empty Nx3 clouds";
     return result;
   }
@@ -235,9 +261,14 @@ ConstrainedIcpResult constrained_icp_xyz(
                           static_cast<double>(guess(0, 0)));
 
   for (int iteration = 0; iteration < params.max_iterations; ++iteration) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      result.message = "constrained XYZ ICP deadline exceeded";
+      return result;
+    }
     const Matrix transformed = transform_xyz_planar(source, x, y, yaw);
-    const auto [ids, dists] = match(
-      target, transformed, 1, params.max_correspondence);
+    const auto matches = matcher.find(transformed);
+    const auto& ids = matches.ids;
+    const auto& dists = matches.dists;
 
     std::vector<std::pair<float, int>> valid;
     valid.reserve(static_cast<std::size_t>(source.rows()));
@@ -281,7 +312,8 @@ ConstrainedIcpResult constrained_icp_xyz(
     }
 
     const Eigen::LDLT<Eigen::Matrix3d> ldlt(H);
-    if (ldlt.info() != Eigen::Success) {
+    if (ldlt.info() != Eigen::Success ||
+        !(ldlt.vectorD().minCoeff() > 1e-12 * std::max(1.0, H.diagonal().maxCoeff()))) {
       result.message = "singular constrained XYZ ICP normal matrix";
       return result;
     }
@@ -295,22 +327,43 @@ ConstrainedIcpResult constrained_icp_xyz(
     yaw = std::remainder(yaw + delta[2], 2.0 * M_PI);
     result.correspondences = keep;
     result.iterations = iteration + 1;
+    double squared_error = 0.0;
+    for (int n = 0; n < keep; ++n) squared_error += valid[static_cast<std::size_t>(n)].first;
+    result.rmse = std::sqrt(squared_error / keep);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      result.message = "constrained XYZ ICP deadline exceeded";
+      return result;
+    }
     if (delta.head<2>().norm() <= params.translation_epsilon &&
         std::abs(delta[2]) <= params.rotation_epsilon) {
       result.success = true;
+      result.converged = true;
       result.message = "success";
       result.T = pose_matrix(x, y, yaw);
       return result;
     }
   }
 
-  // A bounded, finite solution at the iteration cap is still a valid ICP
-  // result; the downstream overlap/covariance/maximum-correction gates decide
-  // whether it is safe to become a graph factor.
-  result.success = true;
-  result.message = "success";
+  result.iteration_limit = true;
+  result.success = params.allow_iteration_limit;
+  result.message = "constrained XYZ ICP iteration limit";
   result.T = pose_matrix(x, y, yaw);
   return result;
+}
+
+ConstrainedIcpResult constrained_icp_xyz(
+  const Matrix& source, const Matrix& target, const Eigen::Matrix3f& guess,
+  const ConstrainedIcpParams& params)
+{
+  if (source.cols() != 3 || target.cols() != 3 || !source.rows() || !target.rows() ||
+      !source.allFinite() || !target.allFinite()) {
+    ConstrainedIcpResult result;
+    result.message = "constrained XYZ ICP requires finite nonempty Nx3 clouds";
+    return result;
+  }
+  PreparedMatcher matcher(target, params.max_correspondence);
+  return constrained_icp_xyz_impl(source, target, guess, params, matcher,
+    std::chrono::steady_clock::time_point::max());
 }
 
 std::vector<ConstrainedIcpResult> constrained_icp_xyz_batch(
@@ -319,18 +372,41 @@ std::vector<ConstrainedIcpResult> constrained_icp_xyz_batch(
   const ConstrainedIcpParams& params, int max_ms)
 {
   std::vector<ConstrainedIcpResult> results(guesses.size());
+  if (guesses.empty() || source.cols() != 3 || target.cols() != 3 ||
+      !source.rows() || !target.rows() || !source.allFinite() || !target.allFinite()) return results;
   const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::milliseconds(std::max(0, max_ms));
+  int workers = 1;
+#ifdef _OPENMP
+  workers = std::max(1, std::min({params.max_threads, omp_get_max_threads(),
+    static_cast<int>(guesses.size())}));
+#endif
+  std::vector<std::unique_ptr<PreparedMatcher>> matchers;
+  for (int worker = 0; worker < workers; ++worker)
+    matchers.push_back(std::make_unique<PreparedMatcher>(target, params.max_correspondence));
   std::vector<char> expired(guesses.size(), 0);
-#pragma omp parallel for schedule(dynamic)
+  std::exception_ptr fatal;
+#pragma omp parallel for schedule(dynamic) num_threads(workers)
   for (int i = 0; i < static_cast<int>(guesses.size()); ++i) {
     if (i > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - start).count() >= max_ms) {
       expired[static_cast<std::size_t>(i)] = 1;
       continue;
     }
-    results[static_cast<std::size_t>(i)] = constrained_icp_xyz(
-      source, target, guesses[static_cast<std::size_t>(i)], params);
+    int worker = 0;
+#ifdef _OPENMP
+    worker = omp_get_thread_num();
+#endif
+    try {
+      results[static_cast<std::size_t>(i)] = constrained_icp_xyz_impl(
+        source, target, guesses[static_cast<std::size_t>(i)], params,
+        *matchers[worker], deadline);
+    } catch (...) {
+#pragma omp critical(sonar_slam_constrained_batch_fatal)
+      if (!fatal) fatal = std::current_exception();
+    }
   }
+  if (fatal) std::rethrow_exception(fatal);
   // Keep prefix semantics like ICP::compute_batch: a later dynamic worker may
   // have finished after an earlier slot observed the cap.
   auto first = std::find(expired.begin(), expired.end(), 1);

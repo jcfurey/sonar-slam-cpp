@@ -79,6 +79,19 @@ public:
   }
 
   const std::vector<Anchor>& anchors() const { return anchors_; }
+  void reparent(const std::vector<KeyframePtr>& parents, std::size_t first = 0)
+  {
+    if (first >= parents.size()) return;
+    const auto update = [&](Anchor& anchor) {
+      const auto after = std::upper_bound(parents.begin() + first, parents.end(), ns(anchor.time),
+        [](int64_t stamp, const KeyframePtr& parent) { return stamp < ns(parent->time); });
+      anchor.parent = after == parents.begin() + first ? first :
+        static_cast<std::size_t>(std::distance(parents.begin(), after) - 1);
+    };
+    for (auto& anchor : anchors_) update(anchor);
+    for (auto& anchor : pending_) update(anchor);
+    if (latest_) update(*latest_);
+  }
   std::size_t pending() const { return pending_.size(); }
   void clear() { anchors_.clear(); pending_.clear(); latest_.reset(); }
 

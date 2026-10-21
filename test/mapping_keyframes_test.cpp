@@ -1,15 +1,18 @@
 // Exercise the public node boundary: mapping trajectory anchors survive weak
 // acoustics, while their clouds cannot become sequential or loop evidence.
-#define main slam_node_disabled_main
-#include "../src/nodes/slam_node.cpp"
-#undef main
+#include "sonar_slam_cpp/node.hpp"
+#include "sonar_slam_cpp/common.hpp"
+#include "sonar_slam_cpp/ros_conversions.hpp"
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
-#include <tf2_ros/static_transform_broadcaster.h>
-#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
 
 #define CHECK(condition, message) \
   do { if (!(condition)) { std::fprintf(stderr, "FAIL line %d: %s\n", \
@@ -58,12 +61,12 @@ int main()
   const char* cfg = std::getenv("SLAM_TEST_CONFIG");
   CHECK(cfg, "SLAM_TEST_CONFIG missing");
   rclcpp::NodeOptions options;
-  options.arguments({"--ros-args", "--params-file", cfg,
+  options.arguments({"--ros-args", "-r", "__ns:=/bruce/slam", "--params-file", cfg,
     "-p", "points_topic:=/mapping_test/points",
     "-p", "keyframe_translation:=0.75",
     "-p", "point_resolution:=0.1",
     "-p", "tf_lookup_timeout:=0.02"});
-  auto slam = std::make_shared<sonar_slam::SlamNode>(options);
+  auto slam = sonar_slam::make_slam_node(options);
   auto probe = rclcpp::Node::make_shared("mapping_keyframes_probe");
   auto pub = probe->create_publisher<sensor_msgs::msg::PointCloud2>(
     "/mapping_test/points", rclcpp::QoS(10).reliable());
@@ -90,7 +93,7 @@ int main()
     sonar_slam::SLAM_TRAJ_TOPIC, rclcpp::QoS(4).reliable().transient_local(),
     [&](const sensor_msgs::msg::PointCloud2& msg) { trajectory = msg; });
   auto mapping_sub = probe->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "/slam/mapping_traj", rclcpp::QoS(4).reliable().transient_local(),
+    "/bruce/slam/slam/mapping_traj", rclcpp::QoS(4).reliable().transient_local(),
     [&](const sensor_msgs::msg::PointCloud2& msg) { mapping_trajectory = msg; });
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(slam);

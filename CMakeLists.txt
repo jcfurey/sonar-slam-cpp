@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
-add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+add_compile_options(
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+  $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+  $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>)
 
 # Only the scan-matching kernels remain here. Image scanning, CFAR and polar
 # projection belong to sonar_proc.
@@ -37,14 +40,16 @@ ament_auto_find_build_dependencies()
 
 function(auto_target_dependencies target)
   if(COMMAND ament_auto_depend_on_packages)
-    ament_auto_depend_on_packages(${target} PACKAGES ${ARGN})
+    ament_auto_depend_on_packages(${target} SCOPE PUBLIC PACKAGES ${ARGN})
   else()
-    ament_target_dependencies(${target} ${ARGN})
+    ament_target_dependencies(${target} PUBLIC ${ARGN})
   endif()
 endfunction()
 
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
@@ -84,50 +89,53 @@ add_library(sonar_slam_core SHARED
   src/core/global_init.cpp
   src/core/mcd.cpp
   src/core/icp_covariance.cpp
+  src/core/registration.cpp
+  src/core/se3_backend.cpp
   src/core/slam_core.cpp)
 target_include_directories(sonar_slam_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
-  ${EIGEN3_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS})
-target_link_libraries(sonar_slam_core
-  ${OpenCV_LIBS}
-  gtsam
-  ${PCL_LIBRARIES})
+  ${EIGEN3_INCLUDE_DIRS})
+target_include_directories(sonar_slam_core PRIVATE ${PCL_INCLUDE_DIRS})
+target_link_libraries(sonar_slam_core PUBLIC gtsam Eigen3::Eigen
+  PRIVATE ${OpenCV_LIBS} ${PCL_LIBRARIES})
 auto_target_dependencies(
   sonar_slam_core builtin_interfaces geometry_msgs)
 if(TARGET libpointmatcher::libpointmatcher)
   target_link_libraries(
-    sonar_slam_core libpointmatcher::libpointmatcher)
+    sonar_slam_core PRIVATE libpointmatcher::libpointmatcher)
 else()
   target_include_directories(
-    sonar_slam_core PUBLIC ${libpointmatcher_INCLUDE_DIRS})
+    sonar_slam_core PRIVATE ${libpointmatcher_INCLUDE_DIRS})
   target_link_libraries(
-    sonar_slam_core ${libpointmatcher_LIBRARIES})
+    sonar_slam_core PRIVATE ${libpointmatcher_LIBRARIES})
 endif()
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(sonar_slam_core OpenMP::OpenMP_CXX)
+  target_link_libraries(sonar_slam_core PRIVATE OpenMP::OpenMP_CXX)
 endif()
 if(HAVE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(
     sonar_slam_core PUBLIC SONAR_SLAM_WITH_CUDA)
   target_link_libraries(
-    sonar_slam_core sonar_slam_cuda CUDA::cudart_static)
+    sonar_slam_core PRIVATE sonar_slam_cuda CUDA::cudart_static)
 endif()
 
 add_library(sonar_slam_ros SHARED src/ros/ros_conversions.cpp)
-target_link_libraries(sonar_slam_ros sonar_slam_core)
+target_link_libraries(sonar_slam_ros PUBLIC sonar_slam_core)
 auto_target_dependencies(
   sonar_slam_ros
   std_msgs sensor_msgs geometry_msgs visualization_msgs builtin_interfaces)
 
-add_executable(slam_node src/nodes/slam_node.cpp)
-target_link_libraries(slam_node sonar_slam_ros)
+add_library(sonar_slam_component SHARED src/nodes/slam_node.cpp)
+target_link_libraries(sonar_slam_component PUBLIC sonar_slam_ros)
 auto_target_dependencies(
-  slam_node
+  sonar_slam_component
   rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs nav_msgs
-  visualization_msgs builtin_interfaces tf2 tf2_ros ament_index_cpp)
+  visualization_msgs builtin_interfaces tf2 tf2_ros ament_index_cpp rclcpp_components)
+rclcpp_components_register_nodes(sonar_slam_component "sonar_slam::SlamNode")
+add_executable(slam_node src/nodes/slam_main.cpp)
+target_link_libraries(slam_node PUBLIC sonar_slam_component)
 install(TARGETS slam_node DESTINATION lib/${PROJECT_NAME})
 
 # Sanitizer recipe (verified 2026-08-02). ASan+UBSan over the test suite:
@@ -149,6 +157,11 @@ install(TARGETS slam_node DESTINATION lib/${PROJECT_NAME})
 # parity; the suite then runs sanitizer-clean end to end.
 if(BUILD_TESTING)
   find_package(ament_cmake_test REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(test_installed_consumer
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/installed_consumer.py
+      ${CMAKE_INSTALL_PREFIX} ${CMAKE_CURRENT_BINARY_DIR}/installed-consumer
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_interp_spline test/interp_spline_test.cpp)
   target_include_directories(
@@ -172,13 +185,13 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_cloud_ops test/cloud_ops_test.cpp)
-  target_link_libraries(test_cloud_ops sonar_slam_core)
+  target_link_libraries(test_cloud_ops PUBLIC sonar_slam_core)
   ament_add_test(test_cloud_ops
     COMMAND $<TARGET_FILE:test_cloud_ops>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_slam_node test/slam_node_test.cpp)
-  target_link_libraries(test_slam_node sonar_slam_ros)
+  target_link_libraries(test_slam_node PUBLIC sonar_slam_component)
   auto_target_dependencies(
     test_slam_node
     rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
@@ -192,9 +205,14 @@ if(BUILD_TESTING)
     ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
         ROS_DOMAIN_ID=152
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+  ament_add_test(test_slam_no_reset
+    COMMAND $<TARGET_FILE:test_slam_node> no-reset
+    ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
+        ROS_DOMAIN_ID=154 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_mapping_keyframes test/mapping_keyframes_test.cpp)
-  target_link_libraries(test_mapping_keyframes sonar_slam_ros)
+  target_link_libraries(test_mapping_keyframes PUBLIC sonar_slam_component)
   auto_target_dependencies(
     test_mapping_keyframes
     rclcpp std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
@@ -207,31 +225,42 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_mapping_trajectory test/mapping_trajectory_test.cpp)
-  target_link_libraries(test_mapping_trajectory sonar_slam_core)
+  target_link_libraries(test_mapping_trajectory PUBLIC sonar_slam_core)
   ament_add_test(test_mapping_trajectory
     COMMAND $<TARGET_FILE:test_mapping_trajectory>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_ros_conversions test/ros_conversions_test.cpp)
-  target_link_libraries(test_ros_conversions sonar_slam_ros)
+  target_link_libraries(test_ros_conversions PUBLIC sonar_slam_ros)
   ament_add_test(test_ros_conversions
     COMMAND $<TARGET_FILE:test_ros_conversions>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_slam_covariance test/slam_covariance_test.cpp)
-  target_link_libraries(test_slam_covariance sonar_slam_core)
+  target_link_libraries(test_slam_covariance PUBLIC sonar_slam_core)
   ament_add_test(test_slam_covariance
     COMMAND $<TARGET_FILE:test_slam_covariance>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
+  add_executable(test_pose_covariance test/pose_covariance_test.cpp)
+  target_link_libraries(test_pose_covariance PUBLIC sonar_slam_core)
+  ament_add_test(test_pose_covariance
+    COMMAND $<TARGET_FILE:test_pose_covariance>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+  add_executable(test_registration_queue test/registration_queue_test.cpp)
+  target_link_libraries(test_registration_queue PUBLIC sonar_slam_core)
+  ament_add_test(test_registration_queue
+    COMMAND $<TARGET_FILE:test_registration_queue>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
+
   add_executable(test_map_persistence test/map_persistence_test.cpp)
-  target_link_libraries(test_map_persistence sonar_slam_core)
+  target_link_libraries(test_map_persistence PUBLIC sonar_slam_core)
   ament_add_test(test_map_persistence
     COMMAND $<TARGET_FILE:test_map_persistence>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_icp_wrapper test/icp_wrapper_test.cpp)
-  target_link_libraries(test_icp_wrapper sonar_slam_core)
+  target_link_libraries(test_icp_wrapper PUBLIC sonar_slam_core)
   ament_add_test(test_icp_wrapper
     COMMAND $<TARGET_FILE:test_icp_wrapper>
     ENV ICP_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/icp.yaml
@@ -240,14 +269,14 @@ if(BUILD_TESTING)
   add_executable(test_isam_recovery test/test_isam_recovery.cpp)
   target_include_directories(
     test_isam_recovery PRIVATE ${EIGEN3_INCLUDE_DIRS})
-  target_link_libraries(test_isam_recovery gtsam)
+  target_link_libraries(test_isam_recovery PUBLIC gtsam)
   ament_add_test(test_isam_recovery
     COMMAND $<TARGET_FILE:test_isam_recovery>
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(
     test_manual_correction test/test_manual_correction.cpp)
-  target_link_libraries(test_manual_correction sonar_slam_core)
+  target_link_libraries(test_manual_correction PUBLIC sonar_slam_core)
   auto_target_dependencies(
     test_manual_correction builtin_interfaces geometry_msgs)
   ament_add_test(test_manual_correction
@@ -255,7 +284,7 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 
   add_executable(test_pipeline_e2e test/test_pipeline_e2e.cpp)
-  target_link_libraries(test_pipeline_e2e sonar_slam_core)
+  target_link_libraries(test_pipeline_e2e PUBLIC sonar_slam_core)
   auto_target_dependencies(
     test_pipeline_e2e builtin_interfaces geometry_msgs)
   target_compile_definitions(
@@ -270,6 +299,18 @@ if(BUILD_TESTING)
   # ground truth under the DEPLOYED profile, read from the settings package
   # when this workspace has it (the package config otherwise).
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_global_init test/global_init_test.cpp TIMEOUT 60)
+  target_link_libraries(test_global_init sonar_slam_core)
+  ament_add_gtest(test_rigid_registration test/rigid_registration_test.cpp)
+  target_link_libraries(test_rigid_registration sonar_slam_core)
+  ament_add_gtest(test_se3_backend test/se3_backend_test.cpp TIMEOUT 120)
+  target_link_libraries(test_se3_backend sonar_slam_core)
+  ament_add_gtest(test_graph_transactions test/graph_transactions_test.cpp)
+  target_link_libraries(test_graph_transactions sonar_slam_core)
+  ament_add_gtest(test_node_regression test/node_regression_test.cpp TIMEOUT 60
+    ENV SLAM_TEST_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/slam.yaml
+        ROS_DOMAIN_ID=155 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+  target_link_libraries(test_node_regression sonar_slam_component)
   set(SLAM_HARNESS_CONFIG
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../settings/params/localization/sonar_slam/slam.yaml")
   if(NOT EXISTS "${SLAM_HARNESS_CONFIG}")
@@ -287,18 +328,23 @@ if(BUILD_TESTING)
   endif()
   target_link_libraries(
     test_loop_closure_harness sonar_slam_core ${SLAM_HARNESS_YAML})
-  auto_target_dependencies(
-    test_loop_closure_harness builtin_interfaces geometry_msgs)
   target_compile_definitions(
     test_loop_closure_harness
     PRIVATE TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-install(TARGETS sonar_slam_core sonar_slam_ros
+install(TARGETS sonar_slam_core sonar_slam_ros sonar_slam_component
+  EXPORT export_sonar_slam_cpp
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
-ament_auto_package()
+ament_export_targets(export_sonar_slam_cpp HAS_LIBRARY_TARGET NAMESPACE sonar_slam_cpp::)
+ament_export_include_directories(include)
+ament_export_dependencies(
+  rclcpp rclcpp_components std_msgs std_srvs diagnostic_msgs sensor_msgs geometry_msgs
+  nav_msgs visualization_msgs builtin_interfaces tf2 tf2_ros ament_index_cpp
+  rcl_interfaces Eigen3 GTSAM)
+ament_package()

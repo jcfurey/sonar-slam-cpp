@@ -7,9 +7,9 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2/exceptions.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_broadcaster.h>
-#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
+#include <tf2_ros/transform_listener.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
@@ -28,8 +28,11 @@
 
 #include "sonar_slam_cpp/gpu.hpp"
 #include "sonar_slam_cpp/mapping_trajectory.hpp"
+#include "sonar_slam_cpp/registration_queue.hpp"
 #include "sonar_slam_cpp/common.hpp"
 #include "sonar_slam_cpp/node_base.hpp"
+#include "sonar_slam_cpp/node.hpp"
+#include <rclcpp_components/register_node_macro.hpp>
 #include "sonar_slam_cpp/ros_conversions.hpp"
 #include "sonar_slam_cpp/sonar_input.hpp"
 #include "sonar_slam_cpp/slam_core.hpp"
@@ -88,6 +91,55 @@ public:
     slam_.icp_odom_sigmas = sigmas("icp_odom_sigmas", get_double_array("icp_odom_sigmas"));
 
     slam_.point_resolution = get_double("point_resolution");
+    registration_max_points_ = get_int("registration/max_points", 5000);
+    slam_.se3_options.max_source_points = registration_max_points_;
+    registration_resolution_ = get_double("registration/voxel_resolution", slam_.point_resolution);
+    if (registration_max_points_ < 50 || !std::isfinite(registration_resolution_) ||
+        registration_resolution_ <= 0.0)
+      throw std::invalid_argument("registration limits require max_points >= 50 and positive voxel_resolution");
+    input_model_ = get_string("input_model", "imaging");
+    if (input_model_ != "imaging" && input_model_ != "measured_xyz")
+      throw std::invalid_argument("input_model must be imaging or measured_xyz");
+    slam_.input_model = input_model_;
+    const auto model = get_string("registration_model", "constrained_xyyaw");
+    if (model != "constrained_xyyaw" && model != "se3")
+      throw std::invalid_argument("registration_model must be constrained_xyyaw or se3");
+    slam_.registration_model = model == "se3" ? RegistrationModel::SE3 : RegistrationModel::ConstrainedXYYaw;
+    manual_correction_mode_ = get_string("manual_correction_mode", "planar");
+    if (manual_correction_mode_ != "planar" && manual_correction_mode_ != "se3")
+      throw std::invalid_argument("manual_correction_mode must be planar or se3");
+    if (manual_correction_mode_ == "se3" && slam_.registration_model != RegistrationModel::SE3)
+      throw std::invalid_argument("full pose corrections require registration_model se3");
+    slam_.map_calibration_id = get_string("map_calibration_id", "");
+    slam_.map_depth_datum = get_string("map_depth_datum", "pressure_zero");
+    slam_.allow_legacy_map = get_bool("allow_legacy_map", false);
+    const auto six_sigmas = [](const std::vector<double>& values) {
+      if (values.size() != 6 || !std::all_of(values.begin(), values.end(),
+          [](double value) { return std::isfinite(value) && value > 0; }))
+        throw std::invalid_argument("SE3 sigmas need [roll,pitch,yaw,x,y,z], finite and positive");
+      return Eigen::Map<const gtsam::Vector6>(values.data()).eval();
+    };
+    slam_.se3_options.prior_sigmas = six_sigmas(get_double_array("se3/prior_sigmas", {.1, .1, .1, .1, .1, .1}));
+    slam_.se3_options.odom_sigmas = six_sigmas(get_double_array("se3/odom_sigmas", {.1, .1, .1, .3, .3, .15}));
+    auto& rigid = slam_.se3_options.icp;
+    rigid.max_correspondence = get_double("se3/max_correspondence", .75);
+    rigid.trim_ratio = get_double("se3/trim_ratio", .8);
+    rigid.max_iterations = get_int("se3/max_iterations", 50);
+    rigid.min_correspondences = get_int("se3/min_correspondences", 30);
+    rigid.translation_epsilon = get_double("se3/translation_epsilon", .005);
+    rigid.rotation_epsilon = get_double("se3/rotation_epsilon", .001);
+    rigid.normal_neighbors = get_int("se3/normal_neighbors", 15);
+    rigid.normal_radius = get_double("se3/normal_radius", 1.0);
+    rigid.max_curvature = get_double("se3/max_curvature", .1);
+    rigid.sensor_noise = get_double("se3/sensor_noise", .1);
+    rigid.rank_tolerance = get_double("se3/rank_tolerance", 1e-4);
+    rigid.rotation_sigma_floor = get_double("se3/rotation_sigma_floor", .02);
+    rigid.translation_sigma_floor = get_double("se3/translation_sigma_floor", .05);
+    slam_.se3_options.max_rotation_sigma = get_double("se3/max_rotation_sigma", .25);
+    slam_.se3_options.relocalize_depth_range = get_double("se3/relocalize_depth_range", 1.0);
+    slam_.se3_options.relocalize_attitude_range = get_double("se3/relocalize_attitude_range", .15);
+    slam_.se3_options.max_seed_points = get_int("se3/max_seed_points", 250000);
+    slam_.use_body_fan_gate = input_model_ == "imaging";
     slam_.point_noise = get_double("point_noise", 0.5);
     slam_.constrained_3d = get_bool("constrained_3d/enabled", true);
     slam_.constrained_icp_params.max_correspondence = static_cast<float>(
@@ -102,6 +154,7 @@ public:
       get_double("constrained_3d/rotation_epsilon", 0.001);
     slam_.constrained_icp_params.min_correspondences =
       get_int("constrained_3d/min_correspondences", 6);
+    slam_.constrained_icp_params.max_threads = get_int("constrained_3d/max_threads", 4);
     // The global-init cost grid divides its resolution and dilation radius
     // by point_noise; zero/negative is a config error, not a tunable.
     if (!(slam_.point_noise > 0.0))
@@ -117,11 +170,19 @@ public:
     // !(x >= 0) also rejects NaN. A negative tolerance makes every normal
     // forward step read as a rewind — the node would silently reset the
     // session on every ping.
-    if (!(time_rewind_tolerance_ >= 0.0))
-      throw std::invalid_argument("time_rewind_tolerance must be >= 0");
+    if (!std::isfinite(time_rewind_tolerance_) || time_rewind_tolerance_ < 0.0)
+      throw std::invalid_argument("time_rewind_tolerance must be finite and >= 0");
     odom_frame_ = get_string("odom_frame", "odom");
     base_frame_ = get_string("base_frame", "base_link");
+    map_frame_ = get_string("map_frame", "map");
+    if (map_frame_.empty() || odom_frame_.empty() || base_frame_.empty() ||
+        map_frame_ == odom_frame_ || map_frame_ == base_frame_ || odom_frame_ == base_frame_)
+      throw std::invalid_argument("map_frame, odom_frame and base_frame must be distinct nonempty frames");
     tf_lookup_timeout_ = get_double("tf_lookup_timeout", 0.05);
+    input_timeout_ = get_double("input_timeout", 2.0);
+    if (!std::isfinite(tf_lookup_timeout_) || tf_lookup_timeout_ < 0.0 ||
+        !std::isfinite(input_timeout_) || input_timeout_ <= 0.0)
+      throw std::invalid_argument("TF timeout must be nonnegative and input_timeout positive and finite");
     // Optional emergency gate.  Constrained-3D mode admits every head angle
     // by default; a positive value restores an operator-selected bound.
     max_head_pitch_ = get_double("max_head_pitch", 0.0);
@@ -202,6 +263,8 @@ public:
     if (admission_params_.min_points < slam_.ssm_params.min_points)
       throw std::runtime_error(
         "admission.min_points must be >= ssm.min_points");
+    if (registration_max_points_ < admission_params_.min_points)
+      throw std::invalid_argument("registration.max_points must be >= admission.min_points");
     if (!std::isfinite(admission_params_.cell_size) ||
         !(admission_params_.cell_size > 0.0) ||
         admission_params_.min_points < 1 ||
@@ -213,6 +276,7 @@ public:
         "admission cell/bin sizes must be positive and minimum counts >= 1");
 
     slam_.nssm_params.enable = get_bool("nssm/enable");
+    slam_.nssm_require_covariance = get_bool("nssm/require_covariance", true);
     slam_.nssm_params.min_st_sep = get_int("nssm/min_st_sep");
     slam_.nssm_params.min_revisit_sep = get_int("nssm/min_revisit_sep", 10);
     slam_.nssm_params.min_points = get_int("nssm/min_points");
@@ -324,7 +388,13 @@ public:
     // reliable), which is what actually makes the deep queue deliver.
     auto input_qos = rclcpp::SensorDataQoS(
       rclcpp::KeepLast(static_cast<std::size_t>(input_queue_depth)));
-    if (get_bool("input_reliable", false)) input_qos.reliable();
+    const bool input_reliable = get_bool("input_reliable", false);
+    if (input_reliable) input_qos.reliable();
+    registration_queue_ = std::make_unique<RegistrationQueue>(
+      static_cast<std::size_t>(input_queue_depth), input_reliable);
+    input_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions subscription_options;
+    subscription_options.callback_group = input_callback_group_;
     const auto output_qos = rclcpp::QoS(
       rclcpp::KeepLast(static_cast<std::size_t>(output_queue_depth)));
     // Oculus is a flash-imaging sonar: a cloud is one rigid ping, not a
@@ -342,7 +412,9 @@ public:
       points_topic_, input_qos,
       [this](const sensor_msgs::msg::PointCloud2& msg) {
         points_callback(msg);
-      });
+      }, subscription_options);
+    registration_timer_ = create_wall_timer(std::chrono::milliseconds(5),
+      [this] { process_pending_ping(); });
 
     // Operator hand-correction: RViz's "2D Pose Estimate" button publishes a
     // map-frame planar pose on /initialpose — applied as a prior on the
@@ -367,9 +439,9 @@ public:
     }
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      SLAM_POSE_TOPIC, output_qos);
+      "~/pose", output_qos);
     odom_pub_ =
-      create_publisher<nav_msgs::msg::Odometry>(SLAM_ODOM_TOPIC, output_qos);
+      create_publisher<nav_msgs::msg::Odometry>("~/odom", output_qos);
     // Depth 1 deliberately, decoupled from output_queue_depth: each
     // trajectory message carries the FULL keyframe history and fully
     // supersedes its predecessor, so a late joiner needs exactly one. A
@@ -377,20 +449,20 @@ public:
     // replay overlay's output_queue_depth 256 it dumped 256 full-trajectory
     // clouds to every late-joining assembler.
     traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      SLAM_TRAJ_TOPIC, latched_qos(1));
+      "~/traj", latched_qos(1));
     mapping_traj_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "~/mapping_traj", latched_qos(1));
     mapping_timer_ = create_wall_timer(
       std::chrono::duration<double>(std::min(mapping_interval / 4.0, 0.25)),
       [this]() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!slam_.keyframes.empty() && !slam_.awaiting_relocalization() &&
+        std::lock_guard<std::mutex> lock(mapping_mutex_);
+        if (!mapping_parents_.empty() && mapping_parents_epoch_ == input_epoch_ &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
               last_mapping_observation_wall_).count() >= mapping_anchor_interval_ &&
             mapping_trajectory_.flush()) publish_mapping_trajectory();
-      });
+      }, input_callback_group_);
     constraint_pub_ = create_publisher<visualization_msgs::msg::Marker>(
-      SLAM_CONSTRAINT_TOPIC, latched_qos());
+      "~/constraint", latched_qos());
 
     // A new session has no keyframes; say so on the latched trajectories, as
     // the rewind path does. After a respawn or manual restart the assembler
@@ -402,7 +474,7 @@ public:
       sensor_msgs::msg::PointCloud2 empty = make_cloud(
         {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
       empty.header.stamp = now();
-      empty.header.frame_id = "map";
+      empty.header.frame_id = map_frame_;
       traj_pub_->publish(empty);
       mapping_traj_pub_->publish(empty);
     }
@@ -411,8 +483,8 @@ public:
     // TF starvation and the NSSM accept/reject balance are visible in rqt.
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", 10);
-    diag_timer_ = create_timer(std::chrono::seconds(1),
-                               [this]() { publish_diagnostics(); });
+    diag_timer_ = create_wall_timer(std::chrono::seconds(1),
+                                    [this]() { publish_diagnostics(); });
 
     tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -423,6 +495,9 @@ public:
     // publish-inline-from-the-callback behaviour.
     tf_publish_period_ = get_double("tf_publish_period", 0.05);  // 20 Hz
     tf_tolerance_ = get_double("tf_tolerance", 0.1);
+    if (!std::isfinite(tf_publish_period_) || !std::isfinite(tf_tolerance_) ||
+        tf_tolerance_ < 0.0)
+      throw std::invalid_argument("TF period must be finite and TF tolerance finite and nonnegative");
     // Its own callback group, served by the multi-threaded executor in
     // run_node: in the default group a keyframe callback (global init,
     // covariance ICPs, iSAM2 and marginals) blocked the republish for its
@@ -436,11 +511,14 @@ public:
         [this]() { republish_map_odom(); }, tf_callback_group_);
     }
 
+    slam_.relocalize_min_confirmations = get_int("relocalize_min_confirmations", 2);
+    slam_.relocalize_min_overlap = get_double("relocalize_min_overlap", 0.5);
+    slam_.relocalize_max_ms = get_int("relocalize_max_ms", 5000);
     slam_.configure();
     RCLCPP_INFO(
       get_logger(),
       "Sonar registration: %s (head gate %s)",
-      slam_.constrained_3d
+      slam_.registration_model == RegistrationModel::SE3 ? "physical SE3 point-to-plane, six-axis graph" : slam_.constrained_3d
         ? "constrained XYZ correspondences -> x/y/yaw factors"
         : "legacy planar ICP",
       max_head_pitch_ <= 0.0 ? "disabled" : "enabled");
@@ -471,7 +549,6 @@ public:
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         save_map(*res);
       });
-    slam_.relocalize_min_overlap = get_double("relocalize_min_overlap", 0.5);
     const std::string load_path = get_string("map_load_path", "");
     if (!load_path.empty()) {
       if (slam_.load_map(load_path))
@@ -480,9 +557,7 @@ public:
                     "first dense candidate frame",
                     slam_.loaded_keyframes(), load_path.c_str());
       else
-        RCLCPP_ERROR(get_logger(),
-                     "map_load_path '%s' failed to load (%s); starting fresh",
-                     load_path.c_str(), slam_.last_error().c_str());
+        throw std::runtime_error("map_load_path rejected: " + slam_.last_error());
     }
 
     // USBL/LBL absolute position input: map-frame position fixes become
@@ -494,6 +569,10 @@ public:
     usbl_min_sigma_ = get_double("usbl/min_sigma", 0.5);
     usbl_max_stamp_delta_ = get_double("usbl/max_stamp_delta", 1.0);
     usbl_frame_id_ = get_string("usbl/frame_id", "");
+    if (!std::isfinite(usbl_max_innovation_) || !std::isfinite(usbl_min_sigma_) ||
+        usbl_min_sigma_ <= 0.0 || !std::isfinite(usbl_max_stamp_delta_) ||
+        usbl_max_stamp_delta_ < 0.0)
+      throw std::invalid_argument("USBL gates require finite innovation, positive min_sigma and nonnegative max_stamp_delta");
     if (!usbl_topic.empty()) {
       if (usbl_driver == "pose_cov") {
         usbl_sub_ = create_subscription<
@@ -513,10 +592,7 @@ public:
                           m.pose.covariance[0], m.pose.covariance[7]);
           });
       } else {
-        RCLCPP_ERROR(get_logger(),
-                     "usbl/driver '%s' unknown (pose_cov | odom) — USBL "
-                     "input disabled",
-                     usbl_driver.c_str());
+        throw std::invalid_argument("usbl.driver must be pose_cov or odom");
       }
     }
 
@@ -525,6 +601,7 @@ public:
     // SONAR_SLAM_FORCE_CPU=1); libpointmatcher ICP itself is CPU
     RCLCPP_INFO(get_logger(), "SLAM node is initialized (GPU: %s)",
                 gpu::available() ? "on" : "off");
+    finalize_parameters();
   }
 
   ~SlamNode() override
@@ -542,7 +619,7 @@ private:
                     const builtin_interfaces::msg::Time& data_stamp)
   {
     if (tf_publish_period_ <= 0.0) {
-      tf_->sendTransform(make_transform(t, q, data_stamp, "map", odom_frame_));
+      tf_->sendTransform(make_transform(t, q, data_stamp, map_frame_, odom_frame_));
       return;
     }
     std::lock_guard<std::mutex> lock(tf_mutex_);
@@ -572,6 +649,7 @@ private:
   // which is the whole reason rtabmap can run this at a fixed 20 Hz.
   void republish_map_odom()
   {
+    std::lock_guard<std::mutex> publish_lock(publication_mutex_);
     MapOdomTf c;
     {
       std::lock_guard<std::mutex> lock(tf_mutex_);
@@ -594,7 +672,7 @@ private:
               rclcpp::Duration::from_seconds(elapsed > 0.0 ? elapsed : 0.0) +
               tolerance;
     }
-    tf_->sendTransform(make_transform(c.t, c.q, stamp, "map", odom_frame_));
+    tf_->sendTransform(make_transform(c.t, c.q, stamp, map_frame_, odom_frame_));
   }
 
   static gtsam::Pose3 pose_from_transform(
@@ -608,6 +686,8 @@ private:
 
   void points_callback(const sensor_msgs::msg::PointCloud2& msg)
   {
+    input_receipt_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
     if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000U ||
         (msg.header.stamp.sec == 0 && msg.header.stamp.nanosec == 0)) {
       ++tf_lookup_failures_;
@@ -623,13 +703,19 @@ private:
       return;
     }
 
+    const rclcpp::Time acquisition_stamp(msg.header.stamp);
+    const bool rewind = last_ping_stamp_valid_ && reset_on_time_rewind_ &&
+      (acquisition_stamp - last_ping_stamp_).seconds() < -time_rewind_tolerance_;
+    if (last_ping_stamp_valid_ && acquisition_stamp <= last_ping_stamp_ && !rewind) {
+      ++out_of_order_rejections_;
+      return;
+    }
+
     geometry_msgs::msg::TransformStamped base_sensor;
     geometry_msgs::msg::TransformStamped odom_base;
     try {
       const auto stamp = rclcpp::Time(msg.header.stamp);
-      // ONE deadline shared by both lookups: under single-threaded spin these
-      // block the executor, and two full budgets back to back doubled the
-      // worst-case stall per ping (0.4 s at the replay overlay's 0.20 s).
+      // One deadline shared by both lookups bounds the intake stall per ping.
       // The second lookup gets whatever the first left unspent — both
       // transforms describe the same instant, so once the buffer has caught
       // up to the stamp the second lookup is typically immediate.
@@ -657,11 +743,24 @@ private:
       return;
     }
 
+    const auto valid_transform = [](const auto& transform) {
+      const auto& t = transform.transform.translation;
+      const auto& q = transform.transform.rotation;
+      const Eigen::Vector3d position(t.x, t.y, t.z);
+      const Eigen::Quaterniond rotation(q.w, q.x, q.y, q.z);
+      return position.allFinite() && rotation.coeffs().allFinite() &&
+        std::abs(rotation.norm() - 1.0) < 1e-3;
+    };
+    if (!valid_transform(base_sensor) || !valid_transform(odom_base)) {
+      ++tf_lookup_failures_;
+      RCLCPP_ERROR(get_logger(), "Dropping sonar ping: non-finite or unnormalized sensor/odometry TF");
+      return;
+    }
     const gtsam::Pose3 dr_pose3 = pose_from_transform(odom_base);
     {
       const rclcpp::Time stamp(msg.header.stamp);
       // looped/restarted bag: fresh baseline, not a spike verdict
-      if (have_last_dr_yaw_ && stamp < last_dr_yaw_stamp_)
+      if (rewind)
         have_last_dr_yaw_ = false;
       const double dr_yaw = dr_pose3.rotation().yaw();
       if (have_last_dr_yaw_ &&
@@ -700,9 +799,11 @@ private:
     q_bs.normalize();
     const Eigen::Matrix3f R_bs = q_bs.toRotationMatrix();
 
-    // Optical +Z is the sonar boresight. Its elevation in base_link gives the
+    // Optical +Z (imaging) or body +X (measured) is the sonar boresight. Its elevation gives the
     // head gate without another joint-state subscription or arrival-time latch.
-    const double head_pitch = optical_boresight_pitch(R_bs);
+    const Eigen::Vector3f boresight = R_bs * (input_model_ == "imaging"
+      ? Eigen::Vector3f(0, 0, 1) : Eigen::Vector3f(1, 0, 0));
+    const double head_pitch = std::atan2(boresight.z(), std::hypot(boresight.x(), boresight.y()));
     const bool scan_usable =
       max_head_pitch_ <= 0.0 || std::fabs(head_pitch) <= max_head_pitch_;
     if (!scan_usable) {
@@ -724,18 +825,122 @@ private:
         static_cast<float>(tr.z));
       // Store returns in the gravity-horizontal vehicle frame. This is a
       // single rigid ping transform, not per-point deskew.
-      const Eigen::Matrix3f R_h =
-        gtsam::Rot3::Ypr(0.0, dr_pose3.rotation().pitch(),
-                        dr_pose3.rotation().roll())
-          .matrix().cast<float>();
+      Eigen::Matrix3f R_h = Eigen::Matrix3f::Identity();
+      if (slam_.registration_model != RegistrationModel::SE3)
+        R_h = gtsam::Rot3::Ypr(0.0, dr_pose3.rotation().pitch(), dr_pose3.rotation().roll()).matrix().cast<float>();
       points = finite_points(
         project_flash_ping(xyz_sensor, R_bs, t_bs, R_h));
-      slam_callback(msg.header.stamp, dr_pose3, points, true, head_pitch);
+      if (points.rows() > registration_max_points_ || slam_.registration_model == RegistrationModel::SE3) {
+        points = downsample(points, static_cast<float>(registration_resolution_));
+        if (points.rows() > registration_max_points_) {
+          Matrix retained(registration_max_points_, 3);
+          for (int i = 0; i < registration_max_points_; ++i)
+            retained.row(i) = points.row(static_cast<Eigen::Index>(i) * points.rows() / registration_max_points_);
+          points = std::move(retained);
+        }
+      }
+      enqueue_ping(msg.header.stamp, dr_pose3, std::move(points), true, head_pitch, rewind);
       return;
     }
 
     points.resize(0, 3);
-    slam_callback(msg.header.stamp, dr_pose3, points, false, head_pitch);
+    enqueue_ping(msg.header.stamp, dr_pose3, std::move(points), false, head_pitch, rewind);
+  }
+
+  void enqueue_ping(const builtin_interfaces::msg::Time& time, const gtsam::Pose3& dr,
+                    Matrix points, bool usable, double head_pitch, bool rewind)
+  {
+    if (rewind) {
+      ++input_epoch_;
+      registration_queue_->clear();
+      {
+        std::lock_guard<std::mutex> lock(mapping_mutex_);
+        mapping_trajectory_.clear();
+        mapping_parents_.clear();
+      }
+      std::lock_guard<std::mutex> publish_lock(publication_mutex_);
+      sensor_msgs::msg::PointCloud2 empty = make_cloud(
+        {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
+      empty.header.stamp = time;
+      empty.header.frame_id = map_frame_;
+      traj_pub_->publish(empty);
+      mapping_traj_pub_->publish(empty);
+      visualization_msgs::msg::Marker clear;
+      clear.header.stamp = time;
+      clear.header.frame_id = map_frame_;
+      clear.action = visualization_msgs::msg::Marker::DELETEALL;
+      constraint_pub_->publish(clear);
+      std::lock_guard<std::mutex> tf_lock(tf_mutex_);
+      map_odom_tf_ = MapOdomTf{};
+    }
+    last_ping_stamp_ = rclcpp::Time(time);
+    last_ping_stamp_valid_ = true;
+    latest_input_ns_ = last_ping_stamp_.nanoseconds();
+    {
+      std::lock_guard<std::mutex> lock(mapping_mutex_);
+      const auto update = mapping_trajectory_.observe(time, dr,
+        mapping_parents_.empty() ? 0 : mapping_parents_.size() - 1);
+      if (update.accepted) last_mapping_observation_wall_ = std::chrono::steady_clock::now();
+      if (update.published) publish_mapping_trajectory();
+    }
+    try {
+      PendingPing ping;
+      ping.time = time;
+      ping.dr_pose = dr;
+      ping.points = std::move(points);
+      ping.usable = usable;
+      ping.head_pitch = head_pitch;
+      ping.epoch = input_epoch_;
+      registration_queue_->push(std::move(ping));
+    } catch (const std::exception& error) {
+      ++registration_queue_errors_;
+      RCLCPP_ERROR(get_logger(), "Registration input could not be retained: %s", error.what());
+    }
+  }
+
+  void process_pending_ping()
+  {
+    PendingPing ping;
+    try {
+      if (!registration_queue_->pop(ping)) return;
+    } catch (const std::exception& error) {
+      ++registration_queue_errors_;
+      RCLCPP_ERROR(get_logger(), "Registration input could not be restored: %s", error.what());
+      return;
+    }
+    if (ping.epoch != input_epoch_) return;
+    const auto start = std::chrono::steady_clock::now();
+    if (graph_epoch_ != ping.epoch) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      slam_.resetSession();
+      usbl_applied_.clear();
+      last_logged_key_ = -1;
+      if (viz_thread_.joinable()) viz_thread_.join();
+      last_viz_publish_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      graph_epoch_ = ping.epoch;
+    }
+    slam_callback(ping.time, ping.dr_pose, ping.points, ping.usable, ping.head_pitch);
+    processing_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (ping.epoch == input_epoch_) processed_input_ns_ = rclcpp::Time(ping.time).nanoseconds();
+  }
+
+  // Called with graph ownership. Mapping callbacks only access these small
+  // pose snapshots, so registration never holds their lock while matching.
+  void refresh_mapping_parents()
+  {
+    std::lock_guard<std::mutex> lock(mapping_mutex_);
+    if (graph_epoch_ != input_epoch_ || slam_.awaiting_relocalization()) return;
+    mapping_parents_.clear();
+    mapping_parents_.reserve(slam_.keyframes.size());
+    for (const auto& parent : slam_.keyframes) {
+      auto pose = std::make_shared<Keyframe>(true, parent->time, parent->dr_pose3);
+      pose->pose3 = parent->pose3;
+      pose->pose = parent->pose;
+      mapping_parents_.push_back(std::move(pose));
+    }
+    mapping_parents_epoch_ = graph_epoch_;
+    mapping_trajectory_.reparent(mapping_parents_, static_cast<std::size_t>(slam_.loaded_keyframes()));
+    publish_mapping_trajectory();
   }
 
   void slam_callback(const builtin_interfaces::msg::Time& time,
@@ -744,58 +949,11 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Bag rewind: a backward ping stamp means a looped/seeked replay. The
-    // graph is a single-session estimator — mixing two passes cross-
-    // contaminates keyframes and permanently breaks the assembler's evidence
-    // association (it resets and re-associates; this node previously did
-    // not). Reset like every other stateful node in the stack.
-    if (reset_on_time_rewind_ && last_ping_stamp_valid_) {
-      const double dt = (rclcpp::Time(time) - last_ping_stamp_).seconds();
-      if (dt < -time_rewind_tolerance_) {
-        RCLCPP_WARN(get_logger(),
-                    "Ping time moved backwards %.2f s — resetting the SLAM "
-                    "session (looped/seeked replay). A loaded map does not "
-                    "survive the reset.",
-                    -dt);
-        slam_.resetSession();
-        mapping_trajectory_.clear();
-        usbl_applied_.clear();
-        last_logged_key_ = -1;
-        // Finish the old snapshot before clearing its latch. Otherwise a
-        // late worker publish can resurrect the discarded session's markers.
-        if (viz_thread_.joinable()) viz_thread_.join();
-        last_viz_publish_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-        {
-          std::lock_guard<std::mutex> tf_lock(tf_mutex_);
-          map_odom_tf_ = MapOdomTf{};
-        }
-        // Refresh the transient-local latches NOW: both publishers latch
-        // depth 1, so without this the dead session's full-history snapshot
-        // stays the retained sample until the first post-reset keyframe —
-        // and in a looped replay pass-2 stamps EQUAL pass-1 stamps, so a
-        // late-joining consumer would associate new evidence to pre-reset
-        // poses. An empty trajectory and a DELETEALL marker are the correct
-        // "no session yet" statements.
-        {
-          sensor_msgs::msg::PointCloud2 empty = make_cloud(
-            {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, Matrix(0, 8));
-          empty.header.stamp = time;
-          empty.header.frame_id = "map";
-          traj_pub_->publish(empty);
-          mapping_traj_pub_->publish(empty);
-          visualization_msgs::msg::Marker clear;
-          clear.header.stamp = time;
-          clear.header.frame_id = "map";
-          clear.action = visualization_msgs::msg::Marker::DELETEALL;
-          constraint_pub_->publish(clear);
-        }
-      }
-    }
-    last_ping_stamp_ = rclcpp::Time(time);
-    last_ping_stamp_valid_ = true;
+    if (graph_epoch_ != input_epoch_) return;
 
     auto frame = std::make_shared<Keyframe>(
       false, time, dr_pose3, Matrix::Zero(0, 3), head_pitch);
+    if (slam_.registration_model == RegistrationModel::SE3) frame->chart = CloudChart::Body;
     ScanAdmission admission;
     bool scan_informative = false;
     if (scan_usable) {
@@ -844,6 +1002,7 @@ private:
         try {
           ok = slam_.relocalize(frame);
         } catch (const std::exception& e) {
+          slam_.discard_pending_update();
           RCLCPP_ERROR(get_logger(), "relocalization attempt threw: %s",
                        e.what());
         }
@@ -872,9 +1031,14 @@ private:
     frame->status = slam_.is_keyframe(*frame);
 
     if (!slam_.keyframes.empty()) {
+      if (slam_.registration_model == RegistrationModel::SE3) {
+        frame->update(slam_.current_keyframe()->pose3.compose(
+          slam_.current_keyframe()->dr_pose3.between(frame->dr_pose3)));
+      } else {
       const gtsam::Pose2 dr_odom =
         slam_.current_keyframe()->dr_pose.between(frame->dr_pose);
       frame->update(slam_.current_keyframe()->pose.compose(dr_odom));
+      }
     }
 
     if (frame->status) {
@@ -913,6 +1077,7 @@ private:
                          slam_.last_error().c_str());
         }
       } catch (const std::exception& e) {
+        slam_.discard_pending_update();
         RCLCPP_ERROR(get_logger(),
                      "SLAM back-end update failed, skipping frame: %s", e.what());
       }
@@ -924,15 +1089,11 @@ private:
 
   void publish_all()
   {
-    if (!slam_.current_frame) return;
+    if (!slam_.current_frame || graph_epoch_ != input_epoch_) return;
     publish_pose();
     if (slam_.keyframes.empty()) return;
-    const auto mapping_update = mapping_trajectory_.observe(
-      slam_.current_frame->time, slam_.current_frame->dr_pose3,
-      slam_.keyframes.size() - 1);
-    if (mapping_update.accepted) last_mapping_observation_wall_ = std::chrono::steady_clock::now();
-    if (mapping_update.published || slam_.current_frame->status) publish_mapping_trajectory();
     if (slam_.current_frame->status) {
+      refresh_mapping_parents();
       publish_trajectory();
       // Constraint markers re-walk the graph history, so rate-limit and build
       // them off the sensor callback.
@@ -967,11 +1128,22 @@ private:
       snap.push_back({kf->pose, kf->pose3.z(), kf->constraints});
     const auto stamp = slam_.current_keyframe()->time;
 
-    viz_thread_ = std::thread([this, snap = std::move(snap), stamp]() {
-      build_and_publish_viz(snap, stamp);
+    const auto epoch = graph_epoch_;
+    viz_thread_ = std::thread([this, snap = std::move(snap), stamp, epoch]() {
+      build_and_publish_viz(snap, stamp, epoch);
       viz_busy_ = false;
     });
     return true;
+  }
+
+  Covariance6 physical_motion_covariance(const gtsam::Pose3& increment) const
+  {
+    gtsam::Vector6 sigmas = slam_.se3_options.odom_sigmas;
+    sigmas.head<3>() *= std::max(1.0, gtsam::Rot3::Logmap(increment.rotation()).norm() /
+      std::max(.001, slam_.keyframe_rotation));
+    sigmas.tail<3>() *= std::max(1.0, increment.translation().norm() /
+      std::max(.001, slam_.keyframe_translation));
+    return sigmas.array().square().matrix().asDiagonal();
   }
 
   void publish_pose()
@@ -980,7 +1152,7 @@ private:
 
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
     pose_msg.header.stamp = frame->time;
-    pose_msg.header.frame_id = "map";
+    pose_msg.header.frame_id = map_frame_;
     pose_msg.pose.pose = g2r(frame->pose3);
 
     // 6x6 covariance in (x, y, z, roll, pitch, yaw). The constrained-3D
@@ -990,6 +1162,17 @@ private:
     // downstream EKF would mistake for a SLAM measurement of those states.
     constexpr double kUnobserved = 1e6;
     Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();
+    if (slam_.registration_model == RegistrationModel::SE3) {
+      covariance_valid_ = !slam_.keyframes.empty() && slam_.current_keyframe()->has_covariance6;
+      Covariance6 body = covariance_valid_ ? slam_.current_keyframe()->covariance6 : Covariance6::Identity() * 1e6;
+      if (covariance_valid_ && frame != slam_.current_keyframe()) {
+        const auto increment = slam_.current_keyframe()->dr_pose3.between(frame->dr_pose3);
+        body = compose_covariance(increment, body, physical_motion_covariance(increment));
+      }
+      covariance_valid_ = covariance_valid_ && valid_covariance6(body);
+      cov = covariance6_to_ros(frame->pose3, body);
+      if (!covariance_valid_) ++covariance_fallbacks_;
+    } else {
     cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
     Eigen::Matrix3d tc = Eigen::Matrix3d::Zero();
     if (slam_.keyframes.empty()) {
@@ -997,19 +1180,20 @@ private:
       // fused-odometry extrapolation. TF carries no covariance, so use the
       // configured DR link noise rather than claiming scan-match confidence.
       tc = slam_.odom_sigmas.array().square().matrix().asDiagonal();
+      covariance_valid_ = valid_pose_covariance(tc);
     } else {
-      tc = slam_.current_keyframe()->transf_cov;
+      const auto& keyframe = slam_.current_keyframe();
+      covariance_valid_ = keyframe->has_cov &&
+        valid_pose_covariance(keyframe->transf_cov);
+      tc = publication_covariance(keyframe->transf_cov, covariance_valid_);
     }
-    const int map_idx[3] = {0, 1, 5};
-    for (int i = 0; i < 3; ++i)
-      for (int j = 0; j < 3; ++j) cov(map_idx[i], map_idx[j]) = tc(i, j);
 
     // Between-keyframe frames are dead-reckoning extrapolations past the last
-    // keyframe, but transf_cov is only that keyframe's marginal. Inflate the
-    // planar covariance by the DR drift accumulated since the keyframe so
-    // fusion does not over-trust the extrapolated pose (the same odometry is
-    // already delivered to the EKF directly).
-    if (!frame->status && !slam_.keyframes.empty()) {
+    // keyframe. Transport heading uncertainty through the displacement and
+    // rotate the span-scaled right-tangent DR noise into the current map axes.
+    // A failed candidate keyframe is also an extrapolation of the committed
+    // parent, even though its input status requested a new graph state.
+    if (covariance_valid_ && !slam_.keyframes.empty() && frame != slam_.current_keyframe()) {
       const gtsam::Pose2 dr =
         slam_.current_keyframe()->dr_pose.between(frame->dr_pose);
       const double d = std::hypot(dr.x(), dr.y());
@@ -1017,23 +1201,22 @@ private:
       const double kt = std::max(slam_.keyframe_translation, 1e-3);
       const double kr = std::max(slam_.keyframe_rotation, 1e-3);
       const Eigen::Vector3d& os = slam_.odom_sigmas;
-      cov(0, 0) += (os[0] * d / kt) * (os[0] * d / kt);
-      cov(1, 1) += (os[1] * d / kt) * (os[1] * d / kt);
-      cov(5, 5) += (os[2] * a / kr) * (os[2] * a / kr);
+      const Eigen::Vector3d increment_sigmas(os[0] * d / kt, os[1] * d / kt, os[2] * a / kr);
+      tc = propagate_planar_covariance(tc,
+        frame->pose.translation() - slam_.current_keyframe()->pose.translation(),
+        frame->pose.theta(), increment_sigmas.array().square().matrix().asDiagonal());
     }
 
-    // transf_cov is zero until the keyframe's marginals are computed, and a
-    // degenerate ISAM2 marginal can be NaN — either reads as infinite
-    // confidence downstream. Floor the estimated DOF (NaN-safe argument order:
-    // std::max(1e-3, NaN) == 1e-3) and, if anything is still non-finite, fall
-    // back to a safe diagonal.
-    for (int k : {0, 1, 5}) cov(k, k) = std::max(1e-3, cov(k, k));
-    if (!cov.allFinite()) {
-      cov.setZero();
-      cov(0, 0) = cov(1, 1) = cov(5, 5) = 1e-3;
-      cov(2, 2) = cov(3, 3) = cov(4, 4) = kUnobserved;
+    covariance_valid_ = covariance_valid_ && valid_pose_covariance(tc);
+    tc = publication_covariance(tc, covariance_valid_);
+    if (!covariance_valid_) ++covariance_fallbacks_;
+    const int map_idx[3] = {0, 1, 5};
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) cov(map_idx[i], map_idx[j]) = tc(i, j);
     }
     for (int i = 0; i < 36; ++i) pose_msg.pose.covariance[i] = cov(i / 6, i % 6);
+    std::lock_guard<std::mutex> publish_lock(publication_mutex_);
+    if (graph_epoch_ != input_epoch_) return;
     pose_pub_->publish(pose_msg);
 
     // map -> odom: SLAM estimate composed with inverse dead reckoning
@@ -1069,7 +1252,7 @@ private:
       RCLCPP_INFO(get_logger(),
                   "SLAM status: keyframes %d (last kf %ld pts), SSM factors %d, "
                   "NSSM accepted %d, last SSM: %s | NSSM attempts %d, queued %d, "
-                  "best clique %d, queue depth %d, PCM min md %.1f (thresh 11.3, "
+                  "best clique %d, queue depth %d, PCM min md %.1f (thresh %.2f, "
                   "%d edges), last NSSM: %s | NSSM rejects [%s]",
                   slam_.current_key(),
                   static_cast<long>(slam_.current_keyframe()->points.rows()),
@@ -1077,6 +1260,7 @@ private:
                   slam_.last_ssm_status.c_str(), slam_.nssm_attempts,
                   slam_.nssm_queued, slam_.nssm_best_clique,
                   slam_.nssm_queue_depth(), slam_.last_pcm_min_md,
+                  slam_.registration_model == RegistrationModel::SE3 ? 16.8119 : 11.3449,
                   slam_.last_pcm_edges, slam_.last_nssm_status.c_str(),
                   slam_.nssm_reject_summary().c_str());
     }
@@ -1084,7 +1268,7 @@ private:
 
   // Worker-thread body: build the graph constraint markers from a snapshot.
   void build_and_publish_viz(const std::vector<VizKeyframe>& snap,
-                             const builtin_interfaces::msg::Time& stamp)
+                             const builtin_interfaces::msg::Time& stamp, std::uint64_t epoch)
   {
     std::vector<ConstraintLink> links;
     for (std::size_t x = 1; x < snap.size(); ++x) {
@@ -1105,6 +1289,9 @@ private:
     if (!links.empty()) {
       visualization_msgs::msg::Marker msg = ros_constraints(links);
       msg.header.stamp = stamp;
+      msg.header.frame_id = map_frame_;
+      std::lock_guard<std::mutex> publish_lock(publication_mutex_);
+      if (epoch != input_epoch_) return;
       constraint_pub_->publish(msg);
     }
   }
@@ -1133,25 +1320,29 @@ private:
     sensor_msgs::msg::PointCloud2 msg =
       make_cloud({"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, traj);
     msg.header.stamp = msg_stamp;
-    msg.header.frame_id = "map";
+    msg.header.frame_id = map_frame_;
+    std::lock_guard<std::mutex> publish_lock(publication_mutex_);
+    if (graph_epoch_ != input_epoch_) return;
     traj_pub_->publish(msg);
   }
 
   void publish_mapping_trajectory()
   {
     const auto& anchors = mapping_trajectory_.anchors();
-    if (anchors.empty()) return;
+    if (anchors.empty() || mapping_parents_.empty() || mapping_parents_epoch_ != input_epoch_) return;
     const auto& stamp = anchors.back().time;
     Matrix rows(anchors.size(), 8);
     for (std::size_t i = 0; i < anchors.size(); ++i) {
-      const auto pose = mapping_trajectory_.pose(i, slam_.keyframes);
+      const auto pose = mapping_trajectory_.pose(i, mapping_parents_);
       rows.row(i) << pose.x(), pose.y(), pose.z(), pose.rotation().roll(),
         pose.rotation().pitch(), pose.rotation().yaw(), static_cast<float>(i),
         static_cast<float>(to_sec(anchors[i].time) - to_sec(stamp));
     }
     auto msg = make_cloud({"x", "y", "z", "roll", "pitch", "yaw", "i", "t"}, rows);
     msg.header.stamp = stamp;
-    msg.header.frame_id = "map";
+    msg.header.frame_id = map_frame_;
+    std::lock_guard<std::mutex> publish_lock(publication_mutex_);
+    if (mapping_parents_epoch_ != input_epoch_) return;
     mapping_traj_pub_->publish(msg);
   }
 
@@ -1165,17 +1356,28 @@ private:
     geometry_msgs::msg::PoseWithCovarianceStamped msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    // The pose is applied as a MAP-frame prior regardless of the stamp; an
-    // RViz click made with the fixed frame on odom arrives offset by the
-    // entire accumulated map->odom correction and would silently drag the
-    // graph. Warn — the click may still be intentional from a non-RViz
-    // publisher that simply left the frame blank or wrong.
-    if (!msg.header.frame_id.empty() && msg.header.frame_id != "map")
-      RCLCPP_WARN(get_logger(),
-                  "manual correction stamped in frame '%s' but applied as a "
-                  "map-frame pose — set the RViz fixed frame to 'map' before "
-                  "clicking, or expect the prior to be offset",
-                  msg.header.frame_id.c_str());
+    if (msg.header.frame_id != map_frame_) {
+      RCLCPP_ERROR(get_logger(), "manual correction rejected: expected frame '%s', got '%s'",
+                   map_frame_.c_str(), msg.header.frame_id.c_str());
+      return;
+    }
+    if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000U) {
+      RCLCPP_ERROR(get_logger(), "manual correction rejected: invalid acquisition stamp");
+      return;
+    }
+    const auto& orientation = msg.pose.pose.orientation;
+    Eigen::Quaterniond rotation(orientation.w, orientation.x, orientation.y, orientation.z);
+    const auto& position = msg.pose.pose.position;
+    if (!rotation.coeffs().allFinite() || !std::isfinite(rotation.norm()) || !(rotation.norm() > 1e-6) ||
+        !Eigen::Vector3d(position.x, position.y, position.z).allFinite()) {
+      RCLCPP_ERROR(get_logger(), "manual correction rejected: invalid pose");
+      return;
+    }
+    rotation.normalize();
+    msg.pose.pose.orientation.w = rotation.w();
+    msg.pose.pose.orientation.x = rotation.x();
+    msg.pose.pose.orientation.y = rotation.y();
+    msg.pose.pose.orientation.z = rotation.z();
     if (slam_.keyframes.empty()) {
       RCLCPP_WARN(get_logger(),
                   "manual correction ignored: no keyframes in the graph yet");
@@ -1191,21 +1393,59 @@ private:
       return;
     }
     const gtsam::Pose3 p = r2g(msg.pose.pose);
-    gtsam::Pose2 fix(p.x(), p.y(), p.rotation().yaw());
-    // The click marks the vehicle's CURRENT pose, which can be up to a full
-    // keyframe interval past the newest keyframe on a moving vehicle —
-    // back-compose the DR delta so the prior targets where the KEYFRAME is,
-    // not where the vehicle is now.
-    if (slam_.current_frame &&
-        slam_.current_frame != slam_.current_keyframe()) {
-      const gtsam::Pose2 dr_delta = slam_.current_keyframe()->dr_pose.between(
-        slam_.current_frame->dr_pose);
-      fix = fix.compose(dr_delta.inverse());
+    const auto& keyframe = slam_.current_keyframe();
+    const auto& current = slam_.current_frame ? slam_.current_frame : keyframe;
+    auto fix_stamp = current->time;
+    gtsam::Pose3 dr_fix = current->dr_pose3;
+    // Nonzero stamps describe the fix acquisition, independently of sonar
+    // processing/backlog. Zero retains the last-processed-pose convention.
+    if (msg.header.stamp.sec != 0 || msg.header.stamp.nanosec != 0) {
+      fix_stamp = msg.header.stamp;
+      try {
+        dr_fix = pose_from_transform(tf_buffer_->lookupTransform(
+          odom_frame_, base_frame_, rclcpp::Time(fix_stamp),
+          rclcpp::Duration::from_seconds(tf_lookup_timeout_)));
+      } catch (const tf2::TransformException& error) {
+        RCLCPP_ERROR(get_logger(), "manual correction rejected: exact fix-time odometry unavailable: %s", error.what());
+        return;
+      }
+      if (!dr_fix.matrix().allFinite()) {
+        RCLCPP_ERROR(get_logger(), "manual correction rejected: invalid fix-time odometry");
+        return;
+      }
     }
+    const auto planar_motion = keyframe->dr_pose.between(pose322(dr_fix));
+    gtsam::Pose2 fix = pose322(p).compose(planar_motion.inverse());
     const int key = slam_.current_key() - 1;
-    const gtsam::Pose2 before = slam_.current_keyframe()->pose;
+    const gtsam::Pose2 before = keyframe->pose;
 
-    if (!slam_.add_manual_correction(fix)) {
+    bool applied = false;
+    if (slam_.registration_model == RegistrationModel::SE3) {
+      const auto motion = keyframe->dr_pose3.between(dr_fix);
+      const auto predicted_fix = keyframe->pose3.compose(motion);
+      gtsam::Pose3 physical = manual_correction_mode_ == "se3" ? p :
+        gtsam::Pose3(gtsam::Rot3::Ypr(p.rotation().yaw(), predicted_fix.rotation().pitch(),
+          predicted_fix.rotation().roll()), gtsam::Point3(p.x(), p.y(), predicted_fix.z()));
+      if (manual_correction_mode_ == "se3") {
+        Covariance6 ros_covariance;
+        for (int i = 0; i < 36; ++i) ros_covariance(i / 6, i % 6) = msg.pose.covariance[i];
+        if (!valid_covariance6(ros_covariance)) {
+          RCLCPP_ERROR(get_logger(), "full pose correction rejected: message needs a positive definite 6x6 covariance");
+          return;
+        }
+        Covariance6 body_covariance = covariance6_from_ros(physical, ros_covariance);
+        if (rclcpp::Time(fix_stamp) != rclcpp::Time(keyframe->time) || !motion.equals(gtsam::Pose3(), 1e-12))
+          body_covariance = compose_covariance(motion.inverse(), body_covariance,
+            inverse_covariance(motion, physical_motion_covariance(motion)));
+        physical = physical.compose(motion.inverse());
+        applied = slam_.add_manual_correction(physical, body_covariance);
+      } else {
+        physical = physical.compose(motion.inverse());
+        applied = slam_.add_manual_correction(pose322(physical));
+      }
+      fix = pose322(physical);
+    } else applied = slam_.add_manual_correction(fix);
+    if (!applied) {
       RCLCPP_ERROR(get_logger(),
                    "manual correction failed (%s); estimator rebuilt from "
                    "last good state",
@@ -1216,11 +1456,11 @@ private:
     const gtsam::Pose2 after = slam_.current_keyframe()->pose;
     RCLCPP_INFO(get_logger(),
                 "manual correction: keyframe %d (%.2f, %.2f, %.1f deg) -> "
-                "(%.2f, %.2f, %.1f deg); operator fix was "
-                "(%.2f, %.2f, %.1f deg)",
+                "(%.2f, %.2f, %.1f deg); keyframe target "
+                "(%.2f, %.2f, %.1f deg), fix acquisition %.6f",
                 key, before.x(), before.y(), before.theta() * 180.0 / M_PI,
                 after.x(), after.y(), after.theta() * 180.0 / M_PI,
-                fix.x(), fix.y(), fix.theta() * 180.0 / M_PI);
+                fix.x(), fix.y(), fix.theta() * 180.0 / M_PI, to_sec(fix_stamp));
 
     republish_corrected_state();
   }
@@ -1289,36 +1529,15 @@ private:
   // innovation bound (a multipath outlier must not yank the map), stamp
   // match within usbl_max_stamp_delta (USBL latency is real; an unmatched
   // fix belongs to no keyframe).
-  // Linear interpolation of the DR chain at an arbitrary time (caller holds
-  // mutex_). Keyframes are >= keyframe_duration apart (1.0 s deployed) and
-  // usbl/max_stamp_delta is the same order, so a geodesic lerp between the
-  // bracketing keyframes is adequate. Clamps to the ends of the chain.
-  gtsam::Pose2 dr_pose_at(double t) const
-  {
-    const auto& kfs = slam_.keyframes;
-    if (t <= to_sec(kfs.front()->time)) return kfs.front()->dr_pose;
-    if (t >= to_sec(kfs.back()->time)) return kfs.back()->dr_pose;
-    std::size_t lo = 0, hi = kfs.size() - 1;
-    while (hi - lo > 1) {  // keyframe times are ascending
-      const std::size_t mid = (lo + hi) / 2;
-      if (to_sec(kfs[mid]->time) <= t) lo = mid; else hi = mid;
-    }
-    const double t0 = to_sec(kfs[lo]->time), t1 = to_sec(kfs[hi]->time);
-    const double a = t1 > t0 ? (t - t0) / (t1 - t0) : 0.0;
-    const gtsam::Pose2& p0 = kfs[lo]->dr_pose;
-    const gtsam::Pose2 d = p0.between(kfs[hi]->dr_pose);
-    return p0.compose(gtsam::Pose2::Expmap(a * gtsam::Pose2::Logmap(d)));
-  }
-
   // Transponder offset in the configured base frame, from TF. Cached after the first success:
   // the mount is static, so one lookup is enough and a later TF hiccup must
   // not silently drop the correction. Returns false until it resolves.
-  bool usbl_lever_arm(const std::string& frame, Eigen::Vector2d& r_bt)
+  bool usbl_lever_arm(Eigen::Vector3d& r_bt)
   {
     if (usbl_lever_arm_valid_) { r_bt = usbl_lever_arm_; return true; }
-    const std::string src = usbl_frame_id_.empty() ? frame : usbl_frame_id_;
+    const std::string src = usbl_frame_id_;
     if (src.empty() || src == base_frame_) {
-      usbl_lever_arm_ = Eigen::Vector2d::Zero();
+      usbl_lever_arm_ = Eigen::Vector3d::Zero();
       usbl_lever_arm_valid_ = true;
       r_bt = usbl_lever_arm_;
       return true;
@@ -1328,25 +1547,23 @@ private:
     // one of these up against the live TF tree "succeeds" — and permanently
     // caches the vehicle's current offset from that frame's origin as a
     // bogus static lever arm, corrupting every subsequent fix. Mount frames
-    // must come from usbl/frame_id or a genuine sensor frame.
-    if (src == "map" || src == odom_frame_ || src == "earth" || src == "utm") {
+    // must come explicitly from usbl/frame_id.
+    if (src == map_frame_ || src == odom_frame_ || src == "earth" || src == "utm") {
       RCLCPP_WARN_ONCE(
         get_logger(),
         "USBL fixes are stamped with reference frame '%s', which cannot be a "
-        "transponder mount frame — applying a ZERO lever arm. Set "
+        "transponder mount frame — rejecting the fix. Set "
         "usbl/frame_id to the mount frame if the transponder is offset from "
         "%s.",
         src.c_str(), base_frame_.c_str());
-      usbl_lever_arm_ = Eigen::Vector2d::Zero();
-      usbl_lever_arm_valid_ = true;
-      r_bt = usbl_lever_arm_;
-      return true;
+      return false;
     }
     try {
       const auto tf = tf_buffer_->lookupTransform(base_frame_, src,
                                                   tf2::TimePointZero);
       usbl_lever_arm_ =
-        Eigen::Vector2d(tf.transform.translation.x, tf.transform.translation.y);
+        Eigen::Vector3d(tf.transform.translation.x, tf.transform.translation.y,
+                        tf.transform.translation.z);
       usbl_lever_arm_valid_ = true;
       RCLCPP_INFO(get_logger(),
                   "USBL transponder '%s' is (%.3f, %.3f) m from %s — "
@@ -1358,9 +1575,8 @@ private:
     } catch (const tf2::TransformException& e) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 10000,
-        "USBL lever arm unavailable (%s <- %s: %s). Fixes are being "
-        "applied AS IF the transponder were at %s — on a masted "
-        "transponder that injects a heading-correlated position bias. Set "
+        "USBL fix rejected: lever arm unavailable (%s <- %s: %s). "
+        "The configured transponder offset must resolve relative to %s. Set "
         "usbl/frame_id or publish the mount TF.",
         base_frame_.c_str(), src.c_str(), e.what(), base_frame_.c_str());
       return false;
@@ -1373,10 +1589,18 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (slam_.keyframes.empty() || slam_.awaiting_relocalization()) return;
+    if (frame_id != map_frame_ || stamp.sec < 0 || stamp.nanosec >= 1000000000U ||
+        (stamp.sec == 0 && stamp.nanosec == 0) ||
+        !std::isfinite(x) || !std::isfinite(y) ||
+        !std::isfinite(var_x) || !std::isfinite(var_y) || var_x < 0.0 || var_y < 0.0) {
+      ++usbl_rejected_;
+      RCLCPP_ERROR(get_logger(), "USBL fix rejected: expected finite map-frame position and covariance");
+      return;
+    }
     const double t = to_sec(stamp);
     int best = -1;
     double best_dt = usbl_max_stamp_delta_;
-    for (int k = slam_.current_key() - 1; k >= 0; --k) {
+    for (int k = slam_.current_key() - 1; k >= slam_.loaded_keyframes(); --k) {
       const double kt = to_sec(slam_.keyframes[k]->time);
       const double dt = std::fabs(kt - t);
       // STRICT compare: under a looped bag a previous pass can carry the
@@ -1407,16 +1631,27 @@ private:
     //    usbl/max_stamp_delta (1.0 s deployed). At 0.5 m/s that admits up to
     //    0.5 m of pure position error — the same size as usbl/min_sigma —
     //    unless the DR motion between the two instants is removed.
-    const gtsam::Pose2 dr_fix = dr_pose_at(t);
-    const double c = std::cos(dr_fix.theta()), sn = std::sin(dr_fix.theta());
-    Eigen::Vector2d r_bt;
-    if (usbl_lever_arm(frame_id, r_bt) && r_bt.squaredNorm() > 0.0) {
-      x -= c * r_bt.x() - sn * r_bt.y();
-      y -= sn * r_bt.x() + c * r_bt.y();
+    gtsam::Pose3 dr_fix;
+    try {
+      dr_fix = pose_from_transform(tf_buffer_->lookupTransform(
+        odom_frame_, base_frame_, rclcpp::Time(stamp),
+        rclcpp::Duration::from_seconds(tf_lookup_timeout_)));
+    } catch (const tf2::TransformException& e) {
+      ++usbl_rejected_;
+      RCLCPP_WARN(get_logger(), "USBL fix rejected: exact fix-time odometry unavailable: %s", e.what());
+      return;
     }
-    const gtsam::Pose2 motion = dr_fix.between(dr_pose_at(to_sec(slam_.keyframes[best]->time)));
-    x += c * motion.x() - sn * motion.y();
-    y += sn * motion.x() + c * motion.y();
+    const auto& keyframe = slam_.keyframes[best];
+    const gtsam::Pose3 map_fix = keyframe->pose3.compose(
+      keyframe->dr_pose3.inverse()).compose(dr_fix);
+    Eigen::Vector3d r_bt;
+    if (!usbl_lever_arm(r_bt)) { ++usbl_rejected_; return; }
+    const Eigen::Vector3d lever = map_fix.rotation().matrix() * r_bt;
+    const double transponder_x = x, transponder_y = y;
+    const gtsam::Pose3 motion = dr_fix.between(keyframe->dr_pose3);
+    const Eigen::Vector3d displacement = map_fix.rotation().matrix() * motion.translation();
+    x += displacement.x() - lever.x();
+    y += displacement.y() - lever.y();
 
     const gtsam::Pose2& kp = slam_.keyframes[best]->pose;
     const double inno = std::hypot(kp.x() - x, kp.y() - y);
@@ -1430,14 +1665,30 @@ private:
         inno, usbl_max_innovation_);
       return;
     }
-    const double sigma =
-      std::max(usbl_min_sigma_, std::sqrt(std::max(var_x, var_y)));
-    if (!slam_.add_position_prior(best, x, y, sigma)) {
+    double variance = var_x + var_y;
+    if (slam_.registration_model == RegistrationModel::SE3) {
+      const double span = std::abs(t - to_sec(keyframe->time)) / std::max(.001, slam_.keyframe_duration);
+      Eigen::Matrix<double, 2, 6> jacobian;
+      const Eigen::Matrix3d rotation = map_fix.rotation().matrix();
+      Eigen::Matrix3d skew;
+      skew << 0, -r_bt.z(), r_bt.y(), r_bt.z(), 0, -r_bt.x(), -r_bt.y(), r_bt.x(), 0;
+      jacobian.leftCols<3>() = (-rotation * skew).topRows<2>();
+      jacobian.rightCols<3>() = rotation.topRows<2>();
+      const Covariance6 motion_covariance = slam_.se3_options.odom_sigmas.array().square().matrix().asDiagonal();
+      variance += (jacobian * motion_covariance * jacobian.transpose()).trace() * span * span;
+    }
+    const double sigma = std::max(usbl_min_sigma_, std::sqrt(variance));
+    const bool applied = slam_.registration_model == RegistrationModel::SE3
+      ? slam_.add_transponder_position_prior(best, transponder_x, transponder_y, sigma,
+          keyframe->dr_pose3.between(dr_fix).transformFrom(r_bt))
+      : slam_.add_position_prior(best, x, y, sigma);
+    if (!applied) {
       RCLCPP_ERROR(get_logger(), "USBL prior failed (%s); estimator rebuilt",
                    slam_.last_error().c_str());
       return;
     }
     usbl_applied_.insert(best);
+    republish_corrected_state();
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 10000,
       "USBL fix on keyframe %d: innovation %.2f m, sigma %.2f m (%d applied)",
@@ -1466,8 +1717,11 @@ private:
       reverted = slam_.nssm_reverted;
       input_mode = last_input_mode_;
       add("keyframes", std::to_string(slam_.current_key()));
-      add("mapping_anchors", std::to_string(mapping_trajectory_.anchors().size()));
-      add("mapping_pending_anchors", std::to_string(mapping_trajectory_.pending()));
+      {
+        std::lock_guard<std::mutex> mapping_lock(mapping_mutex_);
+        add("mapping_anchors", std::to_string(mapping_trajectory_.anchors().size()));
+        add("mapping_pending_anchors", std::to_string(mapping_trajectory_.pending()));
+      }
       std::size_t registration_keyframes = 0;
       std::size_t registration_points = 0;
       for (const auto& frame : slam_.keyframes) {
@@ -1517,14 +1771,48 @@ private:
     add("head_pitch_rejections", std::to_string(pitch_rejections));
     add("dr_yaw_rejections",
         std::to_string(yaw_pose_rejections_.load()));
+    add("out_of_order_rejections", std::to_string(out_of_order_rejections_));
+    add("covariance_valid", covariance_valid_ ? "true" : "false");
+    add("covariance_fallbacks", std::to_string(covariance_fallbacks_));
+    const auto queue = registration_queue_->stats();
+    add("registration_queue_pending", std::to_string(queue.pending));
+    add("registration_queue_resident", std::to_string(queue.resident));
+    add("registration_queue_spilled", std::to_string(queue.spilled));
+    add("registration_queue_dropped", std::to_string(queue.dropped));
+    add("registration_queue_errors", std::to_string(registration_queue_errors_.load()));
+    add("processing_seconds", std::to_string(processing_seconds_));
+    add("processing_stamp_lag_seconds", std::to_string(std::max(0.0,
+      static_cast<double>(latest_input_ns_.load() - processed_input_ns_.load()) * 1e-9)));
+    add("input_model", input_model_);
+    add("registration_model", slam_.registration_model == RegistrationModel::SE3 ? "se3" : "constrained_xyyaw");
+    add("state_chart", slam_.registration_model == RegistrationModel::SE3 ? "physical_body" : "gravity_horizontal");
+    add("registration_backend", slam_.registration_model == RegistrationModel::SE3 ? "se3_point_to_plane_cpu" :
+      slam_.constrained_3d ? "constrained_xyz_cpu" : "planar_libpointmatcher_cpu");
+    add("pcm_chi_square_threshold", slam_.registration_model == RegistrationModel::SE3 ? "16.8119" : "11.3449");
+    add("seed_backend", gpu::available() ? "cuda_xy" : "cpu_xy");
     add("gpu", gpu::available() ? "on" : "off");
 
-    if (tf_failures > diag_prev_tf_failures_) {
+    const int64_t receipt = input_receipt_ns_;
+    const int64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double receipt_age = receipt ? static_cast<double>(wall_ns - receipt) * 1e-9 : -1.0;
+    add("input_receipt_age_seconds", std::to_string(receipt_age));
+
+    if (registration_queue_errors_ > 0) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      st.message = "registration input retention failed; inspect the error log";
+    } else if (receipt == 0 || receipt_age > input_timeout_) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = receipt == 0 ? "waiting for sonar input" : "sonar input is stale";
+    } else if (tf_failures > diag_prev_tf_failures_) {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
       st.message = "exact ping-time sensor/odometry TF unavailable";
     } else if (reverted > diag_prev_reverted_) {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
       st.message = "loop-closure round reverted by post-loop verification";
+    } else if (!covariance_valid_ && !slam_.keyframes.empty()) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      st.message = "pose covariance unavailable; publishing unknown uncertainty";
     } else if (input_mode == "odometry_only_sparse") {
       st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       st.message = "odometry-only: uninformative sonar";
@@ -1555,15 +1843,20 @@ private:
   {
     if (slam_.current_frame) {
       if (slam_.current_frame != slam_.current_keyframe()) {
+        if (slam_.registration_model == RegistrationModel::SE3) {
+          slam_.current_frame->update(slam_.current_keyframe()->pose3.compose(
+            slam_.current_keyframe()->dr_pose3.between(slam_.current_frame->dr_pose3)));
+        } else {
         const gtsam::Pose2 dr_odom = slam_.current_keyframe()->dr_pose.between(
           slam_.current_frame->dr_pose);
         slam_.current_frame->update(
           slam_.current_keyframe()->pose.compose(dr_odom));
+        }
       }
       publish_pose();
     }
     publish_trajectory();
-    publish_mapping_trajectory();
+    refresh_mapping_parents();
     if (schedule_viz_rebuild()) last_viz_publish_ = now();
   }
 
@@ -1574,10 +1867,23 @@ private:
   rclcpp::TimerBase::SharedPtr mapping_timer_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_traj_pub_;
   std::mutex mutex_;
+  std::mutex mapping_mutex_;
+  std::mutex publication_mutex_;
+  std::vector<KeyframePtr> mapping_parents_;
+  std::uint64_t mapping_parents_epoch_ = 0;
+  std::atomic<std::uint64_t> input_epoch_{0};
+  std::uint64_t graph_epoch_ = 0;
+  std::unique_ptr<RegistrationQueue> registration_queue_;
+  rclcpp::CallbackGroup::SharedPtr input_callback_group_;
+  rclcpp::TimerBase::SharedPtr registration_timer_;
+  std::atomic<std::uint64_t> registration_queue_errors_{0};
+  std::atomic<int64_t> latest_input_ns_{0}, processed_input_ns_{0}, input_receipt_ns_{0};
+  double processing_seconds_ = 0.0;
   // Background graph-marker rebuild (see schedule_viz_rebuild).
   std::thread viz_thread_;
   std::atomic<bool> viz_busy_{false};
   bool enable_slam_ = true;
+  std::string manual_correction_mode_ = "planar";
   bool publish_tf_ = true;
   double viz_min_period_ = 2.0;
   int last_logged_key_ = -1;
@@ -1587,10 +1893,18 @@ private:
   double time_rewind_tolerance_ = 0.5;
   rclcpp::Time last_ping_stamp_{0, 0, RCL_ROS_TIME};
   bool last_ping_stamp_valid_ = false;
+  std::atomic<std::uint64_t> out_of_order_rejections_{0};
+  bool covariance_valid_ = false;
+  std::uint64_t covariance_fallbacks_ = 0;
   std::string odom_frame_ = "odom";
+  std::string map_frame_ = "map";
   std::string base_frame_ = "base_link";
   double tf_lookup_timeout_ = 0.05;
+  double input_timeout_ = 2.0;
   double max_head_pitch_ = 0.0;
+  std::string input_model_ = "imaging";
+  int registration_max_points_ = 5000;
+  double registration_resolution_ = 0.5;
   // DR yaw spike gate (see yaw_step_plausible). last_* only touched from
   // the points callback (default mutually-exclusive group).
   double max_dr_yaw_rate_ = 1.5;
@@ -1650,7 +1964,7 @@ private:
   // header.frame_id. Resolved to a base_link offset once via TF and cached
   // (the mount is static).
   std::string usbl_frame_id_;
-  Eigen::Vector2d usbl_lever_arm_ = Eigen::Vector2d::Zero();
+  Eigen::Vector3d usbl_lever_arm_ = Eigen::Vector3d::Zero();
   bool usbl_lever_arm_valid_ = false;
   std::set<int> usbl_applied_;
   std::uint64_t usbl_rejected_ = 0;
@@ -1669,9 +1983,11 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
 };
 
+std::shared_ptr<rclcpp::Node> make_slam_node(const rclcpp::NodeOptions& options)
+{
+  return std::make_shared<SlamNode>(options);
+}
+
 }  // namespace sonar_slam
 
-int main(int argc, char** argv)
-{
-  return sonar_slam::run_node<sonar_slam::SlamNode>(argc, argv);
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(sonar_slam::SlamNode)

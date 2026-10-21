@@ -113,8 +113,39 @@ Slam::Slam() : isam_(make_isam2_params())
   nssm_params.fan_drift_rot = 0.0017;
 }
 
+int Slam::nssm_queue_depth() const
+{
+  return se3_ ? se3_->queue_depth() : static_cast<int>(nssm_queue_.size());
+}
+
+int Slam::manual_corrections_pending() const
+{
+  return se3_ ? se3_->manual_count() : static_cast<int>(manual_prior_indices_.size());
+}
+
+bool Slam::add_manual_correction(const gtsam::Pose3& pose, const Covariance6& covariance)
+{
+  if (!require_idle_update("manual correction")) return false;
+  if (se3_) return se3_->add_manual(pose, covariance);
+  last_error_ = "full pose corrections require the SE3 registration model";
+  return false;
+}
+
+bool Slam::add_transponder_position_prior(int index, double x, double y, double sigma,
+                                         const gtsam::Point3& point_in_key)
+{
+  if (!require_idle_update("position correction")) return false;
+  if (se3_) return se3_->add_position(index, x, y, sigma, point_in_key);
+  last_error_ = "physical transponder factors require the SE3 registration model";
+  return false;
+}
+
 void Slam::configure()
 {
+  if (!keyframes.empty() || has_pending_update())
+    throw std::logic_error("configure requires an empty session with no pending graph update");
+  if (input_model != "imaging" && input_model != "measured_xyz")
+    throw std::invalid_argument("input_model must be imaging or measured_xyz");
   const auto valid_sigmas = [](const Eigen::Vector3d& sigmas) {
     return sigmas.allFinite() && (sigmas.array() > 0.0).all();
   };
@@ -124,11 +155,26 @@ void Slam::configure()
   if (!std::isfinite(point_noise) || point_noise <= 0.0 ||
       !std::isfinite(point_resolution) || point_resolution <= 0.0)
     throw std::invalid_argument("point_noise and point_resolution must be finite and positive");
-  const auto validate_sampling = [](const SMParams& p, const char* name) {
-    if (p.cov_samples < 0 || p.init_n < 1 || p.init_iters < 1 ||
-        p.init_n > std::numeric_limits<int>::max() / p.init_iters ||
+  const auto validate_initialization = [](const SMParams& p, const char* name) {
+    if (p.init_n < 1 || p.init_iters < 1 ||
+        p.init_n > GLOBAL_INIT_MAX_SAMPLES / p.init_iters ||
         !std::isfinite(p.init_ftol) || p.init_ftol < 0.0)
-      throw std::invalid_argument(std::string(name) + " has invalid initialization parameters");
+      throw std::invalid_argument(std::string(name) + " has invalid initialization parameters or exceeds the sample budget");
+  };
+  validate_initialization(ssm_params, "ssm");
+  validate_initialization(nssm_params, "nssm");
+  if (relocalize_max_ms < 1 || relocalize_max_ms > 60000)
+    throw std::invalid_argument("relocalize_max_ms must be in [1, 60000]");
+  if (registration_model == RegistrationModel::SE3) {
+    if (input_model != "measured_xyz")
+      throw std::invalid_argument("SE3 registration requires input_model measured_xyz");
+    se3_ = std::make_shared<Se3Backend>(*this);
+    return;
+  }
+  se3_.reset();
+  const auto validate_sampling = [](const SMParams& p, const char* name) {
+    if (p.cov_samples < 0)
+      throw std::invalid_argument(std::string(name) + " has invalid covariance sample count");
     if (p.enable && p.initialization && p.cov_method == SMParams::SAMPLED &&
         p.cov_samples > 0 && p.cov_samples < 5)
       throw std::invalid_argument(std::string(name) + " sampled covariance needs cov_samples >= 5");
@@ -166,12 +212,16 @@ void Slam::configure()
         "PointToPointErrorMinimizer in icp_config.");
   }
   if (constrained_3d &&
-      (!(constrained_icp_params.max_correspondence > 0.0f) ||
+      (!std::isfinite(constrained_icp_params.max_correspondence) ||
+       !(constrained_icp_params.max_correspondence > 0.0f) ||
        !(constrained_icp_params.trim_ratio > 0.0 &&
          constrained_icp_params.trim_ratio <= 1.0) ||
        constrained_icp_params.max_iterations < 1 ||
+       constrained_icp_params.max_threads < 1 ||
        constrained_icp_params.min_correspondences < 3 ||
+       !std::isfinite(constrained_icp_params.translation_epsilon) ||
        !(constrained_icp_params.translation_epsilon >= 0.0) ||
+       !std::isfinite(constrained_icp_params.rotation_epsilon) ||
        !(constrained_icp_params.rotation_epsilon >= 0.0)))
     throw std::invalid_argument("invalid constrained_3d ICP parameters");
   if (nssm_params.cov_samples > 0 &&
@@ -198,6 +248,15 @@ void Slam::configure()
       "ssm/require_covariance needs ssm/initialization enabled and "
       "ssm/cov_samples > 0; otherwise every sequential scan match is "
       "rejected as 'covariance unavailable'");
+  if (nssm_params.enable && nssm_require_covariance &&
+      (!nssm_params.initialization || nssm_params.cov_samples <= 0))
+    throw std::invalid_argument(
+      "nssm/require_covariance needs initialization and cov_samples > 0");
+  if (relocalize_min_confirmations < 2)
+    throw std::invalid_argument("relocalize_min_confirmations must be >= 2");
+  if (!std::isfinite(relocalize_min_overlap) || relocalize_min_overlap <= 0.0 ||
+      relocalize_min_overlap > 1.0)
+    throw std::invalid_argument("relocalize_min_overlap must be in (0, 1]");
   // 6D lifts of the configured planar sigmas (see the chart note above):
   // prior/odometry constrain chart roll/pitch (0) and depth (absolute for the
   // prior, DR delta for odometry); ICP factors are wide in everything the
@@ -311,6 +370,19 @@ Eigen::Matrix3d Slam::relative_covariance(int from, int to) const
 // ---------------------------------------------------------------------------
 Matrix Slam::get_points(const std::vector<int>& frames, int ref_key) const
 {
+  if (se3_) {
+    Eigen::Index count = 0;
+    for (int k : frames) count += keyframes.at(k)->points.rows();
+    Matrix points(count, 3);
+    Eigen::Index at = 0;
+    for (int k : frames) {
+      const auto pose = ref_key >= 0 ? keyframes.at(ref_key)->pose3.between(keyframes.at(k)->pose3) : keyframes.at(k)->pose3;
+      const auto transformed = transform_body_points(keyframes.at(k)->points, pose);
+      points.middleRows(at, transformed.rows()) = transformed;
+      at += transformed.rows();
+    }
+    return downsample(points, static_cast<float>(point_resolution));
+  }
   const bool use_ref = ref_key >= 0;
   gtsam::Pose2 ref_pose;
   gtsam::Pose3 ref_pose3;
@@ -321,7 +393,7 @@ Matrix Slam::get_points(const std::vector<int>& frames, int ref_key) const
 
   long total = 0;
   for (int key : frames) total += keyframes[key]->points.rows();
-  const int dimensions = constrained_3d ? 3 : 2;
+  const int dimensions = (se3_ || constrained_3d) ? 3 : 2;
   Matrix all_points(total, dimensions);
 
   long at = 0;
@@ -352,7 +424,7 @@ std::pair<Matrix, std::vector<int>> Slam::get_points_with_keys(
 {
   long total = 0;
   for (int key : frames) total += keyframes[key]->points.rows();
-  const int dimensions = constrained_3d ? 3 : 2;
+  const int dimensions = (se3_ || constrained_3d) ? 3 : 2;
   Matrix all_points(total, dimensions);
   Matrix all_keys(total, 1);
 
@@ -360,7 +432,7 @@ std::pair<Matrix, std::vector<int>> Slam::get_points_with_keys(
   for (int key : frames) {
     const Matrix& transf = keyframes[key]->transf_points;
     all_points.middleRows(at, transf.rows()) =
-      constrained_3d ? transf : transf.leftCols(2);
+      (se3_ || constrained_3d) ? transf : transf.leftCols(2);
     all_keys.middleRows(at, transf.rows()).setConstant(static_cast<float>(key));
     at += transf.rows();
   }
@@ -380,13 +452,14 @@ std::pair<std::string, gtsam::Pose2> Slam::compute_icp(
   const Matrix& source_points, const Matrix& target_points,
   const gtsam::Pose2& guess)
 {
+  if (se3_) throw std::logic_error("Pose2 ICP is unavailable for the physical SE3 model");
   Eigen::Matrix3f g = guess.matrix().cast<float>();
   if (constrained_3d) {
     const ConstrainedIcpResult result = constrained_icp_xyz(
       source_points, target_points, g, constrained_icp_params);
     const double x = result.T(0, 2), y = result.T(1, 2);
     const double theta = std::atan2(result.T(1, 0), result.T(0, 0));
-    return {result.message, gtsam::Pose2(x, y, theta)};
+    return {result.success ? "success" : result.message, gtsam::Pose2(x, y, theta)};
   }
   auto [message, T] = icp.compute(source_points, target_points, g);
   const double x = T(0, 2), y = T(1, 2);
@@ -396,11 +469,17 @@ std::pair<std::string, gtsam::Pose2> Slam::compute_icp(
 
 Slam::IcpCovResult Slam::compute_icp_with_cov(
   const Matrix& source_points, const Matrix& target_points,
-  const std::vector<gtsam::Pose2>& guesses)
+  const std::vector<gtsam::Pose2>& guesses, Deadline deadline)
 {
   IcpCovResult result;
+  deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(2000));
+  if (deadline_expired(deadline)) {
+    result.message = "ICP sampling deadline exceeded";
+    return result;
+  }
 
   std::vector<Eigen::Vector3d> sample_transforms;
+  std::size_t attempted = 0;
   if (parallel_cov_samples) {
     // per-thread engine pool; each guess's registration is identical to the
     // sequential loop's (deterministic chain), collected in guess order. The
@@ -410,16 +489,20 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
     std::vector<Eigen::Matrix3f> gm(guesses.size());
     for (std::size_t i = 0; i < guesses.size(); ++i)
       gm[i] = guesses[i].matrix().cast<float>();
+    const int budget = remaining_ms(deadline, 2000);
+    deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(budget));
     if (constrained_3d) {
       const auto batch = constrained_icp_xyz_batch(
-        source_points, target_points, gm, constrained_icp_params, 2000);
+        source_points, target_points, gm, constrained_icp_params, budget);
+      attempted = batch.size();
       for (const auto& r : batch) {
         if (!r.success) continue;
         sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
                                        std::atan2(r.T(1, 0), r.T(0, 0)));
       }
     } else {
-      const auto batch = icp.compute_batch(source_points, target_points, gm, 2000);
+      const auto batch = icp.compute_batch(source_points, target_points, gm, budget);
+      attempted = batch.size();
       for (const auto& r : batch) {
         if (!r.success) continue;
         sample_transforms.emplace_back(r.T(0, 2), r.T(1, 2),
@@ -427,20 +510,26 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
       }
     }
   } else {
-    const auto start = std::chrono::steady_clock::now();
     for (const auto& g : guesses) {
+      if (deadline_expired(deadline)) break;
       const auto [message, odom] =
         compute_icp(source_points, target_points, g);
+      ++attempted;
       if (message == "success") {
         sample_transforms.emplace_back(odom.x(), odom.y(), odom.theta());
       }
-      // enforce a max run time for this loop (slam.py: 2 s)
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start);
-      if (elapsed.count() >= 2000) break;
     }
   }
 
+  // A truncated population can hide a competing basin and underestimate
+  // uncertainty. Retain its poses for diagnostics, but never use its covariance.
+  for (const auto& transform : sample_transforms)
+    result.transforms.emplace_back(transform[0], transform[1], transform[2]);
+  result.complete = attempted == guesses.size() && !deadline_expired(deadline);
+  if (!result.complete) {
+    result.message = "ICP sampling deadline exceeded before all hypotheses completed";
+    return result;
+  }
   if (sample_transforms.size() < 5) {
     result.message = "Too few samples for covariance computation";
     return result;
@@ -457,7 +546,12 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
   }
 
   // robust covariance — outliers are frequent (slam.py uses MinCovDet)
-  const McdResult mcd = min_cov_det(samples, 0.8);
+  const McdResult mcd = min_cov_det(samples, 0.8, deadline);
+  if (mcd.timed_out || deadline_expired(deadline)) {
+    result.complete = false;
+    result.message = "ICP covariance deadline exceeded";
+    return result;
+  }
   if (!mcd.success) {
     result.message = "Failed to calculate covariance";
     return result;
@@ -500,6 +594,11 @@ Slam::IcpCovResult Slam::compute_icp_with_cov(
     cov(2, 2) = std::max(cov(2, 2), floor_var[2]);
   }
 
+  if (deadline_expired(deadline)) {
+    result.complete = false;
+    result.message = "ICP covariance deadline exceeded";
+    return result;
+  }
   result.message = "success";
   result.odom = m;
   result.cov = cov;
@@ -542,13 +641,14 @@ int Slam::get_overlap(const Matrix& source_points, const Matrix& target_points,
 // ---------------------------------------------------------------------------
 bool Slam::is_keyframe(const Keyframe& frame) const
 {
+  if (se3_) return se3_->is_keyframe(frame);
   if (keyframes.empty()) return true;
 
   const double duration = to_sec(frame.time) - to_sec(current_keyframe()->time);
   // negative = time jumped backwards (bag loop / restart): without this the
   // gate returns false against the last pre-jump keyframe until time catches
   // up — zero keyframes for the whole looped pass
-  if (duration < 0.0) return true;
+  if (duration <= 0.0) return false;
   if (duration < keyframe_duration) return false;
 
   const gtsam::Pose2 dr_odom = keyframes.back()->dr_pose.between(frame.dr_pose);
@@ -567,14 +667,70 @@ bool Slam::is_keyframe(const Keyframe& frame) const
           head_rotation > keyframe_head_rotation);
 }
 
+bool Slam::has_pending_update() const
+{
+  if (se3_) return se3_->has_pending_update();
+  return pending_frame_ || !graph_.empty() || !values_.empty() || !pending_loops_.empty() || force_converge_;
+}
+
+bool Slam::require_idle_update(const char* operation)
+{
+  if (!has_pending_update()) return true;
+  last_error_ = std::string(operation) + " requires committing or discarding the pending graph update";
+  return false;
+}
+
+void Slam::discard_pending_update()
+{
+  if (se3_) { se3_->discard_pending_update(); return; }
+  graph_.resize(0); values_.clear();
+  rollback_pending_loops(false);
+  consecutive_links_.resize(keyframes.size());
+  pending_frame_.reset(); pending_ssm_ = false; force_converge_ = false;
+}
+
+void Slam::validate_new_frame(const KeyframePtr& frame, bool prior) const
+{
+  if (prior != keyframes.empty())
+    throw std::logic_error(prior ? "a prior frame requires an empty session" : "odometry requires a committed prior frame");
+  if (awaiting_relocalization_)
+    throw std::logic_error("a loaded map must relocalize before staging another frame");
+  const auto chart = registration_model == RegistrationModel::SE3 ? CloudChart::Body : CloudChart::GravityHorizontal;
+  if (!frame || frame->chart != chart || frame->points.cols() != 3 || !frame->points.allFinite() ||
+      !frame->dr_pose3.matrix().allFinite() || !frame->pose3.matrix().allFinite() ||
+      frame->time.nanosec >= 1000000000U)
+    throw std::invalid_argument("graph frames require the configured cloud chart, finite XYZ/poses and a normalized stamp");
+  const auto nanoseconds = [](const auto& stamp) {
+    return static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
+  };
+  if (!keyframes.empty() && nanoseconds(frame->time) <= nanoseconds(keyframes.back()->time))
+    throw std::invalid_argument("graph frames must have strictly newer acquisition stamps");
+}
+
+void Slam::stage_frame(const KeyframePtr& frame, bool prior)
+{
+  if (has_pending_update()) throw std::logic_error("commit or discard the pending graph update before staging another frame");
+  validate_new_frame(frame, prior);
+  pending_frame_ = frame;
+}
+
 void Slam::add_prior(const KeyframePtr& keyframe)
 {
+  if (se3_) { se3_->add_prior(keyframe); return; }
+  stage_frame(keyframe, true);
   graph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), keyframe->horizon_pose3(),
                                               prior_model_));
   values_.insert(X(0), keyframe->horizon_pose3());
 }
 
 void Slam::add_odometry(const KeyframePtr& keyframe)
+{
+  if (se3_) { se3_->add_odometry(keyframe); return; }
+  stage_frame(keyframe, false);
+  add_odometry_factors(keyframe);
+}
+
+void Slam::add_odometry_factors(const KeyframePtr& keyframe)
 {
   // horizon-chart DR delta: planar odometry + the measured depth change
   const gtsam::Pose3 dr_odom =
@@ -595,6 +751,7 @@ void Slam::add_odometry(const KeyframePtr& keyframe)
 
 void Slam::add_state_unary(int key, const KeyframePtr& keyframe)
 {
+  if (se3_) return;
   // absolute depth + zero-attitude anchor for the dimensions no scan-match
   // factor observes (wide in x/y/yaw, which the graph owns)
   graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
@@ -756,12 +913,14 @@ void Slam::run_scan_match_icp(ICPResult& ret2, const SMParams& params)
 
 void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
 {
+  if (se3_) { se3_->add_sequential(keyframe); return; }
+  stage_frame(keyframe, false);
   InitializationResult ret = initialize_sequential_scan_matching(keyframe);
 
   if (!ret.status) {
     last_ssm_status =
       std::string(ret.status.name()) + " (" + ret.status.description + ")";
-    add_odometry(keyframe);
+    add_odometry_factors(keyframe);
     return;
   }
 
@@ -898,12 +1057,12 @@ void Slam::add_sequential_scan_matching(const KeyframePtr& keyframe)
       record_consecutive_link(ret2.source_key, ret2.estimated_transform, ts, rs);
     }
     ret2.inserted = true;
-    ++ssm_accepted;
+    pending_ssm_ = true;
     last_ssm_status = "accepted (" + ret2.status.description + ")";
   } else {
     last_ssm_status =
       std::string(ret2.status.name()) + " (" + ret2.status.description + ")";
-    add_odometry(keyframe);
+    add_odometry_factors(keyframe);
   }
 }
 
@@ -923,6 +1082,11 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
   // own geometry by up to a keyframe step. Intentional divergence from
   // bruce_slam that fixes that latent bug.
   ret.source_pose = keyframes[ret.source_key]->pose;
+  if (nssm_require_covariance && !keyframes[ret.source_key]->has_cov) {
+    ret.status = Status(Status::NOT_CONVERGED);
+    ret.status.description = "degenerate: source marginal covariance unavailable";
+    return ret;
+  }
   ret.estimated_source_pose = ret.source_pose;
   ret.has_estimated_source_pose = false;
 
@@ -941,8 +1105,23 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
 
   // all keyframes except the exclusion zone around the current one
   std::vector<int> target_frames;
-  for (int k = 0; k < current_key() - nssm_params.min_st_sep; ++k)
-    target_frames.push_back(k);
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eigen(
+    keyframes[ret.source_key]->cov.topLeftCorner<2, 2>());
+  const double variance = eigen.info() == Eigen::Success ?
+    eigen.eigenvalues().maxCoeff() : std::numeric_limits<double>::infinity();
+  for (int k = 0; k < current_key() - nssm_params.min_st_sep; ++k) {
+    if (!keyframes[k]->points.rows()) continue;
+    bool nearby = false;
+    for (int source : source_frames) {
+      const double age = std::max(0.0,
+        to_sec(keyframes[ret.source_key]->time) - to_sec(keyframes[source]->time));
+      const double radius = sonar_max_range + keyframes[k]->horizontal_extent +
+        5.0 * std::sqrt(std::max(0.0, variance) + std::pow(nssm_params.fan_drift_trans * age, 2)) + 1e-3;
+      const Eigen::Vector2d delta = keyframes[k]->pose.translation() - keyframes[source]->pose.translation();
+      if (!std::isfinite(radius) || delta.norm() <= radius) { nearby = true; break; }
+    }
+    if (nearby) target_frames.push_back(k);
+  }
 
   auto [target_points_all, target_keys_all] = get_points_with_keys(target_frames);
 
@@ -999,7 +1178,7 @@ InitializationResult Slam::initialize_nonsequential_scan_matching()
       const double range = std::hypot(local_points(i, 0), local_points(i, 1));
       if (!(range < range_bound)) continue;
       const double bearing = std::atan2(local_points(i, 1), local_points(i, 0));
-      if (std::abs(bearing) < bearing_bound) {
+      if (!use_body_fan_gate || std::abs(bearing) < bearing_bound) {
         sel[i] = 1;
         ++n_sel;
       }
@@ -1276,6 +1455,8 @@ std::string nssm_hist_key(const Status& s)
 
 bool Slam::add_nonsequential_scan_matching()
 {
+  if (!require_idle_update("loop closure")) return false;
+  if (se3_) return se3_->add_nonsequential();
   last_nssm_inserted_geom.clear();
   // current_frame is assigned at the END of the SLAM callback, so it is null
   // until the second callback
@@ -1391,6 +1572,10 @@ bool Slam::add_nonsequential_scan_matching()
   // sampled/Censi estimate, so reject closures whose covariance is too large
   // or too anisotropic. nssm/max_rotation separately bounds how far ICP may
   // refine away from its initialization.
+  if (ret2.status && nssm_require_covariance && !ret2.has_cov) {
+    ret2.status = Status(Status::NOT_CONVERGED);
+    ret2.status.description = "degenerate: covariance unavailable";
+  }
   if (ret2.status && ret2.has_cov) {
     // Gate on the pre-floor covariance when enabled: the per-eigenvalue floor in
     // compute_icp_with_cov otherwise caps the observable anisotropy and lets
@@ -1511,7 +1696,11 @@ std::string Slam::nssm_reject_summary() const
 // ---------------------------------------------------------------------------
 bool Slam::add_manual_correction(const gtsam::Pose2& map_pose)
 {
-  if (keyframes.empty()) return false;
+  if (!require_idle_update("manual correction")) return false;
+  if (se3_) return se3_->add_manual(map_pose);
+  if (keyframes.empty() || awaiting_relocalization_) {
+    last_error_ = "manual correction requires a localized graph"; return false;
+  }
   if (!std::isfinite(map_pose.x()) || !std::isfinite(map_pose.y()) ||
       !std::isfinite(map_pose.theta())) {
     last_error_ = "manual correction must be a finite planar pose";
@@ -1542,6 +1731,8 @@ bool Slam::add_manual_correction(const gtsam::Pose2& map_pose)
 
 bool Slam::undo_manual_correction()
 {
+  if (!require_idle_update("undo correction")) return false;
+  if (se3_) return se3_->undo_manual();
   if (manual_prior_indices_.empty()) {
     last_error_ = "no manual correction to undo";
     return false;
@@ -1583,7 +1774,21 @@ bool Slam::undo_manual_correction()
 namespace {
 
 constexpr char kMapMagic[9] = "SSLMMAP2";
-constexpr std::uint32_t kMapVersion = 1;
+constexpr std::uint32_t kMapVersion = 2;
+
+void put_map_text(std::ofstream& file, const std::string& text)
+{
+  const std::uint32_t size = text.size();
+  file.write(reinterpret_cast<const char*>(&size), sizeof size);
+  file.write(text.data(), size);
+}
+bool get_map_text(std::ifstream& file, std::string& text)
+{
+  std::uint32_t size = 0;
+  if (!file.read(reinterpret_cast<char*>(&size), sizeof size) || size > 4096) return false;
+  text.resize(size);
+  return static_cast<bool>(file.read(text.data(), size));
+}
 
 void put_pose3(std::ofstream& f, const gtsam::Pose3& p)
 {
@@ -1611,6 +1816,17 @@ bool get_pose3(std::ifstream& f, gtsam::Pose3& pose)
 
 bool Slam::save_map(const std::string& path)
 {
+  if (!require_idle_update("map save")) return false;
+  if (se3_) return se3_->save(path);
+  if (keyframes.empty() || input_model.size() > 4096 || map_calibration_id.size() > 4096 ||
+      map_depth_datum.size() > 4096 || map_depth_datum.empty() ||
+      std::any_of(keyframes.begin(), keyframes.end(), [](const auto& frame) {
+        return frame->chart != CloudChart::GravityHorizontal || frame->points.cols() != 3 ||
+          !frame->points.allFinite() || !frame->pose3.matrix().allFinite();
+      })) {
+    last_error_ = "constrained map save requires finite horizon states/clouds and valid metadata";
+    return false;
+  }
   // Write to a sibling temp file and rename into place.
   //
   // Opening `path` directly with trunc destroyed the existing map the moment
@@ -1632,6 +1848,10 @@ bool Slam::save_map(const std::string& path)
   const std::uint32_t n = static_cast<std::uint32_t>(keyframes.size());
   f.write(reinterpret_cast<const char*>(&version), 4);
   f.write(reinterpret_cast<const char*>(&n), 4);
+  put_map_text(f, input_model);
+  put_map_text(f, constrained_3d ? "gravity_horizontal_xyz" : "gravity_horizontal_xy");
+  put_map_text(f, map_calibration_id); put_map_text(f, map_depth_datum);
+  put_map_text(f, "reference_shape");
   for (const auto& kf : keyframes) {
     const std::int64_t stamp_ns =
       static_cast<std::int64_t>(kf->time.sec) * 1000000000ll + kf->time.nanosec;
@@ -1672,6 +1892,8 @@ bool Slam::save_map(const std::string& path)
 
 bool Slam::load_map(const std::string& path)
 {
+  if (!require_idle_update("map load")) return false;
+  if (se3_) return se3_->load(path);
   if (!keyframes.empty()) {
     last_error_ = "load_map requires an empty session (call before any frame)";
     return false;
@@ -1686,7 +1908,7 @@ bool Slam::load_map(const std::string& path)
   f.read(magic, 8);
   f.read(reinterpret_cast<char*>(&version), 4);
   f.read(reinterpret_cast<char*>(&n), 4);
-  if (!f || std::memcmp(magic, kMapMagic, 8) != 0 || version != kMapVersion) {
+  if (!f || std::memcmp(magic, kMapMagic, 8) != 0 || (version != kMapVersion && version != 1)) {
     last_error_ = "'" + path + "' is not a version-" +
                   std::to_string(kMapVersion) + " sonar_slam map";
     return false;
@@ -1696,18 +1918,34 @@ bool Slam::load_map(const std::string& path)
     last_error_ = "map header claims an implausible keyframe count";
     return false;
   }
+  if (version == 1) {
+    if (!allow_legacy_map || input_model != "imaging") {
+      last_error_ = "legacy map has no model/calibration metadata; explicit allow_legacy_map is required for imaging migration";
+      return false;
+    }
+  } else {
+    std::string sensor, chart, calibration, datum, policy;
+    if (!get_map_text(f, sensor) || !get_map_text(f, chart) || !get_map_text(f, calibration) ||
+        !get_map_text(f, datum) || !get_map_text(f, policy) || sensor != input_model ||
+        chart != (constrained_3d ? "gravity_horizontal_xyz" : "gravity_horizontal_xy") ||
+        calibration != map_calibration_id || datum != map_depth_datum || policy != "reference_shape") {
+      last_error_ = "constrained map measurement model, cloud chart, calibration or depth datum mismatch";
+      return false;
+    }
+  }
+  const auto records_begin = f.tellg();
 
   // Bound counts by the actual file before allocating clouds. The fixed
   // portion of each record is stamp + two Pose3s + Pose2 + point count.
   f.seekg(0, std::ios::end);
   const auto file_end = f.tellg();
   constexpr std::streamoff kRecordBytes = 8 + 2 * 7 * 8 + 3 * 8 + 8;
-  if (file_end < std::streampos(16) ||
-      (file_end - std::streampos(16)) / kRecordBytes < n) {
+  if (records_begin < std::streampos(16) || file_end < records_begin ||
+      (file_end - records_begin) / kRecordBytes < n) {
     last_error_ = "truncated map keyframe records";
     return false;
   }
-  f.seekg(16);
+  f.seekg(records_begin);
 
   gtsam::NonlinearFactorGraph g;
   gtsam::Values v;
@@ -1814,8 +2052,17 @@ bool Slam::load_map(const std::string& path)
   return true;
 }
 
-bool Slam::relocalize(const KeyframePtr& frame)
+bool Slam::relocalize(const KeyframePtr& frame, Deadline deadline)
 {
+  if (!require_idle_update("relocalization")) return false;
+  deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(relocalize_max_ms));
+  if (se3_) return se3_->relocalize(frame, deadline);
+  const auto expired = [&]() {
+    if (!deadline_expired(deadline)) return false;
+    last_error_ = "relocalization deadline exceeded; incomplete search rejected";
+    return true;
+  };
+  if (expired()) return false;
   if (!awaiting_relocalization_) {
     last_error_ = "no loaded map awaiting relocalization";
     return false;
@@ -1828,6 +2075,7 @@ bool Slam::relocalize(const KeyframePtr& frame)
   std::vector<int> keys(static_cast<std::size_t>(loaded_key_count_));
   for (int k = 0; k < loaded_key_count_; ++k) keys[static_cast<std::size_t>(k)] = k;
   const Matrix target = get_points(keys, -1);
+  if (expired()) return false;
   if (target.rows() == 0) {
     last_error_ = "loaded map has no points";
     return false;
@@ -1857,7 +2105,8 @@ bool Slam::relocalize(const KeyframePtr& frame)
 
   const GlobalInitResult init = global_scan_match_init(
     frame->points, center, target, gtsam::Pose2(), point_noise, bounds,
-    500, 4, 0.01);
+    500, 4, 0.01, deadline);
+  if (expired() || init.timed_out) return false;
   const double hits = -init.best_cost;
   const double need = relocalize_min_overlap * static_cast<double>(frame->points.rows());
   if (!init.success || hits < need) {
@@ -1866,28 +2115,114 @@ bool Slam::relocalize(const KeyframePtr& frame)
                   std::to_string(static_cast<int>(need)) + " needed)";
     return false;
   }
-  gtsam::Pose2 matched = center.compose(
-    gtsam::Pose2(init.delta.x(), init.delta.y(), init.delta.theta()));
-
-  if (constrained_3d) {
-    Matrix source_global_depth = frame->points;
-    source_global_depth.col(2).array() +=
-      static_cast<float>(frame->dr_pose3.z());
-    const auto [message, refined] = compute_icp(
-      source_global_depth, target, matched);
-    if (message != "success") {
-      last_error_ = "3-D relocalization refinement failed: " + message;
+  InitializationResult registration;
+  registration.source_points = constrained_3d ? frame->points : Matrix(frame->points.leftCols(2));
+  if (constrained_3d)
+    registration.source_points.col(2).array() += static_cast<float>(frame->dr_pose3.z());
+  registration.target_points = target;
+  registration.source_pose = center;
+  registration.target_pose = gtsam::Pose2();
+  registration.estimated_source_pose = center.compose(init.delta);
+  registration.has_estimated_source_pose = true;
+  registration.source_pose_samples = init.pose_samples;
+  const ICPResult candidates(registration, true);
+  std::vector<gtsam::Pose2> guesses{candidates.initial_transform};
+  guesses.insert(guesses.end(), candidates.initial_transforms.begin(),
+    candidates.initial_transforms.begin() +
+      std::min<std::size_t>(30, candidates.initial_transforms.size()));
+  const auto global_fits = compute_icp_with_cov(registration.source_points, target, guesses, deadline);
+  if (expired()) return false;
+  if (!global_fits.complete) {
+    last_error_ = "relocalization global search incomplete: " + global_fits.message;
+    return false;
+  }
+  if (global_fits.transforms.empty()) {
+    last_error_ = "relocalization global hypotheses did not converge";
+    return false;
+  }
+  // Score refined XYZ fits with a clipped residual, including unmatched
+  // returns. A distant local minimum is an alternative map location, not a
+  // sample from the winning basin's measurement uncertainty.
+  const auto score = [&](const gtsam::Pose2& pose) {
+    const Matrix transformed = Keyframe::transform_points(registration.source_points, pose);
+    const Matrix reference = constrained_3d ? target : Matrix(target.leftCols(2));
+    const auto [ids, distances] = match(reference, transformed, 1, static_cast<float>(point_noise));
+    double cost = 0.0;
+    int overlap = 0;
+    for (Eigen::Index i = 0; i < ids.cols(); ++i) {
+      if (ids(0, i) >= 0 && std::isfinite(distances(0, i))) {
+        cost += distances(0, i);
+        ++overlap;
+      } else cost += point_noise * point_noise;
+    }
+    return std::make_pair(overlap, cost / static_cast<double>(transformed.rows()));
+  };
+  std::vector<double> costs;
+  std::size_t best = 0;
+  for (const auto& fit : global_fits.transforms) {
+    if (expired()) return false;
+    const auto [overlap, cost] = score(fit);
+    costs.push_back(overlap >= need ? cost : std::numeric_limits<double>::infinity());
+    if (costs.back() < costs[best]) best = costs.size() - 1;
+  }
+  if (!std::isfinite(costs[best])) {
+    last_error_ = "relocalization refined overlap too low";
+    return false;
+  }
+  const auto& winner = global_fits.transforms[best];
+  for (std::size_t i = 0; i < costs.size(); ++i) {
+    const auto difference = winner.between(global_fits.transforms[i]);
+    if ((difference.translation().norm() > 1.0 || std::abs(difference.theta()) > 0.35) &&
+        costs[i] <= costs[best] * 1.2 + 1e-4) {
+      relocalization_offset_.reset();
+      relocalization_confirmations_ = 0;
+      last_error_ = "relocalization ambiguous: comparable separated map hypotheses";
       return false;
     }
-    matched = refined;
-    const int overlap = get_overlap(
-      source_global_depth, target, &matched);
-    if (overlap < need) {
-      last_error_ = "3-D relocalization overlap too low (" +
-                    std::to_string(overlap) + " hits < " +
-                    std::to_string(static_cast<int>(need)) + " needed)";
+  }
+  // Probe a fixed local neighborhood rather than the whole-map search box.
+  // Keep a wide enough spread to expose sliding along walls/floors.
+  guesses.clear();
+  for (double x : {-0.5, 0.0, 0.5})
+    for (double y : {-0.5, 0.0, 0.5})
+      for (double yaw : {-0.1, 0.0, 0.1})
+        guesses.push_back(winner.compose(gtsam::Pose2(x, y, yaw)));
+  const auto match_result = compute_icp_with_cov(registration.source_points, target, guesses, deadline);
+  if (expired()) return false;
+  const auto observability = assess_icp_observability(match_result.cov_raw,
+    nssm_max_sigma, nssm_max_anisotropy, degeneracy_sigma_floor());
+  if (match_result.message != "success" ||
+      !observability.observable ||
+      match_result.cov_raw(2, 2) > 0.35 * 0.35) {
+    last_error_ = "relocalization requires observable sampled covariance: " +
+      match_result.message + ", sigma " + std::to_string(observability.sigma_max) +
+      ", anisotropy " + std::to_string(observability.anisotropy) +
+      ", yaw variance " + std::to_string(match_result.cov_raw(2, 2));
+    return false;
+  }
+  const gtsam::Pose2 matched = match_result.odom;
+  if (get_overlap(registration.source_points, target, &matched) < need) {
+    last_error_ = "relocalization refined overlap too low";
+    return false;
+  }
+  if (expired()) return false;
+  const double stamp = to_sec(frame->time);
+  const gtsam::Pose2 offset = matched.compose(frame->dr_pose.inverse());
+  if (relocalization_offset_) {
+    if (stamp <= relocalization_stamp_) {
+      last_error_ = "relocalization confirmation needs a newer observation";
       return false;
     }
+    const auto difference = relocalization_offset_->between(offset);
+    if (stamp - relocalization_stamp_ > 5.0 ||
+        difference.translation().norm() > 0.5 || std::abs(difference.theta()) > 0.17453292519943295)
+      relocalization_confirmations_ = 0;
+  }
+  relocalization_offset_ = offset;
+  relocalization_stamp_ = stamp;
+  if (++relocalization_confirmations_ < relocalize_min_confirmations) {
+    last_error_ = "relocalization awaiting consistent confirmation";
+    return false;
   }
 
   // enter the map at the matched pose: moderate prior (the global init is
@@ -1895,10 +2230,15 @@ bool Slam::relocalize(const KeyframePtr& frame)
   frame->update(gtsam::Pose3(gtsam::Rot3::Yaw(matched.theta()),
                              gtsam::Point3(matched.x(), matched.y(),
                                            frame->dr_pose3.z())));
+  pending_frame_ = frame;
   const int key = current_key();
-  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
-    X(key), frame->horizon_pose3(),
-    lift_sigmas(Eigen::Vector3d(0.5, 0.5, 0.1), kSigmaTightRP, kSigmaDepthAbs)));
+  Eigen::Matrix3d covariance = match_result.cov;
+  covariance.diagonal() += Eigen::Vector3d(0.25, 0.25, 0.01);
+  auto covariance6 = embed_planar_cov(covariance);
+  covariance6(0, 0) = covariance6(1, 1) = kSigmaTightRP * kSigmaTightRP;
+  covariance6(5, 5) = kSigmaDepthAbs * kSigmaDepthAbs;
+  graph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(key), frame->horizon_pose3(),
+    gtsam::noiseModel::Gaussian::Covariance(covariance6)));
   values_.insert(X(key), frame->horizon_pose3());
   add_state_unary(key, frame);
   force_converge_ = true;
@@ -1911,6 +2251,9 @@ bool Slam::relocalize(const KeyframePtr& frame)
 
 bool Slam::add_position_prior(int key, double x, double y, double sigma_xy)
 {
+  if (!require_idle_update("position correction")) return false;
+  if (se3_) return se3_->add_position(key, x, y, sigma_xy);
+  if (awaiting_relocalization_) { last_error_ = "position correction requires a localized graph"; return false; }
   if (key < 0 || key >= current_key()) {
     last_error_ = "position prior key out of range";
     return false;
@@ -1938,7 +2281,12 @@ bool Slam::add_position_prior(int key, double x, double y, double sigma_xy)
 // ---------------------------------------------------------------------------
 bool Slam::update_factor_graph(const KeyframePtr& keyframe)
 {
-  if (keyframe) keyframes.push_back(keyframe);
+  if (se3_) return se3_->update(keyframe);
+  if (keyframe != pending_frame_) {
+    last_error_ = "the committed frame must match the prepared graph update";
+    return false;
+  }
+  if (!has_pending_update()) { last_error_.clear(); return true; }
 
   // Optimized-vs-MEASURED discrepancy for one consecutive keyframe link, in
   // SIGMA of that link's own noise model. Port of rtabmap
@@ -1970,17 +2318,13 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     return lin / L.trans_sigma;
   };
 
-  // Pre-round snapshot, loop rounds only (add_nonsequential_scan_matching
-  // fills pending_loops_ before calling us; a plain keyframe round leaves it
-  // empty and skips the post-loop verification below). It serves two jobs
-  // down there: the delta semantics of the chain-tear check, and an exact
-  // revert.
+  // Retain the published poses for rollback after any post-solve failure.
+  // Loop rounds additionally retain the previous link errors for verification.
   std::vector<gtsam::Pose3> pre_round_poses;
   std::vector<double> pre_tear;
+  pre_round_poses.reserve(keyframes.size());
+  for (const auto& kf : keyframes) pre_round_poses.push_back(kf->horizon_pose3());
   if (!pending_loops_.empty()) {
-    pre_round_poses.reserve(keyframes.size());
-    for (const auto& kf : keyframes)
-      pre_round_poses.push_back(kf->horizon_pose3());
     if (post_loop_max_link_error_sigma > 0.0 && keyframes.size() > 1) {
       pre_tear.resize(keyframes.size() - 1);
       for (std::size_t k = 0; k + 1 < keyframes.size(); ++k)
@@ -1995,31 +2339,27 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // the local buffers cannot un-poison the estimator, so recovery is: drop the
   // offending frame (pop the keyframe, roll back loop bookkeeping) and REBUILD
   // ISAM2 from the mirror of everything that previously solved.
+  const std::size_t committed_before = committed_graph_.size();
+  const std::size_t frames_before = keyframes.size();
   try {
+    if (keyframe) keyframes.push_back(keyframe);
     isam_.update(graph_, values_);
-  } catch (const std::exception& e) {
-    last_error_ = e.what();
+    // Mirroring is part of the transaction too: a failed allocation here
+    // must not leave the estimator ahead of its rebuild source.
+    committed_graph_.push_back(graph_);
     graph_.resize(0);
     values_.clear();
-    // a discarded manual-correction prior must not make the NEXT round
-    // converge hard on its behalf
-    force_converge_ = false;
-    if (keyframe) { keyframes.pop_back(); consecutive_links_.resize(keyframes.size()); }
+  } catch (const std::exception& e) {
+    last_error_ = e.what();
+    committed_graph_.resize(committed_before);
+    keyframes.resize(frames_before);
     // solver failure says nothing about the loops themselves — no quarantine
-    rollback_pending_loops(/*quarantine=*/false);
+    discard_pending_update();
     rebuild_isam();
     return false;
   }
-  // The factors are inside the estimator the moment update() returns — mirror
-  // them NOW so committed_graph_ can never desync from isam_ if anything below
-  // throws. A verification revert truncates back to committed_before, which
-  // restores the "committed graph excludes the reverted round" property the
-  // rebuild depends on.
-  const std::size_t committed_before = committed_graph_.size();
-  committed_graph_.push_back(graph_);
-  graph_.resize(0);
-  values_.clear();
-
+  // A verification/post-solve failure truncates the mirror to its previous
+  // size and rebuilds the estimator from that committed graph.
   try {
   // Converge BEFORE judging: a loop-closure (or manual-correction) round
   // needs more than the single Gauss-Newton pass isam_.update() performs —
@@ -2043,18 +2383,20 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
   // loop-closure correction every keyframe moves, and this transform sweep
   // over the whole map history was the sequential half of the CPU spike
   // (the other half, ISAM2 relinearization, is TBB-parallel inside GTSAM).
-  if (values.size() > keyframes.size())
+  if (values.size() != keyframes.size())
     throw std::out_of_range(
-      "solver returned more states than keyframes");  // was .at()'s job
+      "solver state count does not match the committed keyframes");
   std::vector<gtsam::Pose3> new_poses(values.size());
-  for (std::size_t x = 0; x < values.size(); ++x)
+  for (std::size_t x = 0; x < values.size(); ++x) {
     new_poses[x] = values.at<gtsam::Pose3>(X(static_cast<int>(x)));
+    if (!new_poses[x].matrix().allFinite()) throw std::runtime_error("solver returned a non-finite state");
+  }
 #pragma omp parallel for schedule(dynamic)
-  for (std::size_t x = 0; x < new_poses.size(); ++x)
-    keyframes[x]->update(new_poses[x]);
-  // the newest optimized pose, for the marginal refresh below
-  gtsam::Pose3 pose;
-  if (!new_poses.empty()) pose = new_poses.back();
+  for (std::size_t x = 0; x < new_poses.size(); ++x) {
+    if ((keyframe && x + 1 == new_poses.size()) ||
+        !keyframes[x]->horizon_pose3().equals(new_poses[x], 1e-12))
+      keyframes[x]->update(new_poses[x]);
+  }
 
   // Optional rtabmap-style optimize-then-verify yaw check. It is retained for
   // deployments with an independently trustworthy DR yaw reference, but zero
@@ -2188,14 +2530,13 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       for (std::size_t x = 0; x < n; ++x)
         keyframes[x]->update(pre_round_poses[x]);
       rebuild_isam();
+      discard_pending_update();
       return false;
     }
   }
 
   // verified (or no loops this round): the mirrored factors stand, and this
   // round's loop-closure marks become permanent
-  pending_loops_.clear();
-
   // Maintain the per-link over-bound baseline the chain-tear growth gate
   // compares against: record the tear when a link FIRST ends a correction
   // round beyond the bound (typically stretched by an accepted USBL/manual
@@ -2234,7 +2575,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
       for (int j = 0; j < 3; ++j) cov(i, j) = cov6(map[i], map[j]);
     keyframes.back()->set_cov(cov);
   } catch (const std::exception&) {
-    keyframes.back()->update(pose);
+    keyframes.back()->invalidate_covariance();
   }
 
   // PCM marginal refresh: refresh the marginals of every keyframe involved
@@ -2266,6 +2607,10 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     if (ret.inserted)
       ret.estimated_transform = ret.target_pose.between(ret.source_pose);
   }
+  pending_loops_.clear();
+  if (pending_ssm_) ++ssm_accepted;
+  pending_ssm_ = false; pending_frame_.reset();
+  last_error_.clear();
   return true;
   } catch (const std::exception& e) {
     // Any throw between a successful solve and the end of this round (the
@@ -2277,7 +2622,7 @@ bool Slam::update_factor_graph(const KeyframePtr& keyframe)
     last_error_ = std::string("post-solve failure: ") + e.what();
     committed_graph_.resize(committed_before);
     if (keyframe) { keyframes.pop_back(); consecutive_links_.resize(keyframes.size()); }
-    rollback_pending_loops(/*quarantine=*/false);
+    discard_pending_update();
     const std::size_t n = std::min(pre_round_poses.size(), keyframes.size());
     for (std::size_t x = 0; x < n; ++x) keyframes[x]->update(pre_round_poses[x]);
     rebuild_isam();
@@ -2334,6 +2679,11 @@ void Slam::rollback_pending_loops(bool quarantine, long culprit_link)
 
 void Slam::resetSession()
 {
+  if (se3_) se3_->reset();
+  pending_frame_.reset(); pending_ssm_ = false;
+  relocalization_offset_.reset();
+  relocalization_confirmations_ = 0;
+  relocalization_stamp_ = 0.0;
   keyframes.clear();
   current_frame.reset();
   isam_ = gtsam::ISAM2(make_isam2_params());

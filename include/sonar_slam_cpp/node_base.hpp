@@ -1,10 +1,11 @@
 // Common node base: port of bruce_slam utils/io.py BruceNode. get_param
-// accepts ROS 1 style "a/b" names (translated to "a.b"), auto-declares
-// missing parameters with the supplied default, and converts numerics
-// leniently (a YAML `65` satisfies a double parameter).
+// accepts ROS 1 style "a/b" names (translated to "a.b"), explicitly declares
+// startup-only settings, and accepts integer-valued doubles from legacy YAML.
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,28 +15,19 @@ namespace sonar_slam {
 // Construct, spin and shut down a node, translating the one startup failure
 // whose native message does not say what to do about it.
 //
-// Every node here uses automatically_declare_parameters_from_overrides, so
-// rclcpp::Node's CONSTRUCTOR walks the whole override set. An empty YAML
-// sequence (`key: []`) reaches rcl as UNSET rather than as an empty array,
-// and auto-declare then throws
-//   InvalidParameterValueException: parameter_value_from failed for
-//   parameter 'key': No parameter value set
-// which names the key but not the cause or the fix. It happens before any
-// node code runs, so no accessor guard inside SlamNodeBase can catch it —
-// this wrapper is the only place it can be intercepted.
-template <class NodeT>
-int run_node(int argc, char** argv)
+// An empty YAML sequence (`key: []`) reaches rcl as UNSET rather than an
+// empty typed array. Explain that error when explicit declaration fails.
+template <class Factory>
+int run_node_factory(int argc, char** argv, Factory factory)
 {
   rclcpp::init(argc, argv);
   int rc = 0;
   try {
-    // Two threads: callbacks in the default (mutually exclusive) group stay
-    // serialized exactly as under rclcpp::spin, and a node may place
-    // latency-critical work, such as the map->odom republish timer, in its own
-    // group so a long keyframe callback cannot starve it.
+    // Independent graph, input/mapping and TF groups need three workers so
+    // a long registration cannot starve intake or map->odom publication.
     rclcpp::executors::MultiThreadedExecutor executor(
-      rclcpp::ExecutorOptions(), 2);
-    auto node = std::make_shared<NodeT>();
+      rclcpp::ExecutorOptions(), 3);
+    auto node = factory();
     executor.add_node(node);
     executor.spin();
   } catch (const rclcpp::exceptions::InvalidParameterValueException& e) {
@@ -44,7 +36,7 @@ int run_node(int argc, char** argv)
       "%s\n"
       "  This is almost always an EMPTY YAML LIST in a params file: `key: []` "
       "parses as UNSET in rcl, not as an empty array, and parameter "
-      "auto-declaration rejects it at startup.\n"
+      "declaration rejects it at startup.\n"
       "  Fix: give the key a value, or comment it out entirely if you meant "
       "'not configured'.",
       e.what());
@@ -61,17 +53,47 @@ int run_node(int argc, char** argv)
   return rc;
 }
 
+template <class NodeT>
+int run_node(int argc, char** argv)
+{
+  return run_node_factory(argc, argv, [] { return std::make_shared<NodeT>(); });
+}
+
 class SlamNodeBase : public rclcpp::Node
 {
 public:
   explicit SlamNodeBase(const std::string& node_name,
                         const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
     : rclcpp::Node(node_name, rclcpp::NodeOptions(options)
-                                .automatically_declare_parameters_from_overrides(true))
+                                .automatically_declare_parameters_from_overrides(false))
   {
   }
 
 protected:
+  // All algorithm settings are startup-only. Declare them explicitly using the
+  // override's type so legacy integer-valued doubles remain accepted.
+  void declare_config(const std::string& name,
+                      const rclcpp::ParameterValue* fallback = nullptr)
+  {
+    if (has_parameter(name)) return;
+    const auto& overrides = get_node_parameters_interface()->get_parameter_overrides();
+    const auto override = overrides.find(name);
+    if (override == overrides.end() && !fallback)
+      throw std::runtime_error("Required parameter '" + name + "' is not set");
+    const auto& value = override == overrides.end() ? *fallback : override->second;
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.read_only = true;
+    descriptor.description = "Startup configuration; restart the node to change this value";
+    declare_parameter(name, value, descriptor, true);
+  }
+
+  void finalize_parameters()
+  {
+    for (const auto& entry : get_node_parameters_interface()->get_parameter_overrides())
+      if (!has_parameter(entry.first))
+        throw std::invalid_argument("Unknown parameter '" + entry.first + "'");
+  }
+
   static std::string normalize(const std::string& name)
   {
     std::string out = name;
@@ -84,6 +106,7 @@ protected:
   rclcpp::Parameter require_param(const std::string& raw_name)
   {
     const std::string name = normalize(raw_name);
+    declare_config(name);
     if (!has_parameter(name))
       throw std::runtime_error("Required parameter '" + name +
                                "' is not set for node '" + get_name() +
@@ -109,7 +132,8 @@ protected:
   double get_double(const std::string& raw_name, double default_value)
   {
     const std::string name = normalize(raw_name);
-    if (!has_parameter(name)) declare_parameter(name, default_value);
+    const rclcpp::ParameterValue fallback(default_value);
+    declare_config(name, &fallback);
     return as_double(get_parameter(name));
   }
 
@@ -118,18 +142,15 @@ protected:
     // tolerate a YAML value written with a decimal point (declared DOUBLE),
     // matching the defaulted overload and this header's leniency contract
     const auto p = require_param(raw_name);
-    return p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE
-             ? static_cast<int>(p.as_double())
-             : static_cast<int>(p.as_int());
+    return as_int(p);
   }
   int get_int(const std::string& raw_name, int default_value)
   {
     const std::string name = normalize(raw_name);
-    if (!has_parameter(name)) declare_parameter(name, default_value);
+    const rclcpp::ParameterValue fallback(default_value);
+    declare_config(name, &fallback);
     const auto p = get_parameter(name);
-    return p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE
-             ? static_cast<int>(p.as_double())
-             : static_cast<int>(p.as_int());
+    return as_int(p);
   }
 
   // INTEGER-tolerant like get_double/get_int: ROS1-ported YAMLs commonly say
@@ -148,7 +169,8 @@ protected:
   bool get_bool(const std::string& raw_name, bool default_value)
   {
     const std::string name = normalize(raw_name);
-    if (!has_parameter(name)) declare_parameter(name, default_value);
+    const rclcpp::ParameterValue fallback(default_value);
+    declare_config(name, &fallback);
     return coerce_bool(get_parameter(name));
   }
 
@@ -160,7 +182,8 @@ protected:
                          const std::string& default_value)
   {
     const std::string name = normalize(raw_name);
-    if (!has_parameter(name)) declare_parameter(name, default_value);
+    const rclcpp::ParameterValue fallback(default_value);
+    declare_config(name, &fallback);
     return get_parameter(name).as_string();
   }
 
@@ -172,7 +195,8 @@ protected:
                                        const std::vector<double>& default_value)
   {
     const std::string name = normalize(raw_name);
-    if (!has_parameter(name)) declare_parameter(name, default_value);
+    const rclcpp::ParameterValue fallback(default_value);
+    declare_config(name, &fallback);
     const auto p = get_parameter(name);
     // `key: []` in YAML reaches rcl as NOT_SET, not as an empty array, so
     // as_double_array() would throw. For a DEFAULTED lookup that is exactly
@@ -184,6 +208,15 @@ protected:
   }
 
 private:
+  static int as_int(const rclcpp::Parameter& p)
+  {
+    const double value = p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE
+      ? p.as_double() : static_cast<double>(p.as_int());
+    if (!std::isfinite(value) || value != std::floor(value) ||
+        value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
+      throw std::invalid_argument("Parameter '" + p.get_name() + "' must be a bounded integer");
+    return static_cast<int>(value);
+  }
   static std::vector<double> as_double_array(const rclcpp::Parameter& p)
   {
     if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY) {

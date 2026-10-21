@@ -5,18 +5,21 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include "sonar_slam_cpp/deadline.hpp"
 
 namespace sonar_slam {
 
 struct McdResult
 {
   bool success = false;
+  bool timed_out = false;
   Eigen::VectorXd location;
   Eigen::MatrixXd covariance;
 };
 
 // support_fraction: fraction of samples the estimate must cover (sklearn
 // support_fraction; 0.8 in slam.py). Deterministic (fixed seed).
-McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction);
+McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction,
+                      Deadline deadline = Deadline::max());
 
 }  // namespace sonar_slam

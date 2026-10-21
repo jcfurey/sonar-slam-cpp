@@ -2,12 +2,16 @@
 #include "sonar_slam_cpp/gpu.hpp"
 
 #include <opencv2/imgproc.hpp>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 
 namespace sonar_slam {
 
@@ -72,14 +76,21 @@ struct CostGrid
   double xmin = 0.0, ymin = 0.0, resolution = 1.0;
 };
 
+void validate_inputs(const Matrix& source, const gtsam::Pose2& source_pose,
+                     const Matrix& target, const gtsam::Pose2& target_pose,
+                     double point_noise)
+{
+  if (source.cols() < 2 || target.cols() < 2 || !source.allFinite() || !target.allFinite() ||
+      !source_pose.matrix().allFinite() || !target_pose.matrix().allFinite() ||
+      !std::isfinite(point_noise) || point_noise <= 0.0)
+    throw std::invalid_argument("global initialization needs finite XY clouds/poses and positive point_noise");
+}
+
 // port of slam.py lines 503-526: rasterize target points, dilate by the
 // point-noise radius
-CostGrid build_grid(const Matrix& target_points, double point_noise)
+CostGrid build_grid(const Matrix& target_points, double point_noise,
+                    Deadline deadline = Deadline::max())
 {
-  // point_noise <= 0 is a config error: the resolution and the dilation
-  // radius divide by it, and the float->int casts below are UB on the
-  // resulting inf/NaN. The node validates point_noise > 0 at startup; this
-  // clamp keeps a direct/library caller defined as well.
   point_noise = std::max(point_noise, 1e-3);
   CostGrid g;
   const double xmin = target_points.col(0).minCoeff() - 2.0 * point_noise;
@@ -89,11 +100,34 @@ CostGrid build_grid(const Matrix& target_points, double point_noise)
   g.resolution = point_noise / 10.0;
   g.xmin = xmin;
   g.ymin = ymin;
-  const int cols = std::max(1, static_cast<int>(std::ceil((xmax - xmin) / g.resolution)));
-  const int rows = std::max(1, static_cast<int>(std::ceil((ymax - ymin) / g.resolution)));
+  const double width = xmax - xmin, height = ymax - ymin;
+  if (!std::isfinite(width) || !std::isfinite(height) ||
+      std::abs(xmin) > std::numeric_limits<float>::max() ||
+      std::abs(ymin) > std::numeric_limits<float>::max())
+    throw std::invalid_argument("global initialization raster exceeds floating-point coordinate range");
+  // A capped point count does not bound a dense raster's area. Keep both its
+  // long axis and its total allocation bounded BEFORE any integer conversion
+  // or OpenCV allocation. Long, thin maps need the axis bound independently.
+  g.resolution = std::max({g.resolution,
+    width / (GLOBAL_INIT_MAX_GRID_AXIS - 1), height / (GLOBAL_INIT_MAX_GRID_AXIS - 1),
+    std::sqrt(width) * std::sqrt(height) / std::sqrt(static_cast<double>(GLOBAL_INIT_MAX_GRID_CELLS))});
+  int cols = 0, rows = 0;
+  for (;;) {
+    // Include the upper rounded cell. Once coarsened, the physical noise
+    // padding can be smaller than half a cell; the largest endpoint must not
+    // round just past the allocated raster and fail to match itself.
+    cols = std::max(1, static_cast<int>(std::ceil(width / g.resolution)) + 1);
+    rows = std::max(1, static_cast<int>(std::ceil(height / g.resolution)) + 1);
+    if (cols <= GLOBAL_INIT_MAX_GRID_AXIS && rows <= GLOBAL_INIT_MAX_GRID_AXIS &&
+        static_cast<std::size_t>(rows) * cols <= GLOBAL_INIT_MAX_GRID_CELLS) break;
+    g.resolution *= 1.01;  // allow for ceil and floating-point boundary effects
+  }
+  if (g.resolution > std::numeric_limits<float>::max())
+    throw std::invalid_argument("global initialization raster resolution exceeds floating-point range");
   g.grid = cv::Mat::zeros(rows, cols, CV_8UC1);
 
   for (int i = 0; i < target_points.rows(); ++i) {
+    if (i % 1024 == 0 && deadline_expired(deadline)) return g;
     // rint = round half to even, matching np.round in slam.py
     int r = static_cast<int>(std::rint((target_points(i, 1) - ymin) / g.resolution));
     int c = static_cast<int>(std::rint((target_points(i, 0) - xmin) / g.resolution));
@@ -120,6 +154,9 @@ std::array<float, 6> pack_transform(const gtsam::Pose2& source_pose,
   const gtsam::Pose2 sample_source =
     source_pose.compose(gtsam::Pose2(delta[0], delta[1], delta[2]));
   const gtsam::Pose2 T = target_pose.between(sample_source);
+  if (!T.matrix().allFinite() || std::abs(T.x()) > std::numeric_limits<float>::max() ||
+      std::abs(T.y()) > std::numeric_limits<float>::max())
+    throw std::invalid_argument("global initialization candidate exceeds floating-point pose range");
   const double c = std::cos(T.theta()), s = std::sin(T.theta());
   return {static_cast<float>(c),        static_cast<float>(-s),
           static_cast<float>(s),        static_cast<float>(c),
@@ -144,10 +181,12 @@ float eval_one_cost(const Matrix& points, const std::array<float, 6>& T,
     // rint = round half to even — the same arithmetic as np.round and the
     // CUDA __float2int_rn, so CPU-scored and GPU-scored costs agree (the
     // Nelder-Mead refinement always scores on the CPU)
-    const int r = static_cast<int>(std::rint((y - ymin) * inv_res));
-    const int c = static_cast<int>(std::rint((x - xmin) * inv_res));
+    const float r = std::rint((y - ymin) * inv_res);
+    const float c = std::rint((x - xmin) * inv_res);
+    // Test the floating-point coordinates first: remote candidates can be
+    // outside int range (or overflow float arithmetic) while input is finite.
     if (r >= 0 && r < rows && c >= 0 && c < cols &&
-        g.grid.at<std::uint8_t>(r, c) > 0)
+        g.grid.at<std::uint8_t>(static_cast<int>(r), static_cast<int>(c)) > 0)
       ++hits;
   }
   return -static_cast<float>(hits);
@@ -157,7 +196,11 @@ void eval_costs_cpu(const Matrix& points, const std::vector<std::array<float, 6>
                     const CostGrid& g, std::vector<float>& costs)
 {
   costs.resize(Ts.size());
-#pragma omp parallel for schedule(static)
+  [[maybe_unused]] int workers = 1;
+#ifdef _OPENMP
+  workers = std::max(1, std::min({4, omp_get_max_threads(), static_cast<int>(Ts.size())}));
+#endif
+#pragma omp parallel for schedule(static) num_threads(workers)
   for (int t = 0; t < static_cast<int>(Ts.size()); ++t)
     costs[t] = eval_one_cost(points, Ts[t], g);
 }
@@ -199,12 +242,18 @@ std::vector<float> global_match_costs(
   const Matrix& target_points, const gtsam::Pose2& target_pose,
   double point_noise, const std::vector<Eigen::Vector3d>& deltas)
 {
+  if (deltas.size() > GLOBAL_INIT_MAX_SAMPLES)
+    throw std::invalid_argument("global matching deltas exceed the sample budget");
+  if (deltas.empty()) return {};
   // Empty-cloud guard: global_scan_match_init has one, but this public entry
   // point (the parity/harness API) reached build_grid's minCoeff() on an
   // empty matrix — an Eigen assert in debug, UB in release.
   if (source_points.rows() == 0 || target_points.rows() == 0)
     return std::vector<float>(deltas.size(),
                               std::numeric_limits<float>::max());
+  validate_inputs(source_points, source_pose, target_points, target_pose, point_noise);
+  if (std::any_of(deltas.begin(), deltas.end(), [](const auto& delta) { return !delta.allFinite(); }))
+    throw std::invalid_argument("global matching deltas must be finite and within the sample budget");
   const CostGrid grid = build_grid(target_points, point_noise);
   std::vector<std::array<float, 6>> transforms;
   transforms.reserve(deltas.size());
@@ -219,12 +268,26 @@ GlobalInitResult global_scan_match_init(
   const Matrix& source_points, const gtsam::Pose2& source_pose,
   const Matrix& target_points, const gtsam::Pose2& target_pose,
   double point_noise, const Eigen::Matrix<double, 3, 2>& bounds, int n,
-  int iters, double ftol)
+  int iters, double ftol, Deadline deadline)
 {
   GlobalInitResult result;
+  const auto expired = [&]() {
+    result.timed_out = deadline_expired(deadline);
+    return result.timed_out;
+  };
+  if (expired()) return result;
   if (source_points.rows() == 0 || target_points.rows() == 0) return result;
+  validate_inputs(source_points, source_pose, target_points, target_pose, point_noise);
+  if (n < 1 || iters < 1 || n > GLOBAL_INIT_MAX_SAMPLES / iters ||
+      !std::isfinite(ftol) || ftol < 0 || !bounds.allFinite() ||
+      !(bounds.col(0).array() <= bounds.col(1).array()).all() ||
+      !(bounds.col(1) - bounds.col(0)).allFinite())
+    throw std::invalid_argument("invalid global initialization bounds, tolerance or sample budget");
 
-  const CostGrid grid = build_grid(target_points, point_noise);
+  const CostGrid grid = build_grid(target_points, point_noise, deadline);
+  if (expired()) return result;
+  result.grid_resolution = grid.resolution;
+  result.grid_rows = grid.grid.rows; result.grid_cols = grid.grid.cols;
 
   auto record = [&](const Eigen::Vector3d& delta, double cost) {
     const gtsam::Pose2 sample_source =
@@ -235,12 +298,13 @@ GlobalInitResult global_scan_match_init(
 
   // ------------------------------------------------- sobol sampling phase
   Sobol3 sobol;
-  const int total = std::max(1, n) * std::max(1, iters);
+  const int total = n * iters;
   std::vector<Eigen::Vector3d> deltas;
   std::vector<std::array<float, 6>> transforms;
   deltas.reserve(total);
   transforms.reserve(total);
   for (int i = 0; i < total; ++i) {
+    if (i % 128 == 0 && expired()) return result;
     const auto u = sobol.next();
     Eigen::Vector3d d;
     for (int k = 0; k < 3; ++k)
@@ -250,7 +314,22 @@ GlobalInitResult global_scan_match_init(
   }
 
   std::vector<float> costs;
-  eval_costs(source_points, transforms, grid, costs);
+  if (deadline == Deadline::max()) {
+    eval_costs(source_points, transforms, grid, costs);
+  } else {
+    // Keep kernel calls and CPU batches bounded so the proposal phase shares
+    // the caller's deadline. An individual library/kernel call is atomic.
+    costs.reserve(total);
+    for (int offset = 0; offset < total; offset += 128) {
+      if (expired()) return result;
+      const auto end = std::min(total, offset + 128);
+      const std::vector<std::array<float, 6>> chunk(transforms.begin() + offset, transforms.begin() + end);
+      std::vector<float> values;
+      eval_costs(source_points, chunk, grid, values);
+      costs.insert(costs.end(), values.begin(), values.end());
+    }
+  }
+  if (expired()) return result;
 
   int best = 0;
   for (int i = 0; i < total; ++i) {
@@ -288,6 +367,9 @@ GlobalInitResult global_scan_match_init(
   // uncertainty the covariance is supposed to describe. result.delta (the
   // single best guess) still comes from the refined NM optimum below, so
   // registration quality is unchanged — only the covariance POPULATION moves.
+  const auto bounded = [&](const Eigen::Vector3d& d) -> Eigen::Vector3d {
+    return d.cwiseMax(bounds.col(0)).cwiseMin(bounds.col(1));
+  };
   auto cost_of = [&](const Eigen::Vector3d& d) {
     return static_cast<double>(eval_one_cost(
       source_points, pack_transform(source_pose, target_pose, d), grid));
@@ -307,11 +389,13 @@ GlobalInitResult global_scan_match_init(
   for (int k = 0; k < 3; ++k) {
     simplex[k + 1] = deltas[best];
     simplex[k + 1][k] += 0.05 * (bounds(k, 1) - bounds(k, 0));
+    simplex[k + 1] = bounded(simplex[k + 1]);
     fvals[k + 1] = cost_of(simplex[k + 1]);
   }
 
   const int max_nm_iters = 120;
   for (int it = 0; it < max_nm_iters; ++it) {
+    if (expired()) return result;
     // order simplex
     std::array<int, 4> order = {0, 1, 2, 3};
     std::sort(order.begin(), order.end(),
@@ -325,10 +409,10 @@ GlobalInitResult global_scan_match_init(
     if (std::abs(fvals[3] - fvals[0]) <= ftol) break;
 
     const Eigen::Vector3d centroid = (simplex[0] + simplex[1] + simplex[2]) / 3.0;
-    const Eigen::Vector3d refl = centroid + (centroid - simplex[3]);
+    const Eigen::Vector3d refl = bounded(centroid + (centroid - simplex[3]));
     const double f_refl = cost_of(refl);
     if (f_refl < fvals[0]) {
-      const Eigen::Vector3d exp_pt = centroid + 2.0 * (centroid - simplex[3]);
+      const Eigen::Vector3d exp_pt = bounded(centroid + 2.0 * (centroid - simplex[3]));
       const double f_exp = cost_of(exp_pt);
       if (f_exp < f_refl) { simplex[3] = exp_pt; fvals[3] = f_exp; }
       else { simplex[3] = refl; fvals[3] = f_refl; }
@@ -336,12 +420,12 @@ GlobalInitResult global_scan_match_init(
       simplex[3] = refl;
       fvals[3] = f_refl;
     } else {
-      const Eigen::Vector3d contr = centroid + 0.5 * (simplex[3] - centroid);
+      const Eigen::Vector3d contr = bounded(centroid + 0.5 * (simplex[3] - centroid));
       const double f_contr = cost_of(contr);
       if (f_contr < fvals[3]) { simplex[3] = contr; fvals[3] = f_contr; }
       else {
         for (int k = 1; k < 4; ++k) {
-          simplex[k] = simplex[0] + 0.5 * (simplex[k] - simplex[0]);
+          simplex[k] = bounded(simplex[0] + 0.5 * (simplex[k] - simplex[0]));
           fvals[k] = cost_of(simplex[k]);
         }
       }
@@ -352,7 +436,8 @@ GlobalInitResult global_scan_match_init(
   for (int k = 1; k < 4; ++k)
     if (fvals[k] < fvals[best_v]) best_v = k;
 
-  result.success = true;
+  if (expired()) return result;
+  result.success = fvals[best_v] < 0.0;
   result.delta = gtsam::Pose2(simplex[best_v][0], simplex[best_v][1], simplex[best_v][2]);
   result.best_cost = fvals[best_v];
   return result;

@@ -14,6 +14,7 @@
 
 #include "sonar_slam_cpp/cloud_ops.hpp"
 #include "sonar_slam_cpp/keyframe.hpp"
+#include "sonar_slam_cpp/se3_backend.hpp"
 
 namespace sonar_slam {
 
@@ -83,6 +84,12 @@ public:
   // 3-D, not free SE(3): sonar cannot override pressure z or IMU roll/pitch.
   bool constrained_3d = true;
   ConstrainedIcpParams constrained_icp_params;
+  RegistrationModel registration_model = RegistrationModel::ConstrainedXYYaw;
+  std::string input_model = "imaging";
+  Se3Options se3_options;
+  std::string map_calibration_id;
+  std::string map_depth_datum = "pressure_zero";
+  bool allow_legacy_map = false;
 
   SMParams ssm_params;
   SMParams nssm_params;
@@ -91,6 +98,7 @@ public:
   // the registration has a large/weak translation axis. Sparse/open-water
   // periods then use only the fused-odometry link.
   bool ssm_require_covariance = true;
+  bool nssm_require_covariance = true;
   double ssm_max_sigma = 0.5;
   double ssm_max_anisotropy = 8.0;
   bool ssm_degeneracy_prefloor = true;
@@ -172,6 +180,7 @@ public:
   // this back-end independent of raw sonar messages.
   double sonar_max_range = 30.0;
   double sonar_horizontal_aperture = 2.2689280275926285;  // radians(130)
+  bool use_body_fan_gate = true;
 
   // ----------------------------------------------------------------- state
   std::vector<KeyframePtr> keyframes;
@@ -192,7 +201,7 @@ public:
   int nssm_attempts = 0;
   int nssm_queued = 0;
   int nssm_best_clique = 0;
-  int nssm_queue_depth() const { return static_cast<int>(nssm_queue_.size()); }
+  int nssm_queue_depth() const;
   // cumulative histogram of terminal NSSM rejection reasons over the whole run,
   // keyed by Status category (LARGE_TRANSFORMATION is split into "(compass)" vs
   // geometric so the tunable rot/trans bar stays distinct from the untouchable
@@ -237,6 +246,7 @@ public:
   // verification runs. Returns false when there is no keyframe yet or the
   // solve failed (last_error()).
   bool add_manual_correction(const gtsam::Pose2& map_pose);
+  bool add_manual_correction(const gtsam::Pose3& map_pose, const Covariance6& covariance);
   // ------------------------------------------------- persistence + fixes
   // Serialize/restore the keyframe map (binary; poses + clouds). load_map
   // must run on an EMPTY session: it restores the keyframes, rebuilds an
@@ -247,16 +257,22 @@ public:
   // is baked into the saved poses.
   bool save_map(const std::string& path);
   bool load_map(const std::string& path);
-  bool relocalize(const KeyframePtr& frame);
+  // An optional caller deadline may shorten the configured attempt budget.
+  // Expired/incomplete searches leave the saved graph armed for another try.
+  bool relocalize(const KeyframePtr& frame, Deadline deadline = Deadline::max());
   bool awaiting_relocalization() const { return awaiting_relocalization_; }
   int loaded_keyframes() const { return loaded_key_count_; }
   // min fraction of a frame's points that must land on the loaded map for a
   // relocalization to be accepted
   double relocalize_min_overlap = 0.5;
+  int relocalize_min_confirmations = 2;
+  int relocalize_max_ms = 5000;
   // Absolute position fix (USBL/LBL) on keyframe `key`: x/y at sigma_xy,
   // heading and everything else wide. Runs a normal (non-hard) update —
   // acoustic fixes are frequent and incremental, unlike operator input.
   bool add_position_prior(int key, double x, double y, double sigma_xy);
+  bool add_transponder_position_prior(int key, double x, double y, double sigma_xy,
+                                     const gtsam::Point3& point_in_key);
   int position_priors_applied = 0;
   // Remove the MOST RECENT manual-correction prior from the committed graph
   // and re-solve, relaxing the trajectory back. Stack semantics: call again
@@ -264,16 +280,18 @@ public:
   // nothing to undo or the re-solve failed.
   bool undo_manual_correction();
   // manual priors currently in the graph (undo stack depth)
-  int manual_corrections_pending() const
-  {
-    return static_cast<int>(manual_prior_indices_.size());
-  }
+  int manual_corrections_pending() const;
   // Incorporate the buffered factors/values into ISAM2. Returns false when the
   // solve failed: the offending frame's factors (and any loop closures marked
   // this round) are rolled back, the estimator is rebuilt from the previously
   // committed factors, and last_error() describes the failure. The caller
   // should log it and skip any further graph work this callback.
   bool update_factor_graph(const KeyframePtr& keyframe = nullptr);
+  // Stage one frame, then commit that same frame. Rejected out-of-order
+  // operations preserve pending work; a caller catching a staging exception
+  // can explicitly discard it before processing another observation.
+  bool has_pending_update() const;
+  void discard_pending_update();
   const std::string& last_error() const { return last_error_; }
 
   // ------------------------------------------------------------- utilities
@@ -295,10 +313,14 @@ public:
     Eigen::Matrix3d cov;
     Eigen::Matrix3d cov_raw = Eigen::Matrix3d::Zero();  // pre-floor (degeneracy gate)
     int n_samples = 0;
+    bool complete = false;  // every requested hypothesis was attempted in time
+    // Keep distinct converged hypotheses for global ambiguity assessment.
+    std::vector<gtsam::Pose2> transforms;
   };
   IcpCovResult compute_icp_with_cov(const Matrix& source_points,
                                     const Matrix& target_points,
-                                    const std::vector<gtsam::Pose2>& guesses);
+                                    const std::vector<gtsam::Pose2>& guesses,
+                                    Deadline deadline = Deadline::max());
 
   int get_overlap(const Matrix& source_points, const Matrix& target_points,
                   const gtsam::Pose2* source_pose = nullptr,
@@ -316,6 +338,17 @@ public:
   double degeneracy_sigma_floor() const;
 
 private:
+  friend class Se3Backend;
+  void validate_new_frame(const KeyframePtr& frame, bool prior) const;
+  void stage_frame(const KeyframePtr& frame, bool prior);
+  bool require_idle_update(const char* operation);
+  void add_odometry_factors(const KeyframePtr& frame);
+  KeyframePtr pending_frame_;
+  bool pending_ssm_ = false;
+  std::shared_ptr<Se3Backend> se3_;
+  std::optional<gtsam::Pose2> relocalization_offset_;
+  double relocalization_stamp_ = 0.0;
+  int relocalization_confirmations_ = 0;
   InitializationResult initialize_sequential_scan_matching(
     const KeyframePtr& keyframe);
   InitializationResult initialize_nonsequential_scan_matching();

@@ -3,6 +3,34 @@
 # pre-converted to radians below.
 /**:
   ros__parameters:
+    registration_model: constrained_xyyaw
+    manual_correction_mode: planar
+    map_calibration_id: ""
+    map_depth_datum: pressure_zero
+    allow_legacy_map: false
+    # Full physical Pose3 path; these values need sensor/mission commissioning.
+    # Fused odometry supplies soft six-axis increments, with no duplicate raw
+    # IMU/pressure factors. Sigma order: [roll,pitch,yaw,x,y,z].
+    se3:
+      prior_sigmas: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+      odom_sigmas: [0.1, 0.1, 0.1, 0.3, 0.3, 0.15]
+      max_correspondence: 0.75
+      trim_ratio: 0.8
+      max_iterations: 50
+      min_correspondences: 30
+      translation_epsilon: 0.005
+      rotation_epsilon: 0.001
+      normal_neighbors: 15
+      normal_radius: 1.0
+      max_curvature: 0.1
+      sensor_noise: 0.1
+      rank_tolerance: 0.0001
+      rotation_sigma_floor: 0.02
+      translation_sigma_floor: 0.05
+      max_rotation_sigma: 0.25
+      relocalize_depth_range: 1.0
+      relocalize_attitude_range: 0.15
+      max_seed_points: 250000
     # how often to add keyframes, this can be varied but between 1 and 4 meters is best
     keyframe_duration: 1.0
     keyframe_translation: 3.0
@@ -45,7 +73,13 @@
     icp_config: ""
 
     # sonar_proc candidate cloud + exact-stamp TF contract
+    input_model: imaging
+    input_timeout: 2.0
+    registration:
+      max_points: 5000
+      voxel_resolution: 0.5
     points_topic: /sensor/sonar/sonar0/proc_points
+    map_frame: map
     odom_frame: odom
     base_frame: base_link
     tf_lookup_timeout: 0.05
@@ -71,6 +105,7 @@
     # is shifted into the target pressure-depth chart before registration;
     # sonar therefore cannot modify z, roll or pitch.
     constrained_3d:
+      max_threads: 4
       enabled: true
       max_correspondence: 0.75
       trim_ratio: 0.8
@@ -130,6 +165,7 @@
 
     # Non-sequential scan matching
     nssm:
+      require_covariance: true
       enable: true            # is this module enabled?
       # Exclusion zone around the most recent keyframe. NOTE: with the shipped
       # min_revisit_sep (10, below) this no longer affects which frame becomes
@@ -254,6 +290,10 @@
     # min fraction of a frame's points that must land on the loaded map for
     # the relocalization to be accepted
     relocalize_min_overlap: 0.5
+    relocalize_min_confirmations: 2
+    # Shared proposal/registration/covariance budget per attempt. Incomplete
+    # searches are rejected and the loaded map remains available for retry.
+    relocalize_max_ms: 5000
 
     # ---- USBL / LBL absolute position input ----
     # Map-frame position fixes become gated position-only priors on the

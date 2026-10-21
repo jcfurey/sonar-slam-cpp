@@ -383,7 +383,12 @@ int main()
   auto frame2 = make_frame(1000, gtsam::Pose2(0.0, 0.0, 0.0));
   frame2->points =
     world.scan_cloud(reloc_truth, kAperture, kBeams, kMaxRange, 0.03, rng);
-  CHECK(s2.relocalize(frame2), "relocalize failed: %s",
+  const auto loaded_count = s2.current_key();
+  CHECK(!s2.relocalize(frame2) && s2.awaiting_relocalization() && s2.current_key() == loaded_count,
+        "a single relocalization observation changed the graph");
+  CHECK(!s2.relocalize(frame2), "duplicate observation confirmed relocalization");
+  frame2->time.nanosec = 100000000;
+  CHECK(s2.relocalize(frame2), "confirmed relocalization failed: %s",
         s2.last_error().c_str());
   const double reloc_err =
     std::hypot(frame2->pose.x() - reloc_truth.x(),

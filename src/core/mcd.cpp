@@ -6,6 +6,9 @@
 #include <numeric>
 #include <random>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace sonar_slam {
 
@@ -93,9 +96,14 @@ bool c_step(const Eigen::MatrixXd& X, int h, Estimate& est, Scratch& s)
 
 }  // namespace
 
-McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
+McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction, Deadline deadline)
 {
   McdResult result;
+  const auto expired = [&]() {
+    result.timed_out = deadline_expired(deadline);
+    return result.timed_out;
+  };
+  if (expired()) return result;
   const int n = X.rows(), d = X.cols();
   // sklearn MinCovDet floors: n_support = int(support_fraction * n_samples)
   const int h = static_cast<int>(support_fraction * n);
@@ -127,6 +135,7 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   {
     std::vector<char> used(n, 0);
     for (int trial = 0; trial < n_trials; ++trial) {
+      if (expired()) return result;
       std::fill(used.begin(), used.end(), 0);
       std::vector<int>& s = starts[static_cast<std::size_t>(trial)];
       s.reserve(static_cast<std::size_t>(d) + 1);
@@ -143,16 +152,22 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   // spreading them across cores is free of numerical consequence.
   std::vector<Estimate> attempts(static_cast<std::size_t>(n_trials));
   std::vector<char> attempt_ok(static_cast<std::size_t>(n_trials), 0);
-#pragma omp parallel
+  [[maybe_unused]] int workers = 1;
+#ifdef _OPENMP
+  workers = std::max(1, std::min(4, omp_get_max_threads()));
+#endif
+#pragma omp parallel num_threads(workers)
   {
     Scratch scratch;
 #pragma omp for schedule(static)
     for (int trial = 0; trial < n_trials; ++trial) {
+      if (deadline_expired(deadline)) continue;
       Estimate est;
       est.support = starts[static_cast<std::size_t>(trial)];
       bool ok = true;
       double prev_det = std::numeric_limits<double>::infinity();
       for (int step = 0; step < 30 && ok; ++step) {
+        if (deadline_expired(deadline)) { ok = false; break; }
         ok = c_step(X, h, est, scratch);
         if (!ok) break;
         // RELATIVE tolerance: det(cov) of the deployed input (30 ICP
@@ -171,6 +186,7 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
       }
     }
   }
+  if (expired()) return result;
 
   // Reduce IN TRIAL ORDER with the sequential rule (strict <, first winner
   // keeps ties), so the surviving estimate is exactly the one the serial loop
@@ -195,6 +211,7 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   Eigen::FullPivLU<Eigen::MatrixXd> lu(best.cov);
   if (!lu.isInvertible()) return result;
   mahalanobis_sq(X, best.mu, lu.inverse(), scratch, d2);
+  if (expired()) return result;
   std::vector<double> d2_sorted(d2);
   std::sort(d2_sorted.begin(), d2_sorted.end());
   // np.median semantics: average the two middle elements for even n
@@ -210,10 +227,12 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   Eigen::FullPivLU<Eigen::MatrixXd> lu2(cov_corrected);
   if (!lu2.isInvertible()) return result;
   mahalanobis_sq(X, best.mu, lu2.inverse(), scratch, d2);
+  if (expired()) return result;
 
   std::vector<int> keep;
   for (int i = 0; i < n; ++i)
     if (d2[static_cast<std::size_t>(i)] <= CHI2_975_3) keep.push_back(i);
+  if (expired()) return result;
   if (static_cast<int>(keep.size()) < d + 1) {
     result.success = true;
     result.location = best.mu;
@@ -231,6 +250,7 @@ McdResult min_cov_det(const Eigen::MatrixXd& X, double support_fraction)
   }
   cov_w /= static_cast<double>(keep.size());
 
+  if (expired()) return result;
   result.success = true;
   result.location = mu_w;
   result.covariance = cov_w;

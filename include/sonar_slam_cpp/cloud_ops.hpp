@@ -44,11 +44,17 @@ struct ConstrainedIcpParams
   double translation_epsilon = 0.005;
   double rotation_epsilon = 0.001;
   int min_correspondences = 6;
+  int max_threads = 4;
+  // Research-only use of bounded fits. Production requires convergence.
+  bool allow_iteration_limit = false;
 };
 
 struct ConstrainedIcpResult
 {
   bool success = false;
+  bool converged = false;
+  bool iteration_limit = false;
+  double rmse = 0.0;
   std::string message;
   Eigen::Matrix3f T = Eigen::Matrix3f::Identity();
   int correspondences = 0;

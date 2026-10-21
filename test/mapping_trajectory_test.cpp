@@ -41,6 +41,17 @@ int main()
   CHECK(mapping.pose(3, parents).equals(correction1.compose(raw), 1e-10), "new-parent correction missing");
   CHECK(mapping.anchors()[0].time.sec == 100 && mapping.anchors()[3].time.sec == 104,
         "graph correction changed immutable anchor timestamps");
+  auto middle = std::make_shared<Keyframe>(true, at(102), raw);
+  const gtsam::Pose3 full_correction(gtsam::Rot3::Ypr(0.1, 0.2, -0.3), gtsam::Point3(1, 2, 3));
+  middle->pose3 = full_correction.compose(raw);
+  parents.insert(parents.begin() + 1, middle);
+  mapping.reparent(parents);
+  CHECK(mapping.anchors()[1].parent == 1 &&
+        mapping.pose(1, parents).equals(full_correction.compose(raw), 1e-10),
+        "an anchor received while the graph lagged did not adopt its newer parent");
+  CHECK(mapping.anchors()[3].parent == 2 &&
+        mapping.pose(3, parents).equals(correction1.compose(raw), 1e-10),
+        "reparenting changed anchor identity or lost a full rigid correction");
 
   CHECK(!mapping.observe(at(0), raw, 0).accepted, "zero stamp accepted");
   CHECK(!mapping.observe(at(-1), raw, 0).accepted, "negative stamp accepted");

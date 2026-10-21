@@ -8,9 +8,11 @@
 // with main renamed so the class is testable without restructuring the
 // build. The test drives the node through an executor with a fixture TF
 // tree and synthetic clouds, then reads outcomes from /diagnostics.
-#define main slam_node_disabled_main
-#include "../src/nodes/slam_node.cpp"
-#undef main
+#include "sonar_slam_cpp/node.hpp"
+#include "sonar_slam_cpp/common.hpp"
+#include "sonar_slam_cpp/ros_conversions.hpp"
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -22,8 +24,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
-#include <tf2_ros/static_transform_broadcaster.h>
-#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
 
 #define CHECK(cond, ...)                                                   \
   do {                                                                     \
@@ -97,8 +99,9 @@ geometry_msgs::msg::TransformStamped make_tf(double stamp_s,
 
 }  // namespace
 
-int main()
+int main(int argc, char**)
 {
+  const bool reset_enabled = argc == 1;
   rclcpp::init(0, nullptr);
   int rc = 1;
   {
@@ -108,30 +111,36 @@ int main()
     const char* cfg = std::getenv("SLAM_TEST_CONFIG");
     CHECK(cfg != nullptr, "SLAM_TEST_CONFIG not set");
     rclcpp::NodeOptions opts;
-    opts.arguments({"--ros-args", "--params-file", cfg,
+    opts.arguments({"--ros-args", "-r", "__ns:=/bruce/slam", "--params-file", cfg,
                     "-p", "points_topic:=/test/points",
                     "-p", "ssm.enable:=false",
                     "-p", "nssm.enable:=false",
                     "-p", "dr.max_yaw_rate:=1.5",
                     "-p", "max_head_pitch:=0.52",
                     "-p", "tf_lookup_timeout:=0.05",
-                    "-p", "tf_buffer_duration:=120.0"});
+                    "-p", "tf_buffer_duration:=120.0",
+                    "-p", reset_enabled ? "reset_on_time_rewind:=true" : "reset_on_time_rewind:=false"});
     for (const auto& setting : {
            "prior_sigmas:=[0.1, 0.2]", "odom_sigmas:=[0.1, 0.2, -0.01]",
            "icp_odom_sigmas:=[0.1, 0.2, 0.01, 0.1]",
            "manual_correction_sigmas:=[0.1, 0.2]",
-           "ssm.initialization_params:=[1e20, 1.0, 0.01]"}) {
+           "ssm.initialization_params:=[1e20, 1.0, 0.01]",
+           "enable_slam_typo:=false", "input_queue_depth:=1.5"}) {
       auto bad_opts = opts;
       auto args = opts.arguments();
       args.insert(args.end(), {"-p", setting});
       bad_opts.arguments(args);
       bool rejected = false;
-      try { auto invalid = std::make_shared<sonar_slam::SlamNode>(bad_opts); }
+      try { auto invalid = sonar_slam::make_slam_node(bad_opts); }
       catch (const std::runtime_error&) { rejected = true; }
       catch (const std::invalid_argument&) { rejected = true; }
       CHECK(rejected, "invalid setting accepted: %s", setting);
     }
-    auto node = std::make_shared<sonar_slam::SlamNode>(opts);
+    auto node = sonar_slam::make_slam_node(opts);
+    const auto change = node->set_parameter(rclcpp::Parameter("enable_slam", false));
+    CHECK(!change.successful && node->get_parameter("enable_slam").as_bool() &&
+            node->describe_parameter("enable_slam").read_only,
+          "startup-only settings advertised a successful runtime change");
     auto pub_node = rclcpp::Node::make_shared("slam_harness");
     auto points_pub = pub_node->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/test/points", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
@@ -204,6 +213,11 @@ int main()
           diag_int("admitted_scans"));
     CHECK(diag_int("keyframes") >= 1, "no keyframe from the healthy ping");
     std::printf("[1] healthy ping admitted\n");
+    points_pub->publish(make_cloud_msg(100.0, 120, 2.0));
+    points_pub->publish(make_cloud_msg(100.1, 120, 2.0));
+    spin_for(1.1);
+    CHECK(diag_int("out_of_order_rejections") == 2 && diag_int("admitted_scans") == 1,
+          "duplicate or slightly older ping changed the graph/admission baseline");
 
     // [2] sparse ping: TF fine, 3 points -> rejected as evidence,
     // odometry-only fallback
@@ -284,10 +298,10 @@ int main()
     spin_for(0.2);
     points_pub->publish(make_cloud_msg(95.0, 120, 2.0));
     spin_for(1.4);
-    CHECK(diag_int("keyframes") == 1,
+    CHECK(diag_int("keyframes") == (reset_enabled ? 1 : before_big_step + 1),
           "rewound ping did not reset the session (keyframes=%lld)",
           diag_int("keyframes"));
-    CHECK(diag_int("admitted_scans") == adm_before_rewind + 1,
+    CHECK(diag_int("admitted_scans") == adm_before_rewind + (reset_enabled ? 1 : 0),
           "rewound ping not admitted into the fresh session (%lld -> %lld)",
           adm_before_rewind, diag_int("admitted_scans"));
 
@@ -307,10 +321,10 @@ int main()
         });
     spin_for(1.0);
     CHECK(got_latched, "no retained sample on the traj latch after rewind");
-    CHECK(latched.width == 1,
+    CHECK(latched.width == static_cast<unsigned>(reset_enabled ? 1 : before_big_step + 1),
           "traj latch still carries the dead session (width=%u)",
           latched.width);
-    CHECK(latched.header.stamp.sec == 95,
+    CHECK(latched.header.stamp.sec == (reset_enabled ? 95 : 103),
           "traj latch stamp %d != rewound session start",
           latched.header.stamp.sec);
     std::printf("[6] rewind reset: session cleared, latches refreshed\n");

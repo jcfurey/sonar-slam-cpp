@@ -155,6 +155,22 @@ int main()
       wrong_height, target, Eigen::Matrix3f::Identity(), p);
     CHECK(!rejected.success,
           "height-separated scans falsely registered through XY projection");
+    p.max_correspondence = 0.6f;
+    p.max_iterations = 1;
+    const auto capped = sonar_slam::constrained_icp_xyz(
+      source, target, Eigen::Matrix3f::Identity(), p);
+    CHECK(!capped.success && capped.iteration_limit && !capped.converged,
+          "iteration limit was reported as convergence");
+    p.max_iterations = 40;
+    const std::vector<Eigen::Matrix3f> guesses(8, Eigen::Matrix3f::Identity());
+    const auto batch = sonar_slam::constrained_icp_xyz_batch(source, target, guesses, p, 2000);
+    CHECK(batch.size() == guesses.size(), "batch truncated without a deadline");
+    for (const auto& result : batch)
+      CHECK(result.success && result.converged && result.T.isApprox(fit.T, 1e-5),
+            "cached search changed the registration result");
+    const auto expired = sonar_slam::constrained_icp_xyz_batch(source, target, guesses, p, 0);
+    for (const auto& result : expired)
+      CHECK(!result.success, "expired registration became a covariance sample");
     std::printf("[5] constrained XYZ registration and height rejection OK\n");
   }
 

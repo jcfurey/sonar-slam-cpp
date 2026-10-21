@@ -35,6 +35,7 @@ int main()
     slam.parallel_cov_samples = parallel;
     // Stop after one update to retain a measurable spread of ICP solutions.
     slam.constrained_icp_params.max_iterations = 1;
+    slam.constrained_icp_params.allow_iteration_limit = true;
     const auto regular = slam.compute_icp_with_cov(source, source, guesses);
     const auto turned = slam.compute_icp_with_cov(source, target, turned_guesses);
     check(regular.message == "success" && turned.message == "success",
@@ -47,6 +48,35 @@ int main()
           "sampled mean must respect yaw wrapping");
     check((regular.cov_raw - turned.cov_raw).norm() < 1e-6,
           "local covariance must be invariant to a half-turn of the target");
+    for (bool xyz : {false, true}) {
+      slam.constrained_3d = xyz;
+      const Matrix cloud = xyz ? source : Matrix(source.leftCols(2));
+      const auto expired = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+      const auto timeout = slam.compute_icp_with_cov(cloud, cloud, guesses, expired);
+      check(!timeout.complete && timeout.transforms.empty() && timeout.message != "success",
+            "expired sampling cannot return a confident partial population");
+      check(timeout.message.find("deadline") != std::string::npos,
+            "sampling timeout must be reported explicitly");
+      const auto retry = slam.compute_icp_with_cov(cloud, cloud, guesses);
+      check(retry.complete, "sampling must recover after an expired deadline");
+    }
+  }
+
+  // Enough work to interrupt a nonempty population, without asserting an
+  // exact elapsed time or completion count on shared CI machines.
+  {
+    Slam bounded;
+    bounded.parallel_cov_samples = false;
+    bounded.constrained_icp_params.max_iterations = 1;
+    bounded.constrained_icp_params.allow_iteration_limit = true;
+    std::vector<gtsam::Pose2> many;
+    many.reserve(100000);
+    for (int i = 0; i < 100000; ++i) many.push_back(guesses[i % guesses.size()]);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    const auto partial = bounded.compute_icp_with_cov(source, source, many, deadline);
+    check(!partial.complete && partial.transforms.size() < many.size() && partial.message != "success",
+          "interrupted sampling cannot publish covariance from a partial population");
+    check(partial.cov_raw.isZero(), "interrupted sampling must leave measurement covariance unavailable");
   }
 
   const auto rejected = [](Slam& s) {
@@ -64,5 +94,24 @@ int main()
   check(!rejected(s), "valid sampled covariance configuration");
   s.odom_sigmas[0] = -0.1;
   check(rejected(s), "negative noise sigma must be rejected");
+  s.odom_sigmas[0] = 0.2;
+  s.nssm_params.cov_samples = 0;
+  check(rejected(s), "required loop covariance must not silently use fixed noise");
+  s.nssm_params.cov_samples = 30;
+  s.nssm_params.initialization = false;
+  check(rejected(s), "required loop covariance must have initialization");
+  s.nssm_params.initialization = true;
+  check(!rejected(s), "restored loop covariance configuration");
+  builtin_interfaces::msg::Time stamp;
+  stamp.sec = 100;
+  s.keyframes.push_back(std::make_shared<Keyframe>(true, stamp, gtsam::Pose3()));
+  auto earlier = stamp;
+  earlier.sec = 99;
+  earlier.nanosec = 900000000;
+  Keyframe out_of_order(true, earlier,
+    gtsam::Pose3(gtsam::Rot3(), gtsam::Point3(10, 0, 0)));
+  check(!s.is_keyframe(out_of_order), "older input cannot become a graph keyframe");
+  out_of_order.time = stamp;
+  check(!s.is_keyframe(out_of_order), "duplicate input cannot become a graph keyframe");
   return failures ? 1 : 0;
 }
